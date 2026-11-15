@@ -1,0 +1,48 @@
+[package]
+name = "justmux"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+description = "A modern slash-command interface for tmux. Just tmux. Just simpler."
+license = "MIT"
+readme = "README.md"
+keywords = ["tmux", "tui", "terminal", "cli", "ratatui"]
+categories = ["command-line-utilities"]
+exclude = ["/.github", "/assets/*.cast", "/assets/*.gif"]
+
+[lib]
+name = "justmux"
+path = "src/lib.rs"
+
+# Primary command.
+[[bin]]
+name = "jm"
+path = "src/main.rs"
+
+# Long-form alias, same behaviour.
+[[bin]]
+name = "justmux"
+path = "src/bin/justmux.rs"
+
+[dependencies]
+anyhow = "1.0.104"
+clap = { version = "4.6.7", features = ["derive"] }
+crossterm = "0.29.0"
+ratatui = { version = "0.30.2", default-features = false, features = ["crossterm", "layout-cache"] }
+signal-hook = "0.3.18"
+thiserror = "2.0.21"
+unicode-segmentation = "1.13.3"
+unicode-width = "0.2.3"
+
+[dev-dependencies]
+tempfile = "3.27.0"
+
+[lints.clippy]
+# Spec 9.1: no unwrap/expect on runtime paths. Tests are exempt via clippy.toml.
+unwrap_used = "warn"
+expect_used = "warn"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true

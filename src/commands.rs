@@ -41,7 +41,7 @@ pub struct SlashCommand {
 }
 impl SlashCommand {
     pub fn matches(&self, name: &str) -> bool {
-        self.name == name || self.aliases.iter().any(|a| *a == name)
+        self.name == name || self.aliases.contains(&name)
     }
 }
 
