@@ -10,6 +10,8 @@ commands, and hands control back to tmux as soon as you enter a session.
 
 - A Codex-style composer with command completion and a searchable command
   popup.
+- A compact interface in the terminal's main screen, preserving shell output
+  and native scrollback. Fullscreen is optional.
 - Session create, list, resume, rename, and confirmed kill operations.
 - Window and pane management through the native tmux CLI.
 - Correct attach-from-a-shell and switch-client-from-tmux behavior.
@@ -57,6 +59,17 @@ The equivalent long-form invocation is `./target/release/justmux`.
 Run `jm` from a normal shell. Type `/` to open the command menu, then choose
 `/resume` and press Enter to attach to a session. The TUI is torn down before
 tmux receives the terminal, so tmux owns all keyboard input after that point.
+
+By default, JustMux uses a compact region of the main screen instead of
+entering an alternate screen. Existing shell output stays above it, and the
+terminal keeps its normal scrollback. It does not capture mouse scrolling.
+The UI waits for input, updates only changed cells, and combines queued input
+events before drawing. This reduces output over SSH, although menu navigation
+still depends on network latency. Inside tmux, scrollback remains subject to
+tmux's own scroll/copy-mode settings.
+
+Use `jm --fullscreen` (or `justmux --fullscreen`) for the alternate-screen
+layout when you want to use the entire terminal.
 
 When `jm` is launched in a tmux pane (including a `display-popup`), choosing a
 session uses `switch-client`; closing the popup leaves the program in the pane

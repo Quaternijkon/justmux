@@ -306,7 +306,13 @@ pub fn render_command_popup(
     selected: usize,
     theme: Theme,
 ) {
-    let h = (items.len() as u16 + 2).min(anchor.y.max(1));
+    // Inline viewports can start below existing shell output. Measure the
+    // available rows relative to that viewport, rather than the screen top.
+    let available = anchor.y.saturating_sub(frame.area().y);
+    let h = (items.len() as u16 + 2).min(available);
+    if h == 0 {
+        return;
+    }
     let area = Rect {
         x: anchor.x,
         y: anchor.y.saturating_sub(h),

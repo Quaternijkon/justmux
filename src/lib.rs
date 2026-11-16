@@ -14,7 +14,7 @@
 //! commands   slash-command registry and parser
 //! fuzzy      fuzzy matching / ranking
 //! tmux       typed adapter over the tmux CLI (the only module that spawns tmux)
-//! terminal   raw mode / alternate screen guard and the exec hand-off to tmux
+//! terminal   inline/fullscreen lifecycle, restoration, and exec hand-off to tmux
 //! ```
 
 pub mod app;

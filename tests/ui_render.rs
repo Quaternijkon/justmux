@@ -6,7 +6,12 @@ use justmux::{
     tmux::{SocketSpec, TmuxClient},
     ui::{CommandItem, TextInput, Theme, render_form_scrolled, render_home, render_picker},
 };
-use ratatui::{Terminal, backend::TestBackend, style::Modifier};
+use ratatui::{
+    Terminal, TerminalOptions, Viewport,
+    backend::{Backend, TestBackend},
+    layout::Position,
+    style::Modifier,
+};
 
 fn key(app: &mut App<'_>, code: KeyCode) {
     app.handle_event(Event::Key(KeyEvent::new(code, KeyModifiers::NONE)));
@@ -179,6 +184,65 @@ fn short_palette_scrolls_to_selected_last_command() {
             .iter()
             .any(|cell| cell.modifier.contains(Modifier::REVERSED))
     );
+}
+
+#[test]
+fn inline_menu_preserves_output_above_a_small_viewport() {
+    let tmux = private_tmux();
+    let mut app = App::new(&tmux, AppOptions::default());
+    type_text(&mut app, "/");
+    let mut backend = TestBackend::with_lines([
+        "Previous shell output           ",
+        "native scrollback stays here     ",
+        "                                ",
+        "                                ",
+        "                                ",
+        "                                ",
+        "                                ",
+        "                                ",
+        "                                ",
+        "                                ",
+        "                                ",
+        "                                ",
+        "                                ",
+        "                                ",
+        "                                ",
+        "                                ",
+        "                                ",
+        "                                ",
+        "                                ",
+        "                                ",
+    ]);
+    backend
+        .set_cursor_position(Position::new(0, 10))
+        .expect("initial shell cursor");
+    let mut terminal = Terminal::with_options(
+        backend,
+        TerminalOptions {
+            viewport: Viewport::Inline(6),
+        },
+    )
+    .expect("inline terminal");
+    terminal
+        .draw(|frame| app.render(frame))
+        .expect("draw inline");
+    assert!(
+        screen(&terminal).contains("/resume"),
+        "first candidate must remain visible"
+    );
+    for _ in 0..9 {
+        key(&mut app, KeyCode::Down);
+    }
+    terminal
+        .draw(|frame| app.render(frame))
+        .expect("draw selection");
+    let buffer = terminal.backend().buffer();
+    let row = |y| (0..32).map(|x| buffer[(x, y)].symbol()).collect::<String>();
+    assert!(row(0).starts_with("Previous shell output"));
+    assert!(row(1).starts_with("native scrollback stays here"));
+    assert!(!row(8).contains('/'), "menu must stay within its viewport");
+    assert!(!row(9).contains('/'), "menu must not overwrite the shell");
+    assert!(screen(&terminal).contains("/quit"));
 }
 
 #[test]

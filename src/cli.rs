@@ -1,17 +1,18 @@
 //! Argument parsing, diagnostics, and the blocking TUI event loop.
 use crate::{
     app::{App, AppOptions, Exit},
-    terminal::{TerminalGuard, exec_tmux, install_restore_hooks},
+    terminal::{ScreenMode, TerminalGuard, exec_tmux, install_restore_hooks},
     tmux::{SocketSpec, Tmux, TmuxClient},
 };
 use anyhow::{Context, Result};
 use clap::Parser;
-use crossterm::event;
-use ratatui::{Terminal, backend::CrosstermBackend};
+use crossterm::event::{self, Event, KeyEventKind};
+use ratatui::{Terminal, TerminalOptions, Viewport, backend::CrosstermBackend};
 use std::{
     io::{self, IsTerminal},
     path::PathBuf,
     process::ExitCode,
+    time::Duration,
 };
 
 const KEYBIND: &str = r#"bind-key j run-shell 'tmux display-popup -E -w 80% -h 70% -c #{q:client_name} "JUSTMUX_CLIENT=#{q:client_name} JUSTMUX_PANE=#{q:pane_id} JUSTMUX_POPUP=1 jm"'"#;
@@ -30,6 +31,9 @@ struct Cli {
     /// Use a tmux socket path (same as tmux -S).
     #[arg(short = 'S', long = "socket-path", conflicts_with = "socket_name")]
     socket_path: Option<PathBuf>,
+    /// Use an alternate fullscreen display instead of the native inline interface.
+    #[arg(long)]
+    fullscreen: bool,
     /// Print a recommended Popup binding without editing any file.
     #[arg(long)]
     print_keybind: bool,
@@ -85,7 +89,12 @@ fn run(cli: Cli) -> Result<()> {
         }
         text
     });
-    run_tui(&tmux, AppOptions { initial_command })
+    let mode = if cli.fullscreen {
+        ScreenMode::Fullscreen
+    } else {
+        ScreenMode::Inline
+    };
+    run_tui(&tmux, AppOptions { initial_command }, mode)
 }
 
 fn quote_argument(argument: &str) -> String {
@@ -132,29 +141,99 @@ fn doctor(tmux: &TmuxClient) -> Result<()> {
     Ok(())
 }
 
-fn run_tui(tmux: &TmuxClient, options: AppOptions) -> Result<()> {
+fn run_tui(tmux: &TmuxClient, options: AppOptions, mode: ScreenMode) -> Result<()> {
     install_restore_hooks()?;
-    let mut guard = TerminalGuard::enter()?;
-    let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))
-        .context("could not initialise terminal")?;
+    let mut guard = TerminalGuard::enter(mode)?;
+    let viewport = match mode {
+        ScreenMode::Inline => Viewport::Fixed(guard.inline_area(None)?),
+        ScreenMode::Fullscreen => Viewport::Fullscreen,
+    };
+    let mut terminal = Terminal::with_options(
+        CrosstermBackend::new(io::stdout()),
+        TerminalOptions { viewport },
+    )
+    .context("could not initialise terminal")?;
     let mut app = App::new(tmux, options);
     loop {
-        terminal
-            .draw(|frame| app.render(frame))
-            .context("could not draw JustMux")?;
+        // Exit before another draw: attach/switch must hand over immediately.
         if let Some(exit) = app.exit().cloned() {
+            drop(terminal);
             return match exit {
                 Exit::Quit | Exit::Switched => guard.restore(),
                 Exit::Attach(target) => exec_tmux(guard, tmux.attach_command(&target)),
             };
         }
-        app.handle_event(event::read().context("could not read terminal input")?);
+        terminal
+            .draw(|frame| app.render(frame))
+            .context("could not draw JustMux")?;
+
+        // Render once per input batch, without polling while idle. Bursts of
+        // arrow-key repeats or pasted text therefore don't emit a frame each.
+        let mut changed = false;
+        let mut resized = false;
+        while !changed {
+            let first = event::read().context("could not read terminal input")?;
+            let mut current = first;
+            for index in 0..64 {
+                resized |= matches!(current, Event::Resize(_, _));
+                if redraw_event(&current) {
+                    app.handle_event(current);
+                    changed = true;
+                }
+                if index == 63 || app.exit().is_some() || !event::poll(Duration::ZERO)? {
+                    break;
+                }
+                current = event::read().context("could not read queued terminal input")?;
+            }
+        }
+        // A resize burst needs one cursor report and one region reservation.
+        // Waiting for a remote terminal once per resize event adds avoidable RTTs.
+        if resized && mode == ScreenMode::Inline && app.exit().is_none() {
+            let previous = terminal.get_frame().area();
+            let area = guard.inline_area(Some(previous))?;
+            terminal = Terminal::with_options(
+                CrosstermBackend::new(io::stdout()),
+                TerminalOptions {
+                    viewport: Viewport::Fixed(area),
+                },
+            )?;
+        }
+    }
+}
+
+fn redraw_event(event: &Event) -> bool {
+    match event {
+        Event::Key(key) => key.kind != KeyEventKind::Release,
+        Event::Paste(_) | Event::Resize(_, _) => true,
+        Event::Mouse(_) | Event::FocusGained | Event::FocusLost => false,
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn inline_is_default_and_fullscreen_is_explicit() {
+        assert!(!Cli::try_parse_from(["jm"]).expect("default CLI").fullscreen);
+        let cli = Cli::try_parse_from(["jm", "--fullscreen", "resume"]).expect("fullscreen CLI");
+        assert!(cli.fullscreen);
+        assert_eq!(cli.command, vec!["resume"]);
+    }
+
+    #[test]
+    fn focus_and_key_release_events_do_not_trigger_redraws() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        assert!(!redraw_event(&Event::FocusGained));
+        assert!(!redraw_event(&Event::FocusLost));
+        let key = KeyEvent::new(KeyCode::Down, KeyModifiers::NONE);
+        assert!(redraw_event(&Event::Key(key)));
+        assert!(!redraw_event(&Event::Key(KeyEvent {
+            kind: KeyEventKind::Release,
+            ..key
+        })));
+        assert!(redraw_event(&Event::Resize(80, 24)));
+    }
+
     #[test]
     fn socket_arguments_are_mutually_exclusive() {
         assert!(Cli::try_parse_from(["jm", "-L", "private", "-S", "/tmp/private"]).is_err());
