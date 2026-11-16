@@ -285,7 +285,10 @@ pub fn render_home(
         Line::from("Manage your tmux sessions without memorizing commands."),
     ];
     frame.render_widget(Paragraph::new(body).wrap(Wrap { trim: true }), c[0]);
-    frame.render_widget(Paragraph::new(input.rendered(true, theme)), c[1]);
+    frame.render_widget(
+        Paragraph::new(input.rendered_width(true, theme, c[1].width)),
+        c[1],
+    );
     frame.render_widget(
         Paragraph::new(theme.adapt(status.unwrap_or("Type / for commands")))
             .style(theme.style(theme.muted)),
@@ -328,9 +331,14 @@ pub fn render_command_popup(
             ]))
         })
         .collect::<Vec<_>>();
-    frame.render_widget(
+    let mut state = ListState::default();
+    if !items.is_empty() {
+        state.select(Some(selected.min(items.len() - 1)));
+    }
+    frame.render_stateful_widget(
         List::new(rows).block(Block::default().borders(Borders::TOP)),
         area,
+        &mut state,
     );
 }
 
@@ -360,7 +368,10 @@ pub fn render_picker(
             .style(theme.style(theme.accent).add_modifier(Modifier::BOLD)),
         c[0],
     );
-    frame.render_widget(Paragraph::new(query.rendered(true, theme)), c[1]);
+    frame.render_widget(
+        Paragraph::new(query.rendered_width(true, theme, c[1].width)),
+        c[1],
+    );
     if rows.is_empty() {
         frame.render_widget(
             Paragraph::new(theme.adapt(empty)).style(theme.style(theme.muted)),
@@ -401,17 +412,76 @@ pub fn render_form(
     footer: &str,
     theme: Theme,
 ) {
-    let b = Block::default().title(title).borders(Borders::BOTTOM);
-    let inner = b.inner(area);
-    frame.render_widget(b, area);
+    render_form_scrolled(frame, area, title, label, input, footer, theme, 0);
+}
+
+/// A wrapped description scrolls independently of the pinned input/footer.
+/// Returns the clamped offset so callers can retain it between redraws.
+#[allow(clippy::too_many_arguments)]
+pub fn render_form_scrolled(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    title: &str,
+    label: &str,
+    input: &TextInput,
+    footer: &str,
+    theme: Theme,
+    scroll: u16,
+) -> u16 {
+    let chunks = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Min(0),
+        Constraint::Length(1),
+        Constraint::Length(1),
+    ])
+    .split(area);
     frame.render_widget(
-        Paragraph::new(vec![
-            Line::from(theme.adapt(label)),
-            input.rendered(true, theme),
-            Line::from(Span::styled(theme.adapt(footer), theme.style(theme.muted))),
-        ]),
-        inner,
+        Paragraph::new(theme.adapt(title))
+            .style(theme.style(theme.accent).add_modifier(Modifier::BOLD)),
+        chunks[0],
     );
+    let lines = wrap_description(&theme.adapt(label), chunks[1].width);
+    let max_scroll = lines.len().saturating_sub(usize::from(chunks[1].height));
+    let description = Paragraph::new(lines.into_iter().map(Line::from).collect::<Vec<_>>());
+    let scroll = scroll.min(u16::try_from(max_scroll).unwrap_or(u16::MAX));
+    frame.render_widget(description.scroll((scroll, 0)), chunks[1]);
+    frame.render_widget(
+        Paragraph::new(input.rendered_width(true, theme, chunks[2].width)),
+        chunks[2],
+    );
+    frame.render_widget(
+        Paragraph::new(theme.adapt(footer)).style(theme.style(theme.muted)),
+        chunks[3],
+    );
+    scroll
+}
+
+fn wrap_description(text: &str, width: u16) -> Vec<String> {
+    let width = usize::from(width);
+    if width == 0 {
+        return Vec::new();
+    }
+    let mut lines = Vec::new();
+    for paragraph in text.split('\n') {
+        let mut line = String::new();
+        for word in paragraph.split_word_bounds() {
+            if line.width() + word.width() > width && !line.is_empty() {
+                lines.push(line.trim_end().to_owned());
+                line.clear();
+            }
+            if word.trim().is_empty() && line.is_empty() {
+                continue;
+            }
+            for grapheme in word.graphemes(true) {
+                if line.width() + grapheme.width() > width && !line.is_empty() {
+                    lines.push(std::mem::take(&mut line));
+                }
+                line.push_str(grapheme);
+            }
+        }
+        lines.push(line);
+    }
+    lines
 }
 pub fn render_confirm(
     frame: &mut Frame<'_>,

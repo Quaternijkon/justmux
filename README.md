@@ -28,16 +28,29 @@ commands, and hands control back to tmux as soon as you enter a session.
 Install from this checkout:
 
 ```sh
-cargo install --path .
+cargo install --path . --locked
 ```
 
-This installs both `jm` and the long-form `justmux` binary. To build a local
-release artifact without installing it:
+The package installs two executable names into Cargo's binary directory:
+`jm` and `justmux`. They are the same JustMux CLI, so either command starts
+the same TUI and accepts the same options. With the standard Rust setup this
+directory is `$HOME/.cargo/bin`; add it to your shell `PATH` once if it is not
+already present:
+
+```sh
+export PATH="$HOME/.cargo/bin:$PATH"
+jm --version
+justmux --version
+```
+
+To build a local release artifact without installing it:
 
 ```sh
 cargo build --release
 ./target/release/jm
 ```
+
+The equivalent long-form invocation is `./target/release/justmux`.
 
 ## Quick start
 
@@ -52,9 +65,11 @@ below it untouched.
 Recommended popup binding (tmux 3.2+):
 
 ```tmux
-bind-key j display-popup -E -w 80% -h 70% \
-  'JUSTMUX_CLIENT=$(tmux display-message -p "#{client_name}") JUSTMUX_PANE=$(tmux display-message -p "#{pane_id}") JUSTMUX_POPUP=1 jm'
+bind-key j run-shell 'tmux display-popup -E -w 80% -h 70% -c #{q:client_name} "JUSTMUX_CLIENT=#{q:client_name} JUSTMUX_PANE=#{q:pane_id} JUSTMUX_POPUP=1 jm"'
 ```
+
+`run-shell` expands the launching client's identity before opening the popup.
+This keeps switching scoped to that client even when several clients share a session.
 
 ## Slash commands
 

@@ -179,6 +179,7 @@ struct Confirm {
     resource: Resource,
     input: TextInput,
     message: String,
+    scroll: u16,
 }
 #[derive(Debug, Clone)]
 enum View {
@@ -314,7 +315,14 @@ impl<'a> App<'a> {
         if query.contains(char::is_whitespace) {
             return Vec::new();
         }
-        fuzzy::rank_by(query, commands::registry(), |command| command.name)
+        let mut matches = fuzzy::rank_by(query, commands::registry(), |command| command.name);
+        // An exact alias remains discoverable under its canonical name.
+        for command in commands::registry() {
+            if command.aliases.contains(&query) && !matches.contains(&command) {
+                matches.insert(0, command);
+            }
+        }
+        matches
     }
 
     fn composer_key(&mut self, key: KeyEvent) {
@@ -333,7 +341,6 @@ impl<'a> App<'a> {
             KeyCode::Enter => {
                 let mut text = self.composer.value().to_string();
                 if !text.contains(char::is_whitespace)
-                    && commands::parse(&text).is_err()
                     && let Some(command) = candidates.get(self.palette_selected)
                 {
                     text = format!("/{}", command.name);
@@ -554,10 +561,24 @@ impl<'a> App<'a> {
             resource,
             input: TextInput::default(),
             message,
+            scroll: 0,
         }));
     }
 
     fn confirm_key(&mut self, mut confirm: Confirm, key: KeyEvent) {
+        match key.code {
+            KeyCode::Up | KeyCode::PageUp => {
+                confirm.scroll = confirm.scroll.saturating_sub(1);
+                self.views.push(View::Confirm(confirm));
+                return;
+            }
+            KeyCode::Down | KeyCode::PageDown => {
+                confirm.scroll = confirm.scroll.saturating_add(1);
+                self.views.push(View::Confirm(confirm));
+                return;
+            }
+            _ => {}
+        }
         if key.code == KeyCode::Enter {
             if confirm.input.value() != "yes" {
                 self.status = "Cancelled. Nothing was killed.".into();
@@ -769,7 +790,7 @@ impl<'a> App<'a> {
         ])
         .split(area);
         let main = chunks[0];
-        match self.views.top() {
+        match self.views.0.last_mut() {
             Some(View::Picker(picker)) => {
                 let rows: Vec<_> = picker
                     .indices()
@@ -809,15 +830,18 @@ impl<'a> App<'a> {
                     self.theme,
                 );
             }
-            Some(View::Confirm(confirm)) => ui::render_form(
-                frame,
-                main,
-                "Confirm irreversible action",
-                &confirm.message,
-                &confirm.input,
-                "Type yes + Enter to kill · Enter with empty input cancels · Esc Back",
-                self.theme,
-            ),
+            Some(View::Confirm(confirm)) => {
+                confirm.scroll = ui::render_form_scrolled(
+                    frame,
+                    main,
+                    "Confirm irreversible action",
+                    &confirm.message,
+                    &confirm.input,
+                    "↑↓ Review · Type yes + Enter to kill · Esc Back",
+                    self.theme,
+                    confirm.scroll,
+                );
+            }
             Some(View::Created(resource)) => {
                 frame.render_widget(
                     Paragraph::new(vec![
@@ -917,5 +941,63 @@ mod tests {
         }));
         assert!(matches!(stack.pop(), Some(View::Picker(_))));
         assert!(matches!(stack.top(), Some(View::Help)));
+    }
+
+    #[test]
+    fn confirmation_scroll_keeps_focus_and_escape_restores_parent() {
+        let tmux = crate::tmux::TmuxClient::new(crate::tmux::SocketSpec::Name(format!(
+            "jm-confirm-test-{}",
+            std::process::id()
+        )))
+        .with_program("/nonexistent-justmux-test-tmux");
+        let mut app = App::new(&tmux, AppOptions::default());
+        app.views.push(View::Help);
+        app.views.push(View::Confirm(Confirm {
+            resource: Resource::Session(session("$1", "orion")),
+            input: TextInput::default(),
+            message: "An irreversible action".into(),
+            scroll: 0,
+        }));
+        for code in [
+            KeyCode::Char('y'),
+            KeyCode::Down,
+            KeyCode::PageDown,
+            KeyCode::Char('e'),
+            KeyCode::Char('s'),
+        ] {
+            app.handle_event(Event::Key(KeyEvent::new(code, KeyModifiers::NONE)));
+        }
+        let Some(View::Confirm(confirm)) = app.views.top() else {
+            panic!("confirmation lost focus")
+        };
+        assert_eq!(confirm.input.value(), "yes");
+        assert_eq!(confirm.scroll, 2);
+        assert!(app.composer.value().is_empty());
+        app.handle_event(Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)));
+        assert!(matches!(app.views.top(), Some(View::Help)));
+        assert!(app.exit().is_none());
+    }
+
+    #[test]
+    fn empty_confirmation_cancels_without_invoking_tmux() {
+        let tmux = crate::tmux::TmuxClient::new(crate::tmux::SocketSpec::Name(format!(
+            "jm-confirm-cancel-{}",
+            std::process::id()
+        )))
+        .with_program("/nonexistent-justmux-test-tmux");
+        let mut app = App::new(&tmux, AppOptions::default());
+        app.views.push(View::Confirm(Confirm {
+            resource: Resource::Session(session("$1", "orion")),
+            input: TextInput::default(),
+            message: "An irreversible action".into(),
+            scroll: 0,
+        }));
+        app.handle_event(Event::Key(KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        )));
+        assert_eq!(app.status, "Cancelled. Nothing was killed.");
+        assert!(app.views.top().is_none());
+        assert!(app.exit().is_none());
     }
 }

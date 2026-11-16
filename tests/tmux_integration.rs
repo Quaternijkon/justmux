@@ -5,6 +5,8 @@ use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
+use justmux::app::{App, AppOptions};
 use justmux::tmux::{
     Context, SessionId, SocketSpec, SplitDirection, Target, Tmux, TmuxClient, TmuxError,
 };
@@ -51,6 +53,151 @@ impl Drop for PrivateServer {
 
 fn cwd() -> &'static Path {
     Path::new(env!("CARGO_MANIFEST_DIR"))
+}
+
+fn key(app: &mut App<'_>, code: KeyCode, modifiers: KeyModifiers) {
+    app.handle_event(Event::Key(KeyEvent::new(code, modifiers)));
+}
+
+fn text(app: &mut App<'_>, value: &str) {
+    for character in value.chars() {
+        key(app, KeyCode::Char(character), KeyModifiers::NONE);
+    }
+}
+
+#[test]
+fn session_management_works_through_keyboard_events() {
+    let server = PrivateServer::new();
+    let mut app = App::new(&server.client, AppOptions::default());
+    text(&mut app, "/new");
+    key(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+    text(&mut app, "项目 workspace");
+    key(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+    text(&mut app, env!("CARGO_MANIFEST_DIR"));
+    key(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+    let sessions = server.client.list_sessions().expect("created sessions");
+    assert_eq!(sessions.len(), 1);
+    let session = &sessions[0];
+    assert_eq!(session.name, "项目 workspace");
+
+    key(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+    key(&mut app, KeyCode::Char('e'), KeyModifiers::CONTROL);
+    key(&mut app, KeyCode::Char('u'), KeyModifiers::CONTROL);
+    text(&mut app, "renamed project");
+    key(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+    let renamed = server.client.list_sessions().expect("renamed sessions");
+    assert_eq!(renamed[0].id, session.id);
+    assert_eq!(renamed[0].name, "renamed project");
+
+    // A lone Enter at the destructive confirmation must cancel.
+    key(&mut app, KeyCode::Char('k'), KeyModifiers::CONTROL);
+    key(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+    assert!(server.client.has_session(&session.id).expect("not killed"));
+    key(&mut app, KeyCode::Char('k'), KeyModifiers::CONTROL);
+    text(&mut app, "yes");
+    key(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+    assert!(
+        !server
+            .client
+            .has_session(&session.id)
+            .expect("confirmed kill")
+    );
+}
+
+#[test]
+fn window_and_pane_management_work_through_keyboard_events() {
+    let server = PrivateServer::new();
+    let session = server.client.new_session("layout", cwd()).expect("session");
+    let mut app = App::new(
+        &server.client,
+        AppOptions {
+            initial_command: Some("/window".into()),
+        },
+    );
+    key(&mut app, KeyCode::Char('n'), KeyModifiers::CONTROL);
+    key(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+    text(&mut app, "build");
+    key(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+    let windows = server
+        .client
+        .list_windows(Some(&session.id))
+        .expect("new window");
+    assert_eq!(windows.len(), 2);
+    let added = windows
+        .iter()
+        .find(|w| w.name == "build")
+        .expect("build window");
+    key(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+    text(&mut app, "build");
+    key(&mut app, KeyCode::Char('e'), KeyModifiers::CONTROL);
+    key(&mut app, KeyCode::Char('u'), KeyModifiers::CONTROL);
+    text(&mut app, "tests");
+    key(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+    assert!(
+        server
+            .client
+            .list_windows(Some(&session.id))
+            .expect("renamed window")
+            .iter()
+            .any(|w| w.id == added.id && w.name == "tests")
+    );
+    key(&mut app, KeyCode::Char('u'), KeyModifiers::CONTROL);
+    text(&mut app, "tests");
+    key(&mut app, KeyCode::Char('k'), KeyModifiers::CONTROL);
+    key(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+    assert_eq!(
+        server
+            .client
+            .list_windows(Some(&session.id))
+            .expect("cancelled")
+            .len(),
+        2
+    );
+    key(&mut app, KeyCode::Char('k'), KeyModifiers::CONTROL);
+    text(&mut app, "yes");
+    key(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+    assert_eq!(
+        server
+            .client
+            .list_windows(Some(&session.id))
+            .expect("killed window")
+            .len(),
+        1
+    );
+
+    let mut app = App::new(
+        &server.client,
+        AppOptions {
+            initial_command: Some("/split".into()),
+        },
+    );
+    key(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+    key(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+    assert_eq!(
+        server.client.list_panes(None).expect("split panes").len(),
+        2
+    );
+    let mut app = App::new(
+        &server.client,
+        AppOptions {
+            initial_command: Some("/pane".into()),
+        },
+    );
+    key(&mut app, KeyCode::Down, KeyModifiers::NONE);
+    key(&mut app, KeyCode::Char('k'), KeyModifiers::CONTROL);
+    key(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+    assert_eq!(server.client.list_panes(None).expect("cancelled").len(), 2);
+    key(&mut app, KeyCode::Char('k'), KeyModifiers::CONTROL);
+    text(&mut app, "yes");
+    key(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+    assert_eq!(
+        server
+            .client
+            .list_panes(None)
+            .expect("confirmed pane kill")
+            .len(),
+        1
+    );
 }
 
 #[test]
@@ -186,6 +333,54 @@ fn windows_and_panes_are_real_tmux_objects() {
             .expect("remaining")
             .len(),
         1
+    );
+}
+
+#[test]
+fn split_preserves_a_directory_with_spaces_and_unicode() {
+    let directory = tempfile::Builder::new()
+        .prefix("jm workspace 空格 ")
+        .tempdir()
+        .expect("workspace");
+    let expected = directory
+        .path()
+        .canonicalize()
+        .expect("canonical workspace");
+    let server = PrivateServer::new();
+    let session = server
+        .client
+        .new_session("workspace", directory.path())
+        .expect("session");
+    let original = server
+        .client
+        .list_panes(None)
+        .expect("panes")
+        .into_iter()
+        .find(|pane| pane.session_id == session.id)
+        .expect("original pane");
+    let split = server
+        .client
+        .split_pane(&original.id, SplitDirection::SideBySide)
+        .expect("split");
+    // The first -P format may precede tmux observing the new shell's cwd.
+    let mut actual = None;
+    for _ in 0..100 {
+        actual = server
+            .client
+            .list_panes(Some(&original.window_id))
+            .expect("split panes")
+            .into_iter()
+            .find(|pane| pane.id == split.id)
+            .and_then(|pane| Path::new(&pane.current_path).canonicalize().ok());
+        if actual.as_ref() == Some(&expected) {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert_eq!(
+        actual,
+        Some(expected),
+        "split must start in the target pane's directory"
     );
 }
 

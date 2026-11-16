@@ -25,3 +25,10 @@ jobs:
       - run: cargo clippy --all-targets --all-features -- -D warnings
       - run: cargo test --all
       - run: cargo build --release
+      - name: Verify installed command names
+        shell: bash
+        run: |
+          install_root="$RUNNER_TEMP/justmux-install"
+          cargo install --path . --locked --root "$install_root"
+          "$install_root/bin/jm" --version
+          "$install_root/bin/justmux" --version

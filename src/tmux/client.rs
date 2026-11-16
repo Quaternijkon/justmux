@@ -369,7 +369,9 @@ impl Tmux for TmuxClient {
             "-t",
             target.as_str(),
             "-c",
-            "#{q:pane_current_path}",
+            // This is already one argv entry. Shell escaping would become a
+            // literal part of the directory and tmux would fall back to HOME.
+            "#{pane_current_path}",
             "-P",
             "-F",
             PANE_FORMAT,

@@ -14,7 +14,7 @@ use std::{
     process::ExitCode,
 };
 
-const KEYBIND: &str = "bind-key j display-popup -E -w 80% -h 70% 'JUSTMUX_CLIENT=$(tmux display-message -p \"#{client_name}\") JUSTMUX_PANE=$(tmux display-message -p \"#{pane_id}\") JUSTMUX_POPUP=1 jm'";
+const KEYBIND: &str = r#"bind-key j run-shell 'tmux display-popup -E -w 80% -h 70% -c #{q:client_name} "JUSTMUX_CLIENT=#{q:client_name} JUSTMUX_PANE=#{q:pane_id} JUSTMUX_POPUP=1 jm"'"#;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -179,8 +179,10 @@ mod tests {
     #[test]
     fn keybind_is_opt_in_and_uses_native_popup() {
         assert!(KEYBIND.contains("display-popup -E"));
-        assert!(KEYBIND.contains("JUSTMUX_CLIENT=$(tmux display-message"));
-        assert!(KEYBIND.contains("JUSTMUX_PANE=$(tmux display-message"));
+        assert!(KEYBIND.contains("run-shell"));
+        assert!(KEYBIND.contains("-c #{q:client_name}"));
+        assert!(KEYBIND.contains("JUSTMUX_CLIENT=#{q:client_name}"));
+        assert!(KEYBIND.contains("JUSTMUX_PANE=#{q:pane_id}"));
         assert!(
             Cli::try_parse_from(["jm", "--print-keybind"])
                 .expect("keybind CLI")
