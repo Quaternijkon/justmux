@@ -20,12 +20,31 @@ commands, and hands control back to tmux as soon as you enter a session.
 ## Requirements
 
 - Rust 1.88 or newer for source builds.
+- Node.js 22.15+ with `process.execve` support for npm installations (Node.js 24
+  LTS is recommended). npm installs precompiled binaries; Rust is not needed.
 - tmux 3.2 or newer for the optional popup integration (ordinary `jm` use
   works with older tmux versions where the server supports the requested
   operation).
 - macOS or Linux with a UTF-8 capable terminal.
 
 ## Install
+
+Install or update from [npm](https://www.npmjs.com/package/justmux):
+
+```sh
+npm install -g justmux@latest
+```
+
+Both `jm` and `justmux` start the same program. npm selects the binary for
+macOS or Linux on Intel/AMD x64 or ARM64. Linux packages are static musl builds
+and work on both glibc and musl systems. Keep optional dependencies enabled.
+tmux must be installed separately; for example, `brew install tmux` on macOS
+or `sudo apt install tmux` on Debian/Ubuntu. The npm launcher replaces its
+process with the Rust executable, so it does not stay in the background.
+
+Release preparation and publication run locally; GitHub builds are optional.
+See [npm release instructions](docs/npm-release.md). The npm source template is
+private to prevent accidental publication; only generated packages are released.
 
 Install from this checkout:
 
@@ -126,6 +145,21 @@ cargo test --all
 cargo build --release
 ```
 
+To test the npm packaging and real installation/update workflow without
+publishing anything:
+
+```sh
+npm --prefix npm/justmux test
+node --test tests/npm-packages.test.mjs
+node --test tests/release-workflow.test.mjs
+node scripts/test-npm-install.mjs --pty
+```
+
+The last command uses packed files and a temporary loopback registry and global
+prefix. It also checks native tmux handoff and two-client popup switching through
+the installed npm launcher. On Linux, pass `--binary` pointing to the static
+musl release build.
+
 Integration tests use private tmux sockets and clean them up automatically.
 Never run destructive tmux commands against your default server while
 developing. Manual interaction is best checked in Ghostty, iTerm2, or a
@@ -138,6 +172,18 @@ socket:
 ```sh
 python3 scripts/pty_smoke.py
 ```
+
+To release from this Mac with one command, after committing your changes:
+
+```sh
+./scripts/release 0.1.1
+```
+
+This updates the version, runs checks, builds all four platforms, pushes the
+release source and tag to GitHub, and publishes the npm packages. Use `--dry-run`
+to preview, `--commit` to include all nonignored working-tree changes, or
+`--resume` to continue a failed release at the same version. npm may ask for
+browser-based 2FA. See [the local release workflow](docs/local-release.md).
 
 ## FAQ and limitations
 

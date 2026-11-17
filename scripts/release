@@ -1,0 +1,6 @@
+#!/bin/sh
+set -eu
+
+PATH="${CARGO_HOME:-$HOME/.cargo}/bin:$PATH"
+export PATH
+exec node "$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)/release.mjs" "$@"

@@ -60,3 +60,27 @@ passed, including two clients attached to the same source session. The popup
 was opened by actual Prefix+j input; cancellation and `/resume` preserved the
 source sleep PID and did not switch the other client. A real capture was written
 to `/tmp/justmux-inline-regression.cast`, leaving the checked-in demo unchanged.
+
+## npm distribution checks
+
+`node scripts/test-npm-install.mjs --pty` packs the real Rust executable and
+installs it into a temporary global prefix using a loopback fixture registry.
+It checks both command names, an incomplete install's error message, and a
+version update using explicit fixture executables. It then runs the external
+attach and two-client popup assertions above through the installed npm launcher.
+No packages are published and the user's global npm installation is unchanged.
+
+Verified on 2026-11-17 on macOS ARM64 with Node.js 24.22.2, npm 11.19.1, and
+tmux 3.8: these npm checks and all nine direct Rust PTY checks passed. The new
+PTY capture is `/tmp/justmux-npm-release-validation.cast`. All four native npm
+artifacts were built locally with Rust 1.100.0, macOS SDK 27.2, Zig 0.17.1, and
+cargo-zigbuild 0.24.1. Intel macOS and both Linux executables passed architecture
+inspection; their runtime behavior has not been verified on those platforms.
+
+The published `0.1.0` packages were also checked against the public npm registry:
+all five integrity values matched the local tarballs, and an anonymous fresh
+`npm install --global --prefix <temporary-directory> justmux@latest` succeeded.
+Both command names resolved through that prefix's `PATH`. External attach/detach
+and two-client popup cancellation/switching passed through this public npm install;
+the temporary installation was removed afterward. This remains automated PTY
+coverage rather than named-terminal visual acceptance.

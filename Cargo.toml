@@ -6,9 +6,10 @@ rust-version = "1.88"
 description = "A modern slash-command interface for tmux. Just tmux. Just simpler."
 license = "MIT"
 readme = "README.md"
+repository = "https://github.com/Quaternijkon/justmux"
 keywords = ["tmux", "tui", "terminal", "cli", "ratatui"]
 categories = ["command-line-utilities"]
-exclude = ["/.github", "/assets/*.cast", "/assets/*.gif"]
+exclude = ["/.github", "/assets/*.cast", "/assets/*.gif", "/npm", "/dist"]
 
 [lib]
 name = "justmux"

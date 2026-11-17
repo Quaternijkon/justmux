@@ -25,6 +25,15 @@ jobs:
       - run: cargo clippy --all-targets --all-features -- -D warnings
       - run: cargo test --all
       - run: cargo build --release
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - run: npm --prefix npm/justmux test
+      - run: node --test tests/npm-packages.test.mjs
+      - run: node --test tests/release-workflow.test.mjs
+      - name: Verify npm install and update locally
+        if: runner.os == 'macOS'
+        run: node scripts/test-npm-install.mjs --pty
       - name: Verify installed command names
         shell: bash
         run: |
