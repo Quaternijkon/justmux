@@ -5,7 +5,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import { closeSync, existsSync, lstatSync, mkdirSync, openSync, readFileSync, readdirSync, renameSync, unlinkSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
-import { compareVersions } from './npm-packages.mjs';
+import { compareVersions, SUPPORTED_PLATFORMS } from './npm-packages.mjs';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const PHASES = ['preparing', 'prepared', 'checked', 'built', 'tested', 'tagged', 'pushed', 'published'];
@@ -181,7 +181,9 @@ function remotePreflight(root, context, state) {
 
 const production = {
   async preflight(root) {
-    if (process.platform !== 'darwin') throw new Error('The complete four-platform local release requires macOS and the Apple SDK');
+    if (process.platform !== 'darwin' || process.arch !== 'arm64') {
+      throw new Error('The complete local release requires macOS ARM64 and the Apple SDK');
+    }
     if (compareVersions(process.versions.node, '22.15.0') < 0 || typeof process.execve !== 'function') {
       throw new Error('Node.js 22.15 or newer with process.execve is required; Node.js 24 LTS is recommended');
     }
@@ -191,7 +193,7 @@ const production = {
       ['npm', ['whoami', '--registry', 'https://registry.npmjs.org']],
     ]) command(root, program, args, { capture: true, timeout: 30_000 });
     const targets = command(root, 'rustup', ['target', 'list', '--installed'], { capture: true }).split(/\s+/);
-    for (const target of ['aarch64-apple-darwin', 'x86_64-apple-darwin', 'aarch64-unknown-linux-musl', 'x86_64-unknown-linux-musl']) {
+    for (const { target } of SUPPORTED_PLATFORMS) {
       if (!targets.includes(target)) throw new Error(`Missing Rust target: rustup target add ${target}`);
     }
   },
@@ -235,7 +237,7 @@ export async function release(options, hooks = {}) {
   if (!options.resume && !options.commitChanges && !clean(root)) throw new Error('Working tree is dirty; review changes and explicitly use --commit to include all nonignored files');
   if (!options.resume && existsSync(statePath)) throw new Error('Release state already exists; inspect it and use --resume');
   if (options.dryRun) {
-    console.log(`Dry run: ${options.resume ? 'resume' : 'prepare'} JustMux ${version} on main; check, build all four platforms, test installation, annotate v${version}, atomically push origin main + tag, then publish and verify npm.`);
+    console.log(`Dry run: ${options.resume ? 'resume' : 'prepare'} JustMux ${version} on main; check, build macOS ARM64 and Linux x64, test installation, annotate v${version}, atomically push origin main + tag, then publish and verify npm.`);
     console.log(`Artifacts: ${context.out}\nNo files, Git refs, npm packages, or remote state were changed.`);
     return { ...context, dryRun: true };
   }

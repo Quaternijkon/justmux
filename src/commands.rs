@@ -12,6 +12,7 @@ pub enum CommandKind {
     Pane,
     Split,
     Help,
+    Exit,
     Quit,
 }
 impl CommandKind {
@@ -26,6 +27,7 @@ impl CommandKind {
             Self::Pane => "pane",
             Self::Split => "split",
             Self::Help => "help",
+            Self::Exit => "exit",
             Self::Quit => "quit",
         }
     }
@@ -50,7 +52,7 @@ pub const COMMANDS: &[SlashCommand] = &[
         kind: CommandKind::Resume,
         name: "resume",
         aliases: &["r"],
-        description: "Resume an existing tmux session",
+        description: "Open a window in an existing tmux session",
         usage: "/resume",
     },
     SlashCommand {
@@ -85,7 +87,7 @@ pub const COMMANDS: &[SlashCommand] = &[
         kind: CommandKind::Window,
         name: "window",
         aliases: &["w"],
-        description: "Manage windows",
+        description: "Open, create, rename, or close windows",
         usage: "/window",
     },
     SlashCommand {
@@ -110,9 +112,16 @@ pub const COMMANDS: &[SlashCommand] = &[
         usage: "/help [command]",
     },
     SlashCommand {
+        kind: CommandKind::Exit,
+        name: "exit",
+        aliases: &[],
+        description: "Detach the current tmux client",
+        usage: "/exit",
+    },
+    SlashCommand {
         kind: CommandKind::Quit,
         name: "quit",
-        aliases: &["q", "exit"],
+        aliases: &["q"],
         description: "Quit JustMux",
         usage: "/quit",
     },
@@ -206,6 +215,8 @@ mod tests {
     fn parses() {
         assert_eq!(parse("/resume").unwrap().command, CommandKind::Resume);
         assert_eq!(parse("/r").unwrap().command, CommandKind::Resume);
+        assert_eq!(parse("/exit").unwrap().command, CommandKind::Exit);
+        assert_eq!(parse("/q").unwrap().command, CommandKind::Quit);
     }
     #[test]
     fn quoted() {

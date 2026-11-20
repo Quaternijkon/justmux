@@ -4,16 +4,14 @@ const fs = require('node:fs');
 const path = require('node:path');
 
 const SUPPORTED_PLATFORMS = Object.freeze([
-  Object.freeze({ platform: 'darwin', arch: 'x64', target: 'x86_64-apple-darwin' }),
   Object.freeze({ platform: 'darwin', arch: 'arm64', target: 'aarch64-apple-darwin' }),
   Object.freeze({ platform: 'linux', arch: 'x64', target: 'x86_64-unknown-linux-musl' }),
-  Object.freeze({ platform: 'linux', arch: 'arm64', target: 'aarch64-unknown-linux-musl' }),
 ]);
 
 function platformPackageName(mainName, platform, arch) {
   if (!SUPPORTED_PLATFORMS.some((entry) => entry.platform === platform && entry.arch === arch)) {
     throw new Error(
-      `Unsupported platform ${platform}/${arch}. JustMux supports macOS and Linux on x64 and arm64.`,
+      `Unsupported platform ${platform}/${arch}. JustMux supports macOS arm64 and Linux x64.`,
     );
   }
   return `${mainName}-${platform}-${arch}`;

@@ -4,13 +4,13 @@ use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
 use justmux::{
     app::{App, AppOptions},
     tmux::{SocketSpec, TmuxClient},
-    ui::{CommandItem, TextInput, Theme, render_form_scrolled, render_home, render_picker},
+    ui::{CommandItem, HomeDetails, TextInput, Theme, render_form_scrolled, render_home},
 };
 use ratatui::{
     Terminal, TerminalOptions, Viewport,
     backend::{Backend, TestBackend},
     layout::Position,
-    style::Modifier,
+    style::{Color, Modifier},
 };
 
 fn key(app: &mut App<'_>, code: KeyCode) {
@@ -36,13 +36,50 @@ fn screen(terminal: &Terminal<TestBackend>) -> String {
 }
 
 #[test]
+fn welcome_shows_version_directory_context_and_colored_commands() {
+    let mut terminal = Terminal::new(TestBackend::new(72, 16)).expect("test terminal");
+    terminal
+        .draw(|frame| {
+            render_home(
+                frame,
+                frame.area(),
+                &TextInput::default(),
+                &[],
+                0,
+                HomeDetails {
+                    directory: Some("~/project/justmux"),
+                    context: "popup",
+                    session: Some("work session"),
+                    status: None,
+                },
+                Theme::default(),
+            );
+        })
+        .expect("draw welcome screen");
+    let output = screen(&terminal);
+    assert!(output.contains(concat!("◫ JustMux (v", env!("CARGO_PKG_VERSION"), ")")));
+    assert!(output.contains("⌂ ~/project/justmux"));
+    assert!(output.contains("tmux popup · work session"));
+    assert!(output.contains("Create a tmux session"));
+    assert!(output.contains("/help"));
+    let buffer = terminal.backend().buffer();
+    assert_eq!(buffer[(0, 0)].fg, Color::Cyan);
+    assert!(
+        buffer
+            .content()
+            .iter()
+            .any(|cell| cell.symbol() == "/" && cell.fg == Color::Green)
+    );
+}
+
+#[test]
 fn home_and_command_popup_are_visible_in_test_backend() {
     let backend = TestBackend::new(72, 18);
     let mut terminal = Terminal::new(backend).expect("test terminal");
     let input = TextInput::new("/");
     let commands = [CommandItem {
         name: "resume",
-        description: "Resume an existing tmux session",
+        description: "Open a window in an existing tmux session",
     }];
     terminal
         .draw(|frame| {
@@ -52,7 +89,7 @@ fn home_and_command_popup_are_visible_in_test_backend() {
                 &input,
                 &commands,
                 0,
-                None,
+                HomeDetails::default(),
                 Theme::default(),
             )
         })
@@ -60,28 +97,21 @@ fn home_and_command_popup_are_visible_in_test_backend() {
     let output = screen(&terminal);
     assert!(output.contains("JustMux"));
     assert!(output.contains("/resume"));
-    assert!(output.contains("Resume an existing tmux session"));
+    assert!(output.contains("Open a window in an existing tmux session"));
 }
 
 #[test]
-fn empty_picker_has_a_clear_empty_state() {
+fn resume_grid_has_a_clear_empty_state() {
+    let tmux = private_tmux();
+    let mut app = App::new(
+        &tmux,
+        AppOptions {
+            initial_command: Some("/resume".into()),
+        },
+    );
     let backend = TestBackend::new(60, 12);
     let mut terminal = Terminal::new(backend).expect("test terminal");
-    terminal
-        .draw(|frame| {
-            render_picker(
-                frame,
-                frame.area(),
-                "Resume session",
-                &TextInput::default(),
-                &[],
-                0,
-                "No tmux sessions",
-                "Esc back",
-                Theme::default(),
-            )
-        })
-        .expect("draw picker");
+    terminal.draw(|frame| app.render(frame)).expect("draw grid");
     assert!(screen(&terminal).contains("No tmux sessions"));
 }
 
@@ -98,7 +128,7 @@ fn app_opens_palette_on_slash() {
     terminal.draw(|frame| app.render(frame)).expect("draw app");
     let output = screen(&terminal);
     assert!(output.contains("/resume"));
-    assert!(output.contains("Resume an existing tmux session"));
+    assert!(output.contains("Open a window in an existing tmux session"));
 }
 
 #[test]
@@ -111,7 +141,7 @@ fn enter_executes_highlighted_command_instead_of_valid_alias() {
     let mut terminal = Terminal::new(TestBackend::new(72, 18)).expect("test terminal");
     terminal.draw(|frame| app.render(frame)).expect("draw");
     assert!(screen(&terminal).contains("Rename session"));
-    assert!(!screen(&terminal).contains("Resume session"));
+    assert!(!screen(&terminal).contains("Search:"));
 }
 
 #[test]
@@ -140,7 +170,7 @@ fn command_arguments_are_parsed_instead_of_replaced_by_completion() {
 
 #[test]
 fn narrow_home_scrolls_long_input_and_keeps_caret_visible() {
-    let mut terminal = Terminal::new(TestBackend::new(20, 10)).expect("test terminal");
+    let mut terminal = Terminal::new(TestBackend::new(20, 6)).expect("test terminal");
     terminal
         .draw(|frame| {
             render_home(
@@ -149,12 +179,34 @@ fn narrow_home_scrolls_long_input_and_keeps_caret_visible() {
                 &TextInput::new("abcdefghijklmnopqrstuvwxyz"),
                 &[],
                 0,
-                None,
-                Theme::default(),
+                HomeDetails {
+                    directory: Some("~/a/very/long/folder/path/project"),
+                    context: "pane",
+                    session: Some("work"),
+                    status: None,
+                },
+                Theme {
+                    no_color: true,
+                    ascii: true,
+                    ..Theme::default()
+                },
             )
         })
         .expect("draw");
-    assert!(screen(&terminal).contains("z"));
+    let output = screen(&terminal);
+    assert!(output.contains("[] JustMux"));
+    assert!(output.contains("dir ..."));
+    assert!(output.contains("/project"));
+    assert!(output.contains("z"));
+    assert!(output.is_ascii());
+    assert!(
+        terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .all(|cell| cell.fg == Color::Reset)
+    );
     assert!(
         terminal
             .backend()
@@ -170,7 +222,7 @@ fn short_palette_scrolls_to_selected_last_command() {
     let tmux = private_tmux();
     let mut app = App::new(&tmux, AppOptions::default());
     type_text(&mut app, "/");
-    for _ in 0..9 {
+    for _ in 1..justmux::commands::registry().len() {
         key(&mut app, KeyCode::Down);
     }
     let mut terminal = Terminal::new(TestBackend::new(30, 8)).expect("test terminal");
@@ -230,7 +282,7 @@ fn inline_menu_preserves_output_above_a_small_viewport() {
         screen(&terminal).contains("/resume"),
         "first candidate must remain visible"
     );
-    for _ in 0..9 {
+    for _ in 1..justmux::commands::registry().len() {
         key(&mut app, KeyCode::Down);
     }
     terminal

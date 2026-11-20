@@ -25,7 +25,7 @@ commands, and hands control back to tmux as soon as you enter a session.
 - tmux 3.2 or newer for the optional popup integration (ordinary `jm` use
   works with older tmux versions where the server supports the requested
   operation).
-- macOS or Linux with a UTF-8 capable terminal.
+- macOS ARM64 (Apple Silicon) or Linux x64 with a UTF-8 capable terminal.
 
 ## Install
 
@@ -36,11 +36,33 @@ npm install -g justmux@latest
 ```
 
 Both `jm` and `justmux` start the same program. npm selects the binary for
-macOS or Linux on Intel/AMD x64 or ARM64. Linux packages are static musl builds
-and work on both glibc and musl systems. Keep optional dependencies enabled.
+macOS ARM64 or Linux x64. The Linux package is a static musl build and works on
+both glibc and musl systems. Keep optional dependencies enabled.
 tmux must be installed separately; for example, `brew install tmux` on macOS
 or `sudo apt install tmux` on Debian/Ubuntu. The npm launcher replaces its
 process with the Rust executable, so it does not stay in the background.
+
+Global npm installs check for updates when `jm` or `justmux` starts interactively
+without a command (also with `--fullscreen`). At most once a day, a check waits
+up to three seconds for npm. A newer version opens an inline picker:
+
+```text
+JustMux update available
+0.1.1 -> 0.1.2
+
+> 1. Update
+  2. Skip
+  3. Skip this version
+```
+
+Use Up/Down and Enter, or press 1, 2, or 3. `Update` is initially selected;
+it installs that exact version and exits, so run `jm` again afterward. `Skip`
+(also Esc) continues this launch; `Skip this version` remembers the dismissal
+until a different version is available. The picker uses a compact region in
+the current terminal and restores input and the cursor before continuing.
+Ctrl+C cancels startup. Offline checks and failed updates let you keep using
+JustMux. Set `JUSTMUX_NO_UPDATE_CHECK=1` to disable checks. Help, version,
+direct commands, CI, and noninteractive runs skip them.
 
 Release preparation and publication run locally; GitHub builds are optional.
 See [npm release instructions](docs/npm-release.md). The npm source template is
@@ -75,9 +97,12 @@ The equivalent long-form invocation is `./target/release/justmux`.
 
 ## Quick start
 
-Run `jm` from a normal shell. Type `/` to open the command menu, then choose
-`/resume` and press Enter to attach to a session. The TUI is torn down before
-tmux receives the terminal, so tmux owns all keyboard input after that point.
+Run `jm` from a normal shell and open `/resume`. Sessions run across the grid,
+with their windows listed beneath them. Use Left/Right to choose a session
+and Up/Down to select a window, or type a session or window name to filter.
+Enter opens the highlighted window. Each session defaults to its active window,
+and narrower terminals show fewer columns at a time. The TUI is torn down
+before tmux takes over the terminal and keyboard.
 
 By default, JustMux uses a compact region of the main screen instead of
 entering an alternate screen. Existing shell output stays above it, and the
@@ -94,6 +119,11 @@ When `jm` is launched in a tmux pane (including a `display-popup`), choosing a
 session uses `switch-client`; closing the popup leaves the program in the pane
 below it untouched.
 
+Run `/exit` inside tmux to detach and return to the terminal that opened the
+tmux client. You can reconnect to the session with `/resume`. If several
+clients share the same window, open JustMux with the popup binding below so
+it can identify your client. Use `/quit` to close JustMux while staying in tmux.
+
 Recommended popup binding (tmux 3.2+):
 
 ```tmux
@@ -101,13 +131,14 @@ bind-key j run-shell 'tmux display-popup -E -w 80% -h 70% -c #{q:client_name} "J
 ```
 
 `run-shell` expands the launching client's identity before opening the popup.
-This keeps switching scoped to that client even when several clients share a session.
+This keeps switching and detaching scoped to that client even when several
+clients share a session.
 
 ## Slash commands
 
 | Command | Action |
 | --- | --- |
-| `/resume` | Search sessions and attach or switch to one |
+| `/resume` | Search sessions and windows, then open a window from the grid |
 | `/new` | Create a detached session, optionally with a working directory |
 | `/list` | Browse current sessions |
 | `/rename` | Rename a session |
@@ -116,7 +147,15 @@ This keeps switching scoped to that client even when several clients share a ses
 | `/pane` | Inspect and manage panes |
 | `/split` | Split the current pane horizontally or vertically |
 | `/help` | Show command and keyboard help |
+| `/exit` | Detach the current tmux client, or quit JustMux from outside tmux |
 | `/quit` | Exit JustMux and return to the shell |
+
+In `/window`, choose **New window** to select a session and enter an optional
+name. To manage an existing window, filter by session or window name, select
+it, and press Enter for **Open window**, **Rename window**, or **Close window**.
+Closing ends the programs running in that window and requires typing `yes`
+and pressing Enter. In `/list` and `/pane`, Enter on a row opens its actions.
+Choose **Refresh list** in an unfiltered list to reload it.
 
 The command popup filters as you type. Use Up/Down to move, Tab to complete,
 Enter to run, Esc to return, and Ctrl+C to quit safely. Session and resource
@@ -128,7 +167,7 @@ used.
 JustMux is an on-demand client of an existing tmux server. It does not emulate
 a terminal, create a private server, maintain session state, or modify
 `~/.tmux.conf`. Outside tmux it replaces itself with `tmux attach-session`; in
-tmux it runs `switch-client` and exits. Existing clients remain attached.
+tmux it uses `switch-client` to enter a session and `detach-client` for `/exit`.
 Destructive actions always require an explicit confirmation.
 
 Use `jm -L NAME` or `jm -S PATH` when you intentionally manage a custom tmux
@@ -176,10 +215,10 @@ python3 scripts/pty_smoke.py
 To release from this Mac with one command, after committing your changes:
 
 ```sh
-./scripts/release 0.1.1
+./scripts/release 0.1.2
 ```
 
-This updates the version, runs checks, builds all four platforms, pushes the
+This updates the version, runs checks, builds both supported platforms, pushes the
 release source and tag to GitHub, and publishes the npm packages. Use `--dry-run`
 to preview, `--commit` to include all nonignored working-tree changes, or
 `--resume` to continue a failed release at the same version. npm may ask for

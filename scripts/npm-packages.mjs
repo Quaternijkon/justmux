@@ -236,7 +236,7 @@ export async function verifyPacked(directory) {
     const metadata = JSON.parse(command('tar', ['-xOf', path, 'package/package.json']));
     if (JSON.stringify(metadata) !== JSON.stringify(expected)) throw new Error(`Packed metadata changed: ${record.name}`);
     const contents = packages[i].platform
-      ? ['bin/jm'] : ['bin/justmux.cjs', 'lib/launcher.cjs'];
+      ? ['bin/jm'] : ['bin/justmux.cjs', 'lib/launcher.cjs', 'lib/update.cjs', 'lib/update-prompt.cjs'];
     for (const file of contents) {
       const packedBytes = command('tar', ['-xOf', path, `package/${file}`], { encoding: null });
       const preparedBytes = await readFile(join(packages[i].path, file));

@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
-use justmux::app::{App, AppOptions};
+use justmux::app::{App, AppOptions, Exit};
 use justmux::tmux::{
     Context, SessionId, SocketSpec, SplitDirection, Target, Tmux, TmuxClient, TmuxError,
 };
@@ -55,47 +55,48 @@ fn cwd() -> &'static Path {
     Path::new(env!("CARGO_MANIFEST_DIR"))
 }
 
-fn key(app: &mut App<'_>, code: KeyCode, modifiers: KeyModifiers) {
-    app.handle_event(Event::Key(KeyEvent::new(code, modifiers)));
+fn keys(app: &mut App<'_>, codes: &[KeyCode]) {
+    for &code in codes {
+        app.handle_event(Event::Key(KeyEvent::new(code, KeyModifiers::NONE)));
+    }
 }
 
 fn text(app: &mut App<'_>, value: &str) {
     for character in value.chars() {
-        key(app, KeyCode::Char(character), KeyModifiers::NONE);
+        keys(app, &[KeyCode::Char(character)]);
     }
 }
 
 #[test]
 fn session_management_works_through_keyboard_events() {
+    use KeyCode::{Down, Enter, Esc};
+
     let server = PrivateServer::new();
     let mut app = App::new(&server.client, AppOptions::default());
     text(&mut app, "/new");
-    key(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+    keys(&mut app, &[Enter]);
     text(&mut app, "项目 workspace");
-    key(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+    keys(&mut app, &[Enter]);
     text(&mut app, env!("CARGO_MANIFEST_DIR"));
-    key(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+    keys(&mut app, &[Enter]);
     let sessions = server.client.list_sessions().expect("created sessions");
     assert_eq!(sessions.len(), 1);
     let session = &sessions[0];
     assert_eq!(session.name, "项目 workspace");
 
-    key(&mut app, KeyCode::Esc, KeyModifiers::NONE);
-    key(&mut app, KeyCode::Char('e'), KeyModifiers::CONTROL);
-    key(&mut app, KeyCode::Char('u'), KeyModifiers::CONTROL);
+    keys(&mut app, &[Esc, Enter, Down, Enter]);
     text(&mut app, "renamed project");
-    key(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+    keys(&mut app, &[Enter]);
     let renamed = server.client.list_sessions().expect("renamed sessions");
     assert_eq!(renamed[0].id, session.id);
     assert_eq!(renamed[0].name, "renamed project");
 
     // A lone Enter at the destructive confirmation must cancel.
-    key(&mut app, KeyCode::Char('k'), KeyModifiers::CONTROL);
-    key(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+    keys(&mut app, &[Enter, Down, Down, Enter, Enter]);
     assert!(server.client.has_session(&session.id).expect("not killed"));
-    key(&mut app, KeyCode::Char('k'), KeyModifiers::CONTROL);
+    keys(&mut app, &[Enter, Down, Down, Enter]);
     text(&mut app, "yes");
-    key(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+    keys(&mut app, &[Enter]);
     assert!(
         !server
             .client
@@ -106,6 +107,8 @@ fn session_management_works_through_keyboard_events() {
 
 #[test]
 fn window_and_pane_management_work_through_keyboard_events() {
+    use KeyCode::{Backspace, Down, Enter, Esc};
+
     let server = PrivateServer::new();
     let session = server.client.new_session("layout", cwd()).expect("session");
     let mut app = App::new(
@@ -114,10 +117,9 @@ fn window_and_pane_management_work_through_keyboard_events() {
             initial_command: Some("/window".into()),
         },
     );
-    key(&mut app, KeyCode::Char('n'), KeyModifiers::CONTROL);
-    key(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+    keys(&mut app, &[Enter, Enter]);
     text(&mut app, "build");
-    key(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+    keys(&mut app, &[Enter]);
     let windows = server
         .client
         .list_windows(Some(&session.id))
@@ -127,12 +129,11 @@ fn window_and_pane_management_work_through_keyboard_events() {
         .iter()
         .find(|w| w.name == "build")
         .expect("build window");
-    key(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+    keys(&mut app, &[Esc]);
     text(&mut app, "build");
-    key(&mut app, KeyCode::Char('e'), KeyModifiers::CONTROL);
-    key(&mut app, KeyCode::Char('u'), KeyModifiers::CONTROL);
+    keys(&mut app, &[Enter, Down, Enter]);
     text(&mut app, "tests");
-    key(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+    keys(&mut app, &[Enter]);
     assert!(
         server
             .client
@@ -141,10 +142,9 @@ fn window_and_pane_management_work_through_keyboard_events() {
             .iter()
             .any(|w| w.id == added.id && w.name == "tests")
     );
-    key(&mut app, KeyCode::Char('u'), KeyModifiers::CONTROL);
+    keys(&mut app, &[Backspace; 5]);
     text(&mut app, "tests");
-    key(&mut app, KeyCode::Char('k'), KeyModifiers::CONTROL);
-    key(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+    keys(&mut app, &[Enter, Down, Down, Enter, Enter]);
     assert_eq!(
         server
             .client
@@ -153,9 +153,9 @@ fn window_and_pane_management_work_through_keyboard_events() {
             .len(),
         2
     );
-    key(&mut app, KeyCode::Char('k'), KeyModifiers::CONTROL);
+    keys(&mut app, &[Enter, Down, Down, Enter]);
     text(&mut app, "yes");
-    key(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+    keys(&mut app, &[Enter]);
     assert_eq!(
         server
             .client
@@ -171,8 +171,7 @@ fn window_and_pane_management_work_through_keyboard_events() {
             initial_command: Some("/split".into()),
         },
     );
-    key(&mut app, KeyCode::Enter, KeyModifiers::NONE);
-    key(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+    keys(&mut app, &[Enter, Enter]);
     assert_eq!(
         server.client.list_panes(None).expect("split panes").len(),
         2
@@ -183,13 +182,11 @@ fn window_and_pane_management_work_through_keyboard_events() {
             initial_command: Some("/pane".into()),
         },
     );
-    key(&mut app, KeyCode::Down, KeyModifiers::NONE);
-    key(&mut app, KeyCode::Char('k'), KeyModifiers::CONTROL);
-    key(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+    keys(&mut app, &[Down, Enter, Down, Enter, Enter]);
     assert_eq!(server.client.list_panes(None).expect("cancelled").len(), 2);
-    key(&mut app, KeyCode::Char('k'), KeyModifiers::CONTROL);
+    keys(&mut app, &[Enter, Down, Enter]);
     text(&mut app, "yes");
-    key(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+    keys(&mut app, &[Enter]);
     assert_eq!(
         server
             .client
@@ -493,6 +490,73 @@ fn selection_deleted_by_another_client_is_detected() {
             .client
             .has_session(&keeper.id)
             .expect("other session")
+    );
+}
+
+#[test]
+fn resume_refreshes_when_a_selected_window_is_unlinked() {
+    use KeyCode::{Down, Enter};
+
+    let server = PrivateServer::new();
+    let origin = server
+        .client
+        .new_session("origin", cwd())
+        .expect("source session");
+    let target = server
+        .client
+        .new_session("target", cwd())
+        .expect("target session");
+    let shared = server
+        .client
+        .new_window(&origin.id, Some("shared"), None)
+        .expect("shared window");
+    let link = format!("{}:7", target.id);
+    assert!(
+        server
+            .tmux(&["link-window", "-d", "-s", shared.id.as_str(), "-t", &link])
+            .status
+            .success()
+    );
+    let mut app = App::new(
+        &server.client,
+        AppOptions {
+            initial_command: Some("/resume".into()),
+        },
+    );
+    text(&mut app, "target");
+    keys(&mut app, &[Down]);
+    assert!(
+        server
+            .tmux(&["unlink-window", "-t", &link])
+            .status
+            .success()
+    );
+    keys(&mut app, &[Enter]);
+    assert!(
+        app.exit().is_none(),
+        "a shared window must not redirect the client to the other session"
+    );
+    assert!(
+        server
+            .client
+            .list_windows(Some(&origin.id))
+            .expect("origin windows")
+            .iter()
+            .any(|window| window.id == shared.id)
+    );
+
+    let remaining = server
+        .client
+        .list_windows(Some(&target.id))
+        .expect("target windows");
+    assert_eq!(remaining.len(), 1);
+    keys(&mut app, &[Down, Enter]);
+    assert_eq!(
+        app.exit(),
+        Some(&Exit::Attach(Target::Window(
+            target.id,
+            remaining[0].id.clone()
+        )))
     );
 }
 

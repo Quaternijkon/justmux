@@ -1,20 +1,26 @@
 //! Application state and keyboard focus. Views never handle keys below the top
 //! of the stack; all tmux mutations happen here, outside the rendering layer.
-use std::path::PathBuf;
+mod resume;
+
+use std::{env, path::PathBuf};
 
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::{
     Frame,
     layout::{Constraint, Layout, Rect},
     text::{Line, Span},
-    widgets::Paragraph,
+    widgets::{List, ListItem, ListState, Paragraph},
 };
+use resume::ResumePicker;
 
 use crate::{
     commands::{self, CommandKind, ParsedCommand, SlashCommand},
     fuzzy,
-    tmux::{Context, Pane, Session, SessionId, SplitDirection, Target, Tmux, TmuxResult, Window},
-    ui::{self, CommandItem, TextInput, Theme},
+    tmux::{
+        Context, InsideContext, Pane, Session, SessionId, SplitDirection, Target, Tmux, TmuxResult,
+        Window,
+    },
+    ui::{self, CommandItem, HomeDetails, TextInput, Theme},
 };
 
 #[derive(Debug, Clone, Default)]
@@ -22,16 +28,30 @@ pub struct AppOptions {
     pub initial_command: Option<String>,
 }
 
+fn working_directory_label() -> Option<String> {
+    let directory = env::current_dir().ok()?;
+    if let Some(home) = env::home_dir()
+        && let Ok(relative) = directory.strip_prefix(home)
+    {
+        return Some(if relative.as_os_str().is_empty() {
+            "~".into()
+        } else {
+            format!("~/{}", relative.display())
+        });
+    }
+    Some(directory.display().to_string())
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Exit {
     Quit,
     Attach(Target),
+    Detach(String),
     Switched,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PickerPurpose {
-    Resume,
     List,
     Rename,
     Kill,
@@ -43,7 +63,6 @@ enum PickerPurpose {
 impl PickerPurpose {
     fn title(self) -> &'static str {
         match self {
-            Self::Resume => "Resume session",
             Self::List => "Sessions",
             Self::Rename => "Rename session — select a session",
             Self::Kill => "Kill session — select a session",
@@ -55,13 +74,8 @@ impl PickerPurpose {
     }
     fn footer(self) -> &'static str {
         match self {
-            Self::Windows => {
-                "↑↓ Navigate · Enter Select · Ctrl+N New · Ctrl+E Rename · Ctrl+K Kill · Ctrl+R Refresh · Esc Back"
-            }
-            Self::Panes => "↑↓ Navigate · Enter Select · Ctrl+K Kill · Ctrl+R Refresh · Esc Back",
-            _ => {
-                "↑↓ Navigate · Enter Select · Ctrl+E Rename · Ctrl+K Kill · Ctrl+R Refresh · Esc Back"
-            }
+            Self::List | Self::Windows | Self::Panes => "Enter Select · Esc Back",
+            _ => "↑↓ Navigate · Enter Select · Esc Back",
         }
     }
 }
@@ -86,7 +100,7 @@ impl Resource {
     fn target(&self) -> Target {
         match self {
             Self::Session(s) => Target::Session(s.id.clone()),
-            Self::Window(w) => Target::Window(w.id.clone()),
+            Self::Window(w) => Target::Window(w.session_id.clone(), w.id.clone()),
             Self::Pane(p) => Target::Pane(p.id.clone()),
         }
     }
@@ -95,6 +109,22 @@ impl Resource {
             Self::Session(s) => &s.id,
             Self::Window(w) => &w.session_id,
             Self::Pane(p) => &p.session_id,
+        }
+    }
+    fn actions(&self) -> &'static [(&'static str, ResourceAction)] {
+        use ResourceAction::{Close, Open, Rename};
+        match self {
+            Self::Session(_) => &[
+                ("Resume session", Open),
+                ("Rename session", Rename),
+                ("Close session", Close),
+            ],
+            Self::Window(_) => &[
+                ("Open window", Open),
+                ("Rename window", Rename),
+                ("Close window", Close),
+            ],
+            Self::Pane(_) => &[("Open pane", Open), ("Close pane", Close)],
         }
     }
     fn description(&self, context: &Context) -> String {
@@ -141,6 +171,14 @@ struct Picker {
     resources: Vec<Resource>,
     selected: usize,
 }
+
+#[derive(Debug, Clone, Copy)]
+enum PickerRow {
+    Resource(usize),
+    NewWindow,
+    Refresh,
+}
+
 impl Picker {
     fn indices(&self) -> Vec<usize> {
         let mut rows: Vec<_> = self
@@ -154,11 +192,21 @@ impl Picker {
         rows.sort_by_key(|&(score, i)| (score, i));
         rows.into_iter().map(|(_, i)| i).collect()
     }
-    fn selected_resource(&self) -> Option<Resource> {
-        self.indices()
-            .get(self.selected)
-            .and_then(|&i| self.resources.get(i))
-            .cloned()
+    fn rows(&self) -> Vec<PickerRow> {
+        let mut rows = Vec::new();
+        if self.purpose == PickerPurpose::Windows && self.query.value().is_empty() {
+            rows.push(PickerRow::NewWindow);
+        }
+        rows.extend(self.indices().into_iter().map(PickerRow::Resource));
+        if self.query.value().is_empty()
+            && matches!(
+                self.purpose,
+                PickerPurpose::List | PickerPurpose::Windows | PickerPurpose::Panes
+            )
+        {
+            rows.push(PickerRow::Refresh);
+        }
+        rows
     }
 }
 
@@ -181,9 +229,19 @@ struct Confirm {
     message: String,
     scroll: u16,
 }
+
+#[derive(Debug, Clone, Copy)]
+enum ResourceAction {
+    Open,
+    Rename,
+    Close,
+}
+
 #[derive(Debug, Clone)]
 enum View {
     Picker(Picker),
+    Resume(ResumePicker),
+    Actions(Resource, usize),
     Form(Form),
     Confirm(Confirm),
     Created(Resource),
@@ -210,6 +268,7 @@ pub struct App<'a> {
     palette_selected: usize,
     views: ViewStack,
     status: String,
+    directory: Option<String>,
     theme: Theme,
     context: Context,
     exit: Option<Exit>,
@@ -223,6 +282,7 @@ impl<'a> App<'a> {
             palette_selected: 0,
             views: ViewStack::default(),
             status: String::new(),
+            directory: working_directory_label(),
             theme: Theme::from_env(),
             context: tmux.context(),
             exit: None,
@@ -268,6 +328,16 @@ impl<'a> App<'a> {
         match self.views.pop() {
             None => self.composer_key(key),
             Some(View::Picker(picker)) => self.picker_key(picker, key),
+            Some(View::Resume(mut picker)) => {
+                let target = picker.handle_key(key);
+                self.views.push(View::Resume(picker));
+                if let Some(target) = target {
+                    self.enter(target);
+                }
+            }
+            Some(View::Actions(resource, selected)) => {
+                self.resource_action_key(resource, selected, key)
+            }
             Some(View::Form(form)) => self.form_key(form, key),
             Some(View::Confirm(confirm)) => self.confirm_key(confirm, key),
             Some(View::Created(resource)) => {
@@ -373,7 +443,11 @@ impl<'a> App<'a> {
     fn execute(&mut self, parsed: ParsedCommand) {
         use CommandKind as C;
         match parsed.command {
-            C::Resume => self.open_picker(PickerPurpose::Resume),
+            C::Resume => {
+                let mut picker = ResumePicker::default();
+                self.reload_resume(&mut picker);
+                self.views.push(View::Resume(picker));
+            }
             C::List => self.open_picker(PickerPurpose::List),
             C::Rename => self.open_picker(PickerPurpose::Rename),
             C::Kill => self.open_picker(PickerPurpose::Kill),
@@ -398,6 +472,7 @@ impl<'a> App<'a> {
                 }
             }
             C::Help => self.views.push(View::Help),
+            C::Exit => self.detach(),
             C::Quit => self.exit = Some(Exit::Quit),
         }
     }
@@ -412,14 +487,34 @@ impl<'a> App<'a> {
                 .tmux
                 .list_panes(None)
                 .map(|rows| rows.into_iter().map(Resource::Pane).collect()),
-            _ => self.tmux.list_sessions().map(|mut rows| {
-                rows.sort_by(|a, b| {
-                    b.recency()
-                        .cmp(&a.recency())
-                        .then_with(|| a.name.cmp(&b.name))
-                });
-                rows.into_iter().map(Resource::Session).collect()
-            }),
+            _ => self
+                .recent_sessions()
+                .map(|rows| rows.into_iter().map(Resource::Session).collect()),
+        }
+    }
+
+    fn recent_sessions(&self) -> TmuxResult<Vec<Session>> {
+        let mut sessions = self.tmux.list_sessions()?;
+        sessions.sort_by(|a, b| {
+            b.recency()
+                .cmp(&a.recency())
+                .then_with(|| a.name.cmp(&b.name))
+        });
+        Ok(sessions)
+    }
+
+    fn reload_resume(&mut self, picker: &mut ResumePicker) {
+        let result = self.recent_sessions().and_then(|sessions| {
+            let windows = if sessions.is_empty() {
+                Vec::new()
+            } else {
+                self.tmux.list_windows(None)?
+            };
+            Ok((sessions, windows))
+        });
+        match result {
+            Ok((sessions, windows)) => picker.replace(sessions, windows),
+            Err(error) => self.status = error.to_string(),
         }
     }
 
@@ -440,49 +535,29 @@ impl<'a> App<'a> {
     }
 
     fn picker_key(&mut self, mut picker: Picker, key: KeyEvent) {
-        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-        if ctrl && key.code == KeyCode::Char('r') {
-            match self.read_resources(picker.purpose) {
-                Ok(rows) => {
-                    picker.resources = rows;
-                    picker.selected = 0;
-                    self.status = "Refreshed".into();
-                }
-                Err(error) => self.status = error.to_string(),
-            }
-            self.views.push(View::Picker(picker));
-            return;
-        }
-        let resource = picker.selected_resource();
-        if ctrl && key.code == KeyCode::Char('n') && picker.purpose == PickerPurpose::Windows {
-            self.views.push(View::Picker(picker));
-            self.open_picker(PickerPurpose::NewWindow);
-            return;
-        }
-        if ctrl && key.code == KeyCode::Char('e') {
-            self.views.push(View::Picker(picker));
-            if let Some(resource) = resource {
-                self.rename_form(resource);
-            }
-            return;
-        }
-        if ctrl && key.code == KeyCode::Char('k') {
-            self.views.push(View::Picker(picker));
-            if let Some(resource) = resource {
-                self.kill_confirm(resource);
-            }
-            return;
-        }
         match key.code {
             KeyCode::Up => picker.selected = picker.selected.saturating_sub(1),
             KeyCode::Down => {
-                picker.selected =
-                    (picker.selected + 1).min(picker.indices().len().saturating_sub(1))
+                picker.selected = (picker.selected + 1).min(picker.rows().len().saturating_sub(1))
             }
-            KeyCode::Enter => {
-                let purpose = picker.purpose;
-                self.views.push(View::Picker(picker));
-                if let Some(resource) = resource {
+            KeyCode::Enter => match picker.rows().get(picker.selected).copied() {
+                Some(PickerRow::NewWindow) => {
+                    self.views.push(View::Picker(picker));
+                    self.open_picker(PickerPurpose::NewWindow);
+                    return;
+                }
+                Some(PickerRow::Refresh) => match self.read_resources(picker.purpose) {
+                    Ok(resources) => {
+                        picker.resources = resources;
+                        picker.selected = 0;
+                        self.status = "Refreshed".into();
+                    }
+                    Err(error) => self.status = error.to_string(),
+                },
+                Some(PickerRow::Resource(index)) => {
+                    let resource = picker.resources[index].clone();
+                    let purpose = picker.purpose;
+                    self.views.push(View::Picker(picker));
                     match purpose {
                         PickerPurpose::Rename => self.rename_form(resource),
                         PickerPurpose::Kill => self.kill_confirm(resource),
@@ -491,11 +566,14 @@ impl<'a> App<'a> {
                             action: FormAction::NewWindow(resource.session_id().clone()),
                             input: TextInput::default(),
                         })),
-                        _ => self.enter(resource.target()),
+                        PickerPurpose::List | PickerPurpose::Windows | PickerPurpose::Panes => {
+                            self.views.push(View::Actions(resource, 0));
+                        }
                     }
+                    return;
                 }
-                return;
-            }
+                None => {}
+            },
             _ => {
                 if picker.query.handle_key(key) {
                     picker.selected = 0;
@@ -505,20 +583,28 @@ impl<'a> App<'a> {
         self.views.push(View::Picker(picker));
     }
 
-    fn rename_form(&mut self, resource: Resource) {
-        let name = match &resource {
-            Resource::Session(session) => session.name.clone(),
-            Resource::Window(window) => window.name.clone(),
-            Resource::Pane(_) => {
-                self.status =
-                    "Panes have no independent tmux name. Use /window to rename their window."
-                        .into();
+    fn resource_action_key(&mut self, resource: Resource, mut selected: usize, key: KeyEvent) {
+        let actions = resource.actions();
+        match key.code {
+            KeyCode::Up => selected = selected.saturating_sub(1),
+            KeyCode::Down => selected = (selected + 1).min(actions.len() - 1),
+            KeyCode::Enter => {
+                match actions[selected].1 {
+                    ResourceAction::Open => self.enter(resource.target()),
+                    ResourceAction::Rename => self.rename_form(resource),
+                    ResourceAction::Close => self.kill_confirm(resource),
+                }
                 return;
             }
-        };
+            _ => {}
+        }
+        self.views.push(View::Actions(resource, selected));
+    }
+
+    fn rename_form(&mut self, resource: Resource) {
         self.views.push(View::Form(Form {
             action: FormAction::Rename(resource),
-            input: TextInput::new(name),
+            input: TextInput::default(),
         }));
     }
 
@@ -633,6 +719,10 @@ impl<'a> App<'a> {
                 }
             }
             FormAction::Rename(resource) => {
+                let renamed_current = matches!(
+                    &resource,
+                    Resource::Session(session) if self.context.current_session() == Some(&session.id)
+                );
                 let result = match resource {
                     Resource::Session(session) => self.tmux.rename_session(&session.id, &value),
                     Resource::Window(window) => self.tmux.rename_window(&window.id, &value),
@@ -640,6 +730,9 @@ impl<'a> App<'a> {
                 };
                 match result {
                     Ok(()) => {
+                        if renamed_current && let Context::Inside(inside) = &mut self.context {
+                            inside.session_name = Some(value);
+                        }
                         self.status = "Renamed".into();
                         self.refresh_parent();
                     }
@@ -695,6 +788,11 @@ impl<'a> App<'a> {
     fn refresh_parent(&mut self) {
         let popped = self.views.pop();
         let picker = match popped {
+            Some(View::Resume(mut picker)) => {
+                self.reload_resume(&mut picker);
+                self.views.push(View::Resume(picker));
+                return;
+            }
             Some(View::Picker(picker)) => Some(picker),
             Some(_) => match self.views.pop() {
                 Some(View::Picker(picker)) => Some(picker),
@@ -710,13 +808,31 @@ impl<'a> App<'a> {
             match self.read_resources(picker.purpose) {
                 Ok(resources) => {
                     picker.resources = resources;
-                    picker.selected = picker
-                        .selected
-                        .min(picker.indices().len().saturating_sub(1));
+                    picker.selected = picker.selected.min(picker.rows().len().saturating_sub(1));
                 }
                 Err(error) => self.status = error.to_string(),
             }
             self.views.push(View::Picker(picker));
+        }
+    }
+
+    fn detach(&mut self) {
+        self.context = self.tmux.context();
+        match &self.context {
+            Context::Outside => self.exit = Some(Exit::Quit),
+            Context::Inside(InsideContext {
+                client_name: Some(client),
+                ..
+            }) => {
+                self.exit = Some(Exit::Detach(client.clone()));
+            }
+            Context::ForeignServer => {
+                self.status = "This is a different tmux server. Use tmux's detach key.".into()
+            }
+            _ => {
+                self.status =
+                    "Cannot identify this tmux client. Use the Popup or tmux's detach key.".into()
+            }
         }
     }
 
@@ -754,9 +870,10 @@ impl<'a> App<'a> {
 
     pub fn render(&mut self, frame: &mut Frame) {
         let area = frame.area();
+        let indent = if area.width >= 24 { 2 } else { 0 };
         let area = Rect {
-            x: area.x + area.width.min(2),
-            width: area.width.saturating_sub(2),
+            x: area.x + indent,
+            width: area.width - indent,
             ..area
         };
         if self.views.top().is_none() {
@@ -768,17 +885,37 @@ impl<'a> App<'a> {
                     description: c.description,
                 })
                 .collect();
+            let (context, session) = match &self.context {
+                Context::Outside => ("standalone", None),
+                Context::Inside(inside) => (
+                    if inside.popup { "popup" } else { "pane" },
+                    inside.session_name.as_deref(),
+                ),
+                Context::ForeignServer => ("different server", None),
+                Context::Unavailable => ("client unavailable", None),
+            };
             ui::render_home(
                 frame,
                 area,
                 &self.composer,
                 &items,
                 self.palette_selected,
-                if self.status.is_empty() {
-                    None
-                } else {
-                    Some(&self.status)
+                HomeDetails {
+                    directory: self.directory.as_deref(),
+                    context,
+                    session,
+                    status: (!self.status.is_empty()).then_some(self.status.as_str()),
                 },
+                self.theme,
+            );
+            return;
+        }
+        if let Some(View::Resume(picker)) = self.views.0.last_mut() {
+            picker.render(
+                frame,
+                area,
+                self.context.current_session(),
+                &self.status,
                 self.theme,
             );
             return;
@@ -793,10 +930,15 @@ impl<'a> App<'a> {
         match self.views.0.last_mut() {
             Some(View::Picker(picker)) => {
                 let rows: Vec<_> = picker
-                    .indices()
-                    .iter()
-                    .filter_map(|&i| picker.resources.get(i))
-                    .map(|resource| resource.description(&self.context))
+                    .rows()
+                    .into_iter()
+                    .map(|row| match row {
+                        PickerRow::Resource(index) => {
+                            picker.resources[index].description(&self.context)
+                        }
+                        PickerRow::NewWindow => "+ New window".into(),
+                        PickerRow::Refresh => "Refresh list".into(),
+                    })
                     .collect();
                 ui::render_picker(
                     frame,
@@ -805,19 +947,70 @@ impl<'a> App<'a> {
                     &picker.query,
                     &rows,
                     picker.selected,
-                    "No matches or sessions. Esc back · /new creates a session · Ctrl+R refreshes",
+                    match picker.purpose {
+                        PickerPurpose::Windows => "No matching windows",
+                        PickerPurpose::NewWindow => {
+                            "No matching sessions. Use /new to create a session."
+                        }
+                        _ => "No matches or sessions. Esc back · /new creates a session",
+                    },
                     picker.purpose.footer(),
                     self.theme,
                 );
             }
+            Some(View::Actions(resource, selected)) => {
+                let actions = resource.actions();
+                let [title, target, choices, footer] = Layout::vertical([
+                    Constraint::Length(1),
+                    Constraint::Length(u16::from(main.height >= actions.len() as u16 + 3)),
+                    Constraint::Min(1),
+                    Constraint::Length(u16::from(main.height >= actions.len() as u16 + 2)),
+                ])
+                .areas(main);
+                frame.render_widget(
+                    Paragraph::new(match resource {
+                        Resource::Session(_) => "Session actions",
+                        Resource::Window(_) => "Window actions",
+                        Resource::Pane(_) => "Pane actions",
+                    })
+                    .style(
+                        self.theme
+                            .style(self.theme.accent)
+                            .add_modifier(ratatui::style::Modifier::BOLD),
+                    ),
+                    title,
+                );
+                frame.render_widget(
+                    Paragraph::new(resource.label()).style(self.theme.style(self.theme.muted)),
+                    target,
+                );
+                let rows = actions.iter().map(|(label, _)| ListItem::new(*label));
+                let mut state = ListState::default().with_selected(Some(*selected));
+                frame.render_stateful_widget(
+                    List::new(rows)
+                        .highlight_style(self.theme.selected_style())
+                        .highlight_symbol(format!("{} ", self.theme.marker())),
+                    choices,
+                    &mut state,
+                );
+                frame.render_widget(
+                    Paragraph::new(self.theme.adapt("Enter Select · Esc Back"))
+                        .style(self.theme.style(self.theme.muted)),
+                    footer,
+                );
+            }
             Some(View::Form(form)) => {
+                let rename_label;
                 let (title, label) = match &form.action {
                     FormAction::NewSessionName => ("New session", "Session name"),
                     FormAction::NewSessionDirectory { .. } => (
                         "New session",
                         "Working directory (empty = current directory)",
                     ),
-                    FormAction::Rename(_) => ("Rename", "New name"),
+                    FormAction::Rename(resource) => {
+                        rename_label = format!("New name for {}", resource.label());
+                        ("Rename", rename_label.as_str())
+                    }
                     FormAction::NewWindow(_) => ("New window", "Window name (optional)"),
                 };
                 ui::render_form(
@@ -872,7 +1065,7 @@ impl<'a> App<'a> {
                 );
             }
             Some(View::Help) => ui::render_help(frame, main, self.theme),
-            None => {}
+            Some(View::Resume(_)) | None => {}
         }
         frame.render_widget(
             Paragraph::new(Line::from(vec![
@@ -912,7 +1105,7 @@ mod tests {
     #[test]
     fn picker_filters_and_sorts_fuzzy_matches() {
         let picker = Picker {
-            purpose: PickerPurpose::Resume,
+            purpose: PickerPurpose::List,
             query: TextInput::new("ori"),
             resources: vec![
                 Resource::Session(session("$1", "server")),
@@ -921,12 +1114,11 @@ mod tests {
             ],
             selected: 0,
         };
-        let indices = picker.indices();
-        assert_eq!(indices.len(), 1);
-        assert_eq!(
-            picker.selected_resource().map(|r| r.label()),
-            Some("orion".into())
-        );
+        let rows = picker.rows();
+        let [PickerRow::Resource(index)] = rows.as_slice() else {
+            panic!("expected one matching session: {rows:?}");
+        };
+        assert_eq!(picker.resources[*index].label(), "orion");
     }
 
     #[test]

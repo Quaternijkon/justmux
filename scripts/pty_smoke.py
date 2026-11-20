@@ -283,7 +283,7 @@ def inline_terminal(sock):
         p.send("/")
         p.read(.2)
         before = len(p.out)
-        os.write(p.fd, b"\x1b[B" * 9)
+        os.write(p.fd, b"\x1b[B" * 10)
         p.read(.2)
         navigation_bytes = len(p.out) - before
         require("/quit" in p.screen.text(), "inline navigation did not make the selected command visible")
@@ -305,7 +305,7 @@ def inline_terminal(sock):
         p.assert_restored()
         shell_rows = [i for i, row in enumerate(p.screen.cells) if "JM_SHELL_RETURN:0" in "".join(row)]
         require(shell_rows and min(shell_rows) > ui_bottom, "shell resumed over the inline UI instead of below it")
-    print(f"PASS inline: native history + non-top cursor + resize + shell placement; idle 0 bytes, 9-key burst {navigation_bytes} bytes")
+    print(f"PASS inline: native history + non-top cursor + resize + shell placement; idle 0 bytes, 10-key burst {navigation_bytes} bytes")
 
 
 def fullscreen(sock):
@@ -352,14 +352,25 @@ def inline_bottom(sock):
 
 def external(sock):
     sock.run("new-session", "-d", "-s", "orion", "/bin/sh")
+    sock.run("new-session", "-d", "-s", "lyra", "/bin/sh")
+    shared = sock.run("new-window", "-d", "-P", "-F", "#{window_id}", "-t", "orion:1", "-n", "workspace", "/bin/sh")
+    sock.run("link-window", "-d", "-s", shared, "-t", "lyra:3")
     with PTY([str(JM), "-L", sock.name]) as p:
         p.text("JustMux")
         p.send("/resume\r")
-        p.text("orion")
+        p.until(lambda: any("orion" in row and "lyra" in row for row in p.screen.text().splitlines()),
+                "session headers were not displayed side by side")
         p.assert_native_screen()
         pid = p.pid
+        p.send("lyra")
+        os.write(p.fd, b"\x1b[B")
+        p.until(lambda: any("3 workspace" in row and ("›" in row or ">" in row)
+                            for row in p.screen.text().splitlines()), "linked window was not selected")
         p.send("\r")
         p.until(lambda: pid in sock.clients(), "jm PID did not become native tmux client")
+        require(sock.clients()[pid][1] == "lyra", "linked window attached to its other session")
+        require(f"{shared} 1" in sock.run("list-windows", "-t", "=lyra", "-F", "#{window_id} #{window_active}").splitlines(),
+                "tmux client did not open the selected window")
         command = subprocess.run(["ps", "-p", str(pid), "-o", "comm="], text=True, capture_output=True, timeout=5).stdout
         require("tmux" in command and "jm" not in Path(command.strip()).name, f"exec evidence failed: {command!r}")
         # An external sentinel proves native input reached the pane, not echoed UI text.
@@ -370,7 +381,7 @@ def external(sock):
         p.wait_exit()
         require(os.waitstatus_to_exitcode(p.status) == 0, "native detach failed")
         p.assert_restored(native_tmux=True)
-    print("PASS external /resume: original jm PID became tmux; native input + detach + termios restored")
+    print("PASS external /resume: column layout, linked window in chosen session, exec and terminal restoration")
 
 
 def create(sock):
@@ -390,6 +401,57 @@ def create(sock):
         p.assert_restored()
     require("smoke-new" in sock.run("list-sessions", "-F", "#{session_name}"), "session did not outlive jm")
     print("PASS /new: native session and cwd verified; /quit restores terminal; session survives")
+
+
+def detach(sock):
+    sock.run("new-session", "-d", "-s", "detach-source", "/bin/sh")
+    sock.run("new-session", "-d", "-s", "detach-other", "/bin/sleep", "300")
+    sock.run("link-window", "-s", "detach-source:0", "-t", "detach-other:1")
+    sock.run("select-window", "-t", "detach-other:1")
+    source_pid = sock.run("list-panes", "-t", "=detach-source", "-F", "#{pane_pid}")
+    attach = sock.argv("attach-session", "-t", "=detach-source")
+    shell = shlex.join(attach) + '; printf "JM_DETACH_SHELL:%s\\n" "$?"'
+    other = sock.argv("attach-session", "-t", "=detach-other")
+    with PTY(["/bin/sh", "-c", shell]) as first, PTY(other) as second:
+        first.until(lambda: second.pid in sock.clients() and len(sock.clients()) == 2,
+                    "the two clients did not attach to the shared window")
+        second_name = sock.clients()[second.pid][0]
+        record = shlex.join(sock.argv("set-option", "-g", "@jm-detach-result"))
+        # PENDIN is a transient input redisplay flag that the OS can clear.
+        attributes = shlex.join([sys.executable, "-c", "import termios; attrs = termios.tcgetattr(0); "
+                                 "attrs[3] &= ~getattr(termios, 'PENDIN', 0); print(attrs)"])
+        launch = (f'saved=$({attributes}); {shlex.quote(str(JM))}; result=$?; '
+                  f'if [ "$saved" = "$({attributes})" ]; then {record} "$result:restored"; fi\r')
+        os.write(first.fd, launch.encode())
+        first.until(lambda: "Type / for commands" in first.screen.text(), "pane jm did not render")
+        first.send("/exit\r")
+        first.until(lambda: "Cannot identify this tmux client" in first.screen.text(),
+                    "/exit did not report the ambiguous clients")
+        require(len(sock.clients()) == 2, "ambiguous /exit detached a client")
+
+        sock.run("select-window", "-t", "detach-other:0")
+        first.send("/exit")
+        first.read(.15)
+        os.write(first.fd, b"\r")
+        first.text("JM_DETACH_SHELL:0")
+        first.wait_exit()
+        first.assert_restored(native_tmux=True)
+        second.until(lambda: sock.run("show-option", "-gv", "@jm-detach-result", check=False) == "0:restored",
+                     "jm did not return with the original pane termios")
+        require(sock.clients() == {second.pid: [second_name, "detach-other"]}, "wrong client detached")
+        require(sock.run("list-panes", "-t", "=detach-source", "-F", "#{pane_pid}") == source_pid,
+                "detach did not preserve the original pane process")
+        second.send("\x02d")
+        second.wait_exit()
+    print("PASS pane /exit: refuses a shared window, detaches the current client, and preserves the pane")
+
+    with PTY([str(JM), "-L", sock.name]) as outside:
+        outside.text("JustMux")
+        outside.send("/exit\r")
+        outside.wait_exit()
+        require(os.waitstatus_to_exitcode(outside.status) == 0, "/exit from outside tmux did not quit")
+        outside.assert_restored()
+    print("PASS standalone /exit: quits JustMux and restores the terminal")
 
 
 def interrupt(sock, method, fullscreen=False):
@@ -414,6 +476,7 @@ def interrupt(sock, method, fullscreen=False):
 def popup(sock):
     sock.run("new-session", "-d", "-s", "popup-source", "/bin/sleep", "300")
     sock.run("new-session", "-d", "-s", "popup-target", "/bin/sh")
+    work = sock.run("new-window", "-d", "-P", "-F", "#{window_id}", "-t", "popup-target:1", "-n", "popup-work", "/bin/sh")
     source_pid = int(sock.run("list-panes", "-t", "=popup-source", "-F", "#{pane_pid}"))
     with PTY(sock.argv("attach-session", "-t", "=popup-source")) as first, PTY(sock.argv("attach-session", "-t", "=popup-source")) as second:
         first.until(lambda: len(sock.clients()) == 2, "two native clients did not attach")
@@ -423,7 +486,9 @@ def popup(sock):
                                  capture_output=True, text=True, timeout=5, check=True).stdout
         binding = next(line for line in printed.splitlines() if line.startswith("bind-key "))
         require("run-shell" in binding, "keybind must expand launching client in run-shell")
-        for action in ("cancel", "switch"):
+        for action in ("cancel", "switch", "detach"):
+            if action == "detach":
+                sock.run("switch-client", "-c", sock.clients()[first.pid][0], "-t", "=popup-source")
             before = len(first.out)
             marker = "@jm-popup-" + action
             config = binding.replace("tmux display-popup", "tmux -L " + shlex.quote(sock.name) + " display-popup")
@@ -440,20 +505,36 @@ def popup(sock):
             first.until(lambda: b"JustMux" in first.out[before:], "popup jm did not render")
             if action == "cancel":
                 first.send("\x1b")
-            else:
+            elif action == "switch":
                 first.send("/resume\r")
                 first.until(lambda: b"popup-target" in first.out[before:], "popup picker did not render")
-                first.send("popup-target\r")
-            first.until(lambda: sock.run("show-option", "-gv", marker, check=False).strip() == "done", f"popup did not close after {action}")
+                first.send("popup-work\r")
+            else:
+                first.send("/exit")
+                # Drain redraws before tmux writes its terminal restore codes.
+                first.read(.15)
+                os.write(first.fd, b"\r")
+
+            if action == "detach":
+                first.wait_exit()
+                require(os.waitstatus_to_exitcode(first.status) == 0, "popup /exit did not detach normally")
+                first.assert_restored(native_tmux=True)
+            else:
+                first.until(lambda: sock.run("show-option", "-gv", marker, check=False) == "done", f"popup did not close after {action}")
             clients = sock.clients()
-            require(clients[first.pid][1] == ("popup-source" if action == "cancel" else "popup-target"), f"wrong target after {action}: {clients}")
+            if action == "detach":
+                require(first.original_pid not in clients, "popup /exit left its client attached")
+            else:
+                require(clients[first.pid][1] == ("popup-source" if action == "cancel" else "popup-target"), f"wrong target after {action}: {clients}")
+                if action == "switch":
+                    require(f"{work} 1" in sock.run("list-windows", "-t", "=popup-target", "-F", "#{window_id} #{window_active}").splitlines(),
+                            "popup /resume did not select the requested window")
             require(clients[second.pid][1] == "popup-source", "second client was unexpectedly switched")
             require(int(sock.run("list-panes", "-t", "=popup-source", "-F", "#{pane_pid}")) == source_pid, "source process PID changed")
             os.kill(source_pid, 0)
             require(sock.run("list-panes", "-t", "=popup-source", "-F", "#{pane_current_command}") == "sleep", "source foreground sleep was interrupted")
-        first.send("\x02d"); first.wait_exit()
         second.send("\x02d"); second.wait_exit()
-    print("PASS popup cancel + /resume switch: source sleep PID survives; second client unchanged")
+    print("PASS popup cancel, /resume, and /exit: source sleep PID survives; second client remains attached")
 
 
 def main():
@@ -468,6 +549,7 @@ def main():
         fullscreen(sock)
         external(sock)
         create(sock)
+        detach(sock)
         interrupt(sock, "Ctrl+C")
         interrupt(sock, "SIGTERM")
         interrupt(sock, "SIGTERM", fullscreen=True)

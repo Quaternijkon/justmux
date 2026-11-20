@@ -155,12 +155,17 @@ fn run_tui(tmux: &TmuxClient, options: AppOptions, mode: ScreenMode) -> Result<(
     .context("could not initialise terminal")?;
     let mut app = App::new(tmux, options);
     loop {
-        // Exit before another draw: attach/switch must hand over immediately.
+        // Hand control back before drawing another frame.
         if let Some(exit) = app.exit().cloned() {
             drop(terminal);
             return match exit {
                 Exit::Quit | Exit::Switched => guard.restore(),
                 Exit::Attach(target) => exec_tmux(guard, tmux.attach_command(&target)),
+                Exit::Detach(client) => {
+                    guard.restore()?;
+                    tmux.detach_client(&client)
+                        .context("cannot detach from tmux")
+                }
             };
         }
         terminal

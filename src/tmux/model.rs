@@ -61,24 +61,17 @@ tmux_id!(
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Target {
     Session(SessionId),
-    Window(WindowId),
+    Window(SessionId, WindowId),
     Pane(PaneId),
-}
-
-impl Target {
-    /// The value to pass to tmux's `-t`.
-    pub fn as_str(&self) -> &str {
-        match self {
-            Target::Session(id) => id.as_str(),
-            Target::Window(id) => id.as_str(),
-            Target::Pane(id) => id.as_str(),
-        }
-    }
 }
 
 impl fmt::Display for Target {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.as_str())
+        match self {
+            Self::Session(id) => f.write_str(id.as_str()),
+            Self::Window(session, window) => write!(f, "{session}:{window}"),
+            Self::Pane(id) => f.write_str(id.as_str()),
+        }
     }
 }
 
@@ -208,6 +201,8 @@ pub enum Context {
 pub struct InsideContext {
     /// The session the current client is showing.
     pub session_id: Option<SessionId>,
+    /// The attached client's session name, for display.
+    pub session_name: Option<String>,
     /// The current client's active window.
     pub window_id: Option<WindowId>,
     /// The current client's active pane (for a popup: the pane underneath).

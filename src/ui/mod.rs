@@ -11,6 +11,8 @@ use ratatui::{
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
+use crate::commands::{CommandKind, registry};
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Theme {
     pub accent: Color,
@@ -257,46 +259,149 @@ impl Composer {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+pub struct HomeDetails<'a> {
+    pub directory: Option<&'a str>,
+    pub context: &'a str,
+    pub session: Option<&'a str>,
+    pub status: Option<&'a str>,
+}
+
 pub fn render_home(
     frame: &mut Frame<'_>,
     area: Rect,
     input: &TextInput,
     popup: &[CommandItem<'_>],
     selected: usize,
-    status: Option<&str>,
+    details: HomeDetails<'_>,
     theme: Theme,
 ) {
-    let c = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Min(3),
-            Constraint::Length(2),
-            Constraint::Length(1),
-        ])
-        .split(area);
-    let body = vec![
-        Line::from(Span::styled(
-            "JustMux",
-            theme.style(theme.accent).add_modifier(Modifier::BOLD),
-        )),
-        Line::from(""),
-        Line::from("Just tmux. Just simpler."),
-        Line::from(""),
-        Line::from("Manage your tmux sessions without memorizing commands."),
-    ];
-    frame.render_widget(Paragraph::new(body).wrap(Wrap { trim: true }), c[0]);
+    let [welcome, composer, footer] = Layout::vertical([
+        Constraint::Min(0),
+        Constraint::Length(if area.height > 4 { 2 } else { 1 }),
+        Constraint::Length(u16::from(area.height > 2)),
+    ])
+    .areas(area);
     frame.render_widget(
-        Paragraph::new(input.rendered_width(true, theme, c[1].width)),
-        c[1],
+        Paragraph::new(welcome_lines(welcome, details, popup.is_empty(), theme)),
+        welcome,
     );
+    let marker = if composer.width > 2 {
+        format!("{} ", theme.marker())
+    } else {
+        String::new()
+    };
+    let mut line = input.rendered_width(true, theme, composer.width - marker.width() as u16);
+    line.spans
+        .insert(0, Span::styled(marker, theme.style(theme.accent)));
+    frame.render_widget(Paragraph::new(line), composer);
     frame.render_widget(
-        Paragraph::new(theme.adapt(status.unwrap_or("Type / for commands")))
+        Paragraph::new(theme.adapt(details.status.unwrap_or("Type / for commands")))
             .style(theme.style(theme.muted)),
-        c[2],
+        footer,
     );
     if !popup.is_empty() {
-        render_command_popup(frame, c[1], popup, selected, theme);
+        render_command_popup(frame, composer, popup, selected, theme);
     }
+}
+
+fn welcome_lines(
+    area: Rect,
+    details: HomeDetails<'_>,
+    show_commands: bool,
+    theme: Theme,
+) -> Vec<Line<'static>> {
+    let accent = theme.style(theme.accent);
+    let muted = theme.style(theme.muted);
+    let mut title = Line::from(Span::styled(
+        if theme.ascii {
+            "[] JustMux"
+        } else {
+            "◫ JustMux"
+        },
+        accent.add_modifier(Modifier::BOLD),
+    ));
+    let version = format!(" (v{})", env!("CARGO_PKG_VERSION"));
+    if title.width() + version.width() <= usize::from(area.width) {
+        title.spans.push(Span::styled(version, muted));
+    }
+    let mut lines = vec![title];
+    if let Some(directory) = details.directory {
+        let label = if theme.ascii { "  dir " } else { "  ⌂ " };
+        let width = usize::from(area.width).saturating_sub(label.width());
+        let directory = single_line(directory);
+        let marker = if theme.ascii { "..." } else { "…" };
+        lines.push(Line::from(vec![
+            Span::styled(label, muted),
+            Span::raw(directory_tail(&directory, width, marker)),
+        ]));
+    }
+    if !details.context.is_empty() {
+        let mut spans = vec![
+            Span::styled("  tmux ", muted),
+            Span::raw(details.context.to_owned()),
+        ];
+        if let Some(session) = details.session.filter(|name| !name.is_empty()) {
+            spans.push(Span::styled(if theme.ascii { " | " } else { " · " }, muted));
+            spans.push(Span::styled(single_line(session), accent));
+        }
+        lines.push(Line::from(spans));
+    }
+    if show_commands {
+        if usize::from(area.height) >= lines.len() + 3 {
+            lines.push(Line::default());
+            lines.push(Line::from(Span::styled("Try a command", muted)));
+        }
+        let quick_start = [
+            CommandKind::Resume,
+            CommandKind::New,
+            CommandKind::List,
+            CommandKind::Window,
+            CommandKind::Help,
+        ];
+        let command_style = theme.style(Color::Green).add_modifier(Modifier::BOLD);
+        for command in quick_start
+            .into_iter()
+            .filter_map(|kind| registry().iter().find(|command| command.kind == kind))
+        {
+            if lines.len() >= usize::from(area.height) {
+                break;
+            }
+            let mut spans = vec![Span::styled(format!("  /{}", command.name), command_style)];
+            if area.width >= 34 {
+                spans.push(Span::raw(
+                    " ".repeat(9_usize.saturating_sub(command.name.len())),
+                ));
+                spans.push(Span::styled(command.description, muted));
+            }
+            lines.push(Line::from(spans));
+        }
+    }
+    lines
+}
+
+fn single_line(text: &str) -> String {
+    text.chars()
+        .map(|ch| if ch.is_control() { ' ' } else { ch })
+        .collect()
+}
+
+fn directory_tail(path: &str, width: usize, marker: &str) -> String {
+    if path.width() <= width {
+        return path.to_owned();
+    }
+    let Some(mut remaining) = width.checked_sub(marker.width()) else {
+        return String::new();
+    };
+    let mut start = path.len();
+    for (index, grapheme) in path.grapheme_indices(true).rev() {
+        let Some(next) = remaining.checked_sub(grapheme.width()) else {
+            break;
+        };
+        remaining = next;
+        start = index;
+    }
+    format!("{marker}{}", &path[start..])
 }
 
 pub fn render_command_popup(
@@ -535,7 +640,7 @@ pub fn render_confirm(
     );
 }
 pub fn render_help(frame: &mut Frame<'_>, area: Rect, theme: Theme) {
-    let s = theme.adapt("JustMux commands\n\n/resume  attach or switch to a session\n/new     create a session\n/list    list sessions\n/rename  rename a session\n/kill    terminate a session\n/window  manage windows\n/pane    manage panes\n/split   split the current pane\n/help    show this help\n/quit    exit\n\nEsc back · ↑↓ navigate · Enter select · Ctrl+C quit");
+    let s = theme.adapt("JustMux commands\n\n/resume  open a window from the session grid\n/exit    detach from tmux\n/new     create a session\n/list    browse sessions and choose an action\n/rename  rename a session\n/kill    terminate a session\n/window  create, open, rename, or close windows\n/pane    open or close panes\n/split   split the current pane\n/help    show this help\n/quit    quit JustMux\n\nEsc back · ↑↓ navigate · Enter select · Ctrl+C quit");
     frame.render_widget(
         Paragraph::new(s)
             .wrap(Wrap { trim: true })
@@ -613,7 +718,7 @@ mod tests {
                         description: "Resume session",
                     }],
                     0,
-                    None,
+                    HomeDetails::default(),
                     Theme::default(),
                 );
             })

@@ -8,7 +8,7 @@ import test from 'node:test';
 import { release } from '../scripts/release.mjs';
 
 const VERSION = '0.1.1';
-const PLATFORMS = ['darwin-x64', 'darwin-arm64', 'linux-x64', 'linux-arm64'];
+const PLATFORMS = ['darwin-arm64', 'linux-x64'];
 const hash = (bytes, algorithm = 'sha256', encoding = 'hex') => (
   createHash(algorithm).update(bytes).digest(encoding)
 );

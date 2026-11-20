@@ -20,19 +20,51 @@ Windows is not supported by the native tmux application; use the Linux build
 inside WSL instead. Installing with `--omit=optional` omits the required native
 platform package and is not supported.
 
+## Update prompts
+
+Global npm installations check the public npm registry on interactive startup
+without a command, including `--fullscreen`, at most once per 24 hours. Checks
+have a three-second total timeout, and errors allow the native app to start.
+The prompt is an inline TUI selector shown before the main Rust interface:
+
+1. **Update** (initial selection): install the displayed exact version into
+   the existing global npm prefix, then exit. Start `jm` again afterward.
+2. **Skip**: continue this launch. The same version may prompt on the next
+   interactive launch, using the daily cache without another request.
+3. **Skip this version**: remember the dismissal across restarts and daily
+   metadata refreshes. A different release can prompt again.
+
+Up/Down (or j/k) moves between choices, Enter confirms, and 1/2/3 selects
+directly. Esc and Ctrl+D skip; Ctrl+C cancels startup. The selector briefly uses
+raw input and inverse highlighting in a small terminal region. It restores
+input and the cursor before npm or the Rust interface starts, including on
+SIGINT, SIGTERM, SIGHUP, and SIGQUIT. It does not use an alternate screen or
+capture the mouse. A failed installation prints a manual retry command and
+continues with the available installed program. The updater never invokes
+`sudo` and never installs without an explicit selection.
+
+`JUSTMUX_NO_UPDATE_CHECK=1` or `NO_UPDATE_CHECK=1` disables checks. Noninteractive
+runs, CI, help, version, direct commands, local/npm-link/npx installs, and Cargo
+builds do not perform them. The cache stores only version and check time (plus
+the version explicitly skipped) under `$XDG_CACHE_HOME/justmux/update.json`, or the normal
+macOS/Linux user cache directory. No tmux or terminal content is sent to npm.
+
+Version `0.1.1` includes this feature. Existing official `0.1.0` installations
+need one manual npm update to receive the updater; they cannot notify users
+through code they do not yet contain.
+
 ## Published packages
 
-Every release has five packages with the same version:
+Current releases target macOS ARM64 and Linux x64 only, using three packages
+with the same version:
 
 | Package | Rust target | Executable |
 | --- | --- | --- |
 | `justmux` | JavaScript launcher | `jm` and `justmux` |
 | `justmux-darwin-arm64` | `aarch64-apple-darwin` | `bin/jm` |
-| `justmux-darwin-x64` | `x86_64-apple-darwin` | `bin/jm` |
 | `justmux-linux-x64` | `x86_64-unknown-linux-musl` | `bin/jm` |
-| `justmux-linux-arm64` | `aarch64-unknown-linux-musl` | `bin/jm` |
 
-The Linux targets use static musl executables so the package does not depend
+The Linux target uses a static musl executable so the package does not depend
 on the user's glibc version. Native tmux still needs to be installed separately.
 The source launcher manifest is private; the preparation command creates the
 publishable manifest with the exact native-package dependencies.
@@ -56,11 +88,11 @@ node scripts/npm-packages.mjs publish --dir dist/npm --dry-run
 node scripts/test-npm-install.mjs --pty
 ```
 
-On macOS, building all four targets requires the Apple SDK for both Darwin
-targets, Zig and `cargo-zigbuild` for Linux cross-builds, and all four Rust
+On an Apple Silicon Mac, building both targets requires the Apple SDK for the
+Darwin target, Zig and `cargo-zigbuild` for the Linux cross-build, and both Rust
 targets. The script checks these prerequisites before building; it never
-installs tools implicitly. Linux hosts can build the Linux targets, but a
-macOS host is required for the Darwin builds.
+installs tools implicitly. Linux x64 hosts can build the Linux target, but a
+Mac is required for the Darwin build.
 
 The build command reports missing toolchains or cross-build prerequisites; do
 not substitute one architecture's executable for another. Prepared package
@@ -71,7 +103,7 @@ prefix and loopback registry, then checks tmux attach and popup switching throug
 the installed launcher. On Linux, pass `--binary` with the static musl build path.
 A dry run performs no npm publication.
 
-Publication needs an npm account with permission to create or update all five
+Publication needs an npm account with permission to create or update all three
 package names. The account must satisfy npm's current authentication and 2FA
 requirements. Authenticate interactively on the publishing machine:
 
@@ -92,7 +124,7 @@ For the next release, update all source version fields together before
 rebuilding:
 
 ```sh
-node scripts/npm-release.mjs version 0.1.1
+node scripts/npm-release.mjs version 0.1.2
 node scripts/npm-release.mjs build --all
 ```
 
@@ -112,12 +144,18 @@ main package too. If this wait times out, continue checking without republishing
 node scripts/npm-packages.mjs verify-registry --dir dist/npm
 ```
 
-Version `0.1.0` was built locally and published to npm on 2026-11-17. All five
-packages are public. A fresh anonymous installation on macOS ARM64 verified both
+The historical `0.1.0` release was built locally and published to npm on
+2026-11-17 with five packages covering four platforms. A fresh anonymous
+installation on macOS ARM64 verified both
 command names and actual tmux attach, detach, and two-client popup switching.
 The Intel macOS and Linux artifacts were cross-built and inspected; their runtime
 behavior still needs testing on those platforms. No GitHub Actions run was used
-for this publication.
+for this publication. Release `0.1.1` is restricted to macOS ARM64 and Linux x64
+and adds the three-choice startup update picker. It was built and published
+locally on 2026-11-18; all three public tarballs matched the prepared integrity
+values. A real public-registry upgrade from a local preview of `0.1.0` to
+`0.1.1` passed on macOS ARM64. No GitHub build or Git push was used. The
+historical packages for other architectures are unchanged.
 
 Neither preparing nor packing logs in, creates an npm account, changes a shell
 configuration, pushes Git commits, or publishes a package. Package names must
@@ -128,12 +166,12 @@ does not reserve them.
 
 `.github/workflows/npm-release.yml` is optional. It runs only through
 `workflow_dispatch`; pushing code or a tag does not trigger it. The default
-`publish=false` builds and tests on four native runners, then uploads a complete
+`publish=false` builds and tests on two native runners, then uploads a complete
 distribution artifact. No npm credentials or GitHub Releases are needed for
 this build-only path.
 
-The runner matrix uses macOS 15 ARM64, macOS 15 Intel, Ubuntu 24.04 x64, and
-Ubuntu 24.04 ARM64. Each runner executes the Rust tests and actual PTY smoke
+The runner matrix uses macOS 15 ARM64 and Ubuntu 24.04 x64. Each runner executes
+the Rust tests and actual PTY smoke
 check using an isolated tmux socket before preparing its package. Linux builds
 also reject a dynamic ELF interpreter. The build logs record the OS, Rust,
 Node.js, npm, and tmux versions. Runner availability and quotas are governed by
@@ -152,7 +190,7 @@ been validated locally. The checked-in terminal demo is not overwritten.
 ## Optional trusted npm publication from GitHub
 
 After the initial package publications, configure an npm trusted publisher on
-each of the five packages. Use these exact values:
+each of the three current packages. Use these exact values:
 
 | npm trusted publisher setting | Value |
 | --- | --- |

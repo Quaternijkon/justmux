@@ -128,43 +128,35 @@ impl TmuxClient {
 
     /// tmux's implicit current-client selection chooses the most recently
     /// active client, which is unsafe with multiple clients. Use an explicit
-    /// popup client token when available, otherwise accept only one client
-    /// whose active pane is the pane that launched JustMux.
-    fn current_client(&self) -> Option<String> {
-        let pane = env::var("JUSTMUX_PANE")
-            .or_else(|_| env::var("TMUX_PANE"))
-            .ok()?;
+    /// popup client token when available, otherwise require exactly one
+    /// interactive client showing the launching pane's window, even if that
+    /// window is linked into several sessions.
+    fn current_client(&self, window: &WindowId) -> Option<(String, String)> {
         let requested = env::var("JUSTMUX_CLIENT").ok();
-        let session = self
-            .text(&[
-                "display-message",
-                "-p",
-                "-t",
-                pane.as_str(),
-                "#{session_name}",
-            ])
-            .ok()?
-            .trim()
-            .to_string();
         let clients = self
-            .text(&["list-clients", "-F", "#{client_name}\t#{client_session}"])
+            .text(&[
+                "list-clients",
+                "-F",
+                "#{client_name}\t#{window_id}\t#{client_control_mode}\t#{client_session}",
+            ])
             .ok()?;
-        let candidates: Vec<_> = clients
-            .lines()
-            .filter_map(|line| {
-                let (name, client_session) = line.split_once('\t')?;
-                let matched = match requested.as_deref() {
-                    Some(requested) => requested == name,
-                    None => client_session == session,
-                };
-                matched.then_some(name.to_string())
-            })
-            .collect();
-        if candidates.len() == 1 {
-            candidates.into_iter().next()
-        } else {
-            None
-        }
+        let mut candidates = clients.lines().filter_map(|line| {
+            let mut fields = line.splitn(4, '\t');
+            let name = fields.next()?;
+            let active_window = fields.next()?;
+            let control_mode = fields.next()?;
+            let session = fields.next()?;
+            let matched = match requested.as_deref() {
+                Some(requested) => requested == name,
+                None => active_window == window.as_str(),
+            };
+            (matched && !name.is_empty() && control_mode != "1").then_some((name, session))
+        });
+        let (name, session) = candidates.next()?;
+        candidates
+            .next()
+            .is_none()
+            .then(|| (name.to_owned(), session.to_owned()))
     }
 }
 const SESSION_FORMAT: &str = "#{session_id}\t#{q:session_name}\t#{session_windows}\t#{session_attached}\t#{session_created}\t#{session_last_attached}\t#{session_activity}\t#{q:session_path}";
@@ -232,12 +224,16 @@ impl Tmux for TmuxClient {
             // selected the requested server. A mismatched server yielded no
             // matching pane above and therefore resolves as ForeignServer.
         }
-        let Some(client_name) = self.current_client() else {
+        let Some(window_id) = WindowId::new(p[1].to_string()) else {
+            return Context::Unavailable;
+        };
+        let Some((client_name, session_name)) = self.current_client(&window_id) else {
             return Context::Unavailable;
         };
         Context::Inside(InsideContext {
             session_id: SessionId::new(p[0].to_string()),
-            window_id: WindowId::new(p[1].to_string()),
+            session_name: Some(session_name),
+            window_id: Some(window_id),
             pane_id: PaneId::new(p[2].to_string()),
             popup: env::var_os("JUSTMUX_POPUP").is_some() || env::var_os("TMUX_POPUP").is_some(),
             client_name: Some(client_name),
@@ -386,27 +382,49 @@ impl Tmux for TmuxClient {
     fn select(&self, target: &Target) -> TmuxResult<()> {
         match target {
             Target::Session(_) => Ok(()),
-            Target::Window(id) => self
-                .checked(&["select-window", "-t", id.as_str()])
-                .map(|_| ()),
+            Target::Window(..) => {
+                let target = target.to_string();
+                let resolved = self.text(&[
+                    "display-message",
+                    "-p",
+                    "-t",
+                    &target,
+                    "#{session_id}:#{window_id}",
+                ])?;
+                if resolved.trim_end() == target {
+                    Ok(())
+                } else {
+                    Err(TmuxError::WindowNotFound)
+                }
+            }
             Target::Pane(id) => self
                 .checked(&["select-pane", "-t", id.as_str()])
                 .map(|_| ()),
         }
     }
     fn switch_client(&self, target: &Target) -> TmuxResult<()> {
-        let client = self.current_client().ok_or(TmuxError::NoCurrentClient)?;
+        let Context::Inside(InsideContext {
+            client_name: Some(client),
+            ..
+        }) = self.context()
+        else {
+            return Err(TmuxError::NoCurrentClient);
+        };
         self.checked(&[
             "switch-client",
             "-c",
             client.as_str(),
             "-t",
-            target.as_str(),
+            &target.to_string(),
         ])
         .map(|_| ())
     }
+    fn detach_client(&self, client: &str) -> TmuxResult<()> {
+        self.checked(&["detach-client", "-t", client]).map(|_| ())
+    }
     fn attach_command(&self, target: &Target) -> Command {
-        let mut cmd = self.command(&["attach-session", "-t", target.as_str()]);
+        let target = target.to_string();
+        let mut cmd = self.command(&["attach-session", "-t", &target]);
         if let SocketSpec::Default = &self.socket
             && let Some(val) = env::var_os("TMUX")
         {
@@ -415,7 +433,7 @@ impl Tmux for TmuxClient {
                 cmd = self.command(&[]);
                 cmd.arg("-S")
                     .arg(path)
-                    .args(["attach-session", "-t", target.as_str()]);
+                    .args(["attach-session", "-t", &target]);
             }
         }
         cmd.env_remove("TMUX")

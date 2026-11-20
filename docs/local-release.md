@@ -6,36 +6,35 @@ machine. GitHub Actions is an optional build and publication channel.
 
 ## Before releasing
 
-Use a macOS checkout on `main`, with the intended `origin` pointing to
+Use an Apple Silicon Mac checkout on `main`, with the intended `origin` pointing to
 `https://github.com/Quaternijkon/justmux.git`. Set up Rust, the Apple SDK, Zig,
 `cargo-zigbuild`, Node.js 22.15 or newer, npm, Python 3, and tmux. Install the
-four Rust targets listed in [the npm release guide](npm-release.md). Authenticate
-Git access and run `npm login` with an account permitted to publish all five
+two Rust targets listed in [the npm release guide](npm-release.md). Authenticate
+Git access and run `npm login` with an account permitted to publish all three
 JustMux packages.
 
-The build produces macOS ARM64 and x64 executables, plus Linux ARM64 and x64
-static musl executables. Linux users still install tmux separately. Building
-all four targets requires a Mac because the Darwin builds use the Apple SDK.
+The build produces a macOS ARM64 executable and a Linux x64 static musl
+executable. Linux users still install tmux separately. Building both targets
+requires a Mac because the Darwin build uses the Apple SDK.
 
 ## One command
 
 For the next intended version, run:
 
 ```sh
-./scripts/release 0.1.1
+./scripts/release 0.1.2
 ```
 
-The wrapper is equivalent to `node scripts/release.mjs 0.1.1`.
+The wrapper is equivalent to `node scripts/release.mjs 0.1.2`.
 
-`0.1.1` is an example for a future release. Adding this workflow does not bump
-the current version or publish another release. The checkout's source changes
-have not been pushed as part of preparing these instructions.
+`0.1.2` is the example next release after `0.1.1`. Replace it with the intended
+new version; published npm versions cannot be overwritten.
 
 The default requires a clean working tree. To explicitly include **all
 nonignored modifications and untracked files** in the release commit, use:
 
 ```sh
-./scripts/release 0.1.1 --commit
+./scripts/release 0.1.2 --commit
 ```
 
 Review `git status` first: `--commit` is permission to include the complete
@@ -45,7 +44,7 @@ To inspect the intended operations without changing files, commits, tags,
 remote branches, or npm packages:
 
 ```sh
-./scripts/release 0.1.1 --dry-run
+./scripts/release 0.1.2 --dry-run
 ```
 
 The release sequence is:
@@ -53,7 +52,7 @@ The release sequence is:
 1. Check the environment and release prerequisites.
 2. Update the Cargo and npm versions together and create a release commit.
 3. Run formatting, Clippy, Rust tests, the release build, and npm packaging
-   tests. Build all four platforms, validate and pack the five npm packages,
+   tests. Build both supported platforms, validate and pack the three npm packages,
    and exercise actual installation and the installed command's terminal
    handoff.
 4. Create an annotated version tag and atomically push `main` and that tag.
@@ -71,11 +70,11 @@ been built or published.
 Continue an interrupted release with its original version:
 
 ```sh
-./scripts/release 0.1.1 --resume
+./scripts/release 0.1.2 --resume
 ```
 
-The command records state in `dist/releases/0.1.1/release-state.json` and
-prepares packages under `dist/releases/0.1.1/npm`. After the release commit is
+The command records state in `dist/releases/0.1.2/release-state.json` and
+prepares packages under `dist/releases/0.1.2/npm`. After the release commit is
 created, resume requires a clean working tree at that recorded commit and checks
 the tag and prepared package hashes. Once the source has been pushed, it does not rebuild the
 packages. Do not edit the source, rebuild different tarballs, or move the

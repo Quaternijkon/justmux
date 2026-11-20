@@ -31,6 +31,7 @@ let registry;
 const environment = Object.fromEntries(Object.entries(process.env).filter(([key]) => (
   !/^npm_config_/i.test(key) && !/^(NPM_TOKEN|NODE_AUTH_TOKEN)$/.test(key)
 )));
+environment.JUSTMUX_NO_UPDATE_CHECK = '1';
 
 async function command(executable, args, {
   cwd = temporary, env = environment, allowFailure = false, timeout = 90_000,
@@ -182,6 +183,9 @@ try {
   console.log('PASS actual npm install: packed Rust binary, jm + justmux through PATH, --version and --help');
 
   if (runPty) {
+    const prompt = await command('python3', [path.join(root, 'scripts/test-npm-update-pty.py'),
+      '--entry', path.join(prefix, 'bin', 'jm')], { timeout: 60_000 });
+    process.stdout.write(prompt.stdout);
     const pty = await command('python3', ['-c', `
 import importlib.util
 import sys

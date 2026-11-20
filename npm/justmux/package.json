@@ -1,6 +1,6 @@
 {
   "name": "justmux",
-  "version": "0.1.0",
+  "version": "0.1.2",
   "private": true,
   "description": "A modern slash-command interface for tmux. Just tmux. Just simpler.",
   "license": "MIT",
@@ -32,10 +32,8 @@
     "LICENSE"
   ],
   "optionalDependencies": {
-    "justmux-darwin-x64": "0.1.0",
-    "justmux-darwin-arm64": "0.1.0",
-    "justmux-linux-x64": "0.1.0",
-    "justmux-linux-arm64": "0.1.0"
+    "justmux-darwin-arm64": "0.1.2",
+    "justmux-linux-x64": "0.1.2"
   },
   "scripts": {
     "test": "node --test test/*.test.cjs"

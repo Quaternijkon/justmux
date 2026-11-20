@@ -109,13 +109,16 @@ pub trait Tmux {
 
     // --- going somewhere --------------------------------------------------
 
-    /// Make `target` the current window/pane of its session (no-op for a
-    /// session target). Used before attaching from outside tmux.
+    /// Prepare a target for attach from outside tmux. A window target is
+    /// validated here and selected by `attach-session` during handoff.
     fn select(&self, target: &Target) -> TmuxResult<()>;
 
     /// `switch-client` the *current* client to `target`. Only meaningful when
     /// [`Tmux::context`] is [`Context::Inside`].
     fn switch_client(&self, target: &Target) -> TmuxResult<()>;
+
+    /// Detach one client identified by [`Tmux::context`].
+    fn detach_client(&self, client: &str) -> TmuxResult<()>;
 
     /// The `tmux attach-session` command to `exec` after the TUI has been
     /// torn down. Must not be spawned as a child by JustMux.

@@ -12,18 +12,20 @@ const manifest = { name: '@owner/justmux', version: '0.1.0' };
 
 test('platform names preserve npm scopes and cover the release targets', () => {
   assert.deepEqual(SUPPORTED_PLATFORMS.map((entry) => entry.target), [
-    'x86_64-apple-darwin', 'aarch64-apple-darwin',
-    'x86_64-unknown-linux-musl', 'aarch64-unknown-linux-musl',
+    'aarch64-apple-darwin', 'x86_64-unknown-linux-musl',
   ]);
   assert.equal(platformPackageName('justmux', 'darwin', 'arm64'), 'justmux-darwin-arm64');
   assert.equal(platformPackageName('@owner/justmux', 'linux', 'x64'), '@owner/justmux-linux-x64');
   assert.throws(() => platformPackageName('justmux', 'win32', 'x64'), /Unsupported platform win32\/x64/);
   assert.throws(() => platformPackageName('justmux', 'linux', 'riscv64'), /Unsupported platform/);
+  assert.throws(() => platformPackageName('justmux', 'darwin', 'x64'), /Unsupported platform/);
+  assert.throws(() => platformPackageName('justmux', 'linux', 'arm64'), /Unsupported platform/);
 });
 
 test('both installed command names use the same launcher and exact dependencies', () => {
   const pkg = require('../package.json');
   assert.equal(pkg.bin.jm, pkg.bin.justmux);
+  assert.equal(Object.keys(pkg.optionalDependencies).length, SUPPORTED_PLATFORMS.length);
   for (const { platform, arch } of SUPPORTED_PLATFORMS) {
     assert.equal(pkg.optionalDependencies[platformPackageName(pkg.name, platform, arch)], pkg.version);
   }
@@ -52,8 +54,8 @@ test('missing optional dependency gives an actionable exact-version reinstall co
 
 test('missing executable and malformed metadata report useful errors', () => {
   const options = {
-    platform: 'linux', arch: 'arm64', resolvePackage: () => '/unused/package.json',
-    readFile: () => JSON.stringify({ name: '@owner/justmux-linux-arm64', version: '0.1.0' }),
+    platform: 'linux', arch: 'x64', resolvePackage: () => '/unused/package.json',
+    readFile: () => JSON.stringify({ name: '@owner/justmux-linux-x64', version: '0.1.0' }),
     access() { throw new Error('missing'); },
   };
   assert.throws(() => resolveNativeExecutable(manifest, options), /missing or not executable/);

@@ -29,7 +29,7 @@ function fakeClock() {
 
 test('public verification waits through metadata and tarball propagation without redownloading successful packages', async () => {
   const first = registryFixture('justmux-linux-x64');
-  const second = registryFixture('justmux-linux-arm64');
+  const second = registryFixture('justmux-darwin-arm64');
   const clock = fakeClock();
   const requests = new Map();
   const messages = [];
@@ -51,7 +51,7 @@ test('public verification waits through metadata and tarball propagation without
   assert.deepEqual(clock.sleeps, [10, 10]);
   assert.equal(requests.get('https://registry.npmjs.org/justmux-linux-x64/0.1.0'), 1);
   assert.equal(requests.get(first.metadata.dist.tarball), 1);
-  assert.equal(requests.get('https://registry.npmjs.org/justmux-linux-arm64/0.1.0'), 3);
+  assert.equal(requests.get('https://registry.npmjs.org/justmux-darwin-arm64/0.1.0'), 3);
   assert.equal(requests.get(second.metadata.dist.tarball), 2);
   assert.equal(messages.filter((message) => message.startsWith('Publicly available')).length, 2);
 });
@@ -140,13 +140,11 @@ function elf(arch, interpreter = false) {
 }
 
 test('release validation rejects wrong CPU, malformed binaries, and dynamic Linux loaders', () => {
-  for (const arch of ['x64', 'arm64']) {
-    assert.doesNotThrow(() => inspectBinary(macho(arch), platformFor(`darwin-${arch}`)));
-    assert.doesNotThrow(() => inspectBinary(elf(arch), platformFor(`linux-${arch}`)));
-    assert.throws(() => inspectBinary(elf(arch, true), platformFor(`linux-${arch}`)), /static musl/);
-  }
+  assert.doesNotThrow(() => inspectBinary(macho('arm64'), platformFor('darwin-arm64')));
+  assert.doesNotThrow(() => inspectBinary(elf('x64'), platformFor('linux-x64')));
+  assert.throws(() => inspectBinary(elf('x64', true), platformFor('linux-x64')), /static musl/);
   assert.throws(() => inspectBinary(macho('x64'), platformFor('darwin-arm64')), /Mach-O/);
-  assert.throws(() => inspectBinary(elf('x64'), platformFor('linux-arm64')), /ELF/);
+  assert.throws(() => inspectBinary(elf('arm64'), platformFor('linux-x64')), /ELF/);
   assert.throws(() => inspectBinary(Buffer.alloc(12), platformFor('linux-x64')), /too small/);
   const badHeaders = elf('x64');
   badHeaders.writeBigUInt64LE(99999n, 32);
@@ -164,7 +162,7 @@ test('prepared main is publishable while its source remains protected and every 
   assert.equal(manifest.private, undefined);
   assert.equal(manifest.scripts, undefined);
   assert.equal(manifest.bin.jm, manifest.bin.justmux);
-  assert.equal(Object.keys(manifest.optionalDependencies).length, 4);
+  assert.equal(Object.keys(manifest.optionalDependencies).length, 2);
   assert.ok(Object.values(manifest.optionalDependencies).every((v) => v === source.version));
   assert.equal((await readFile(join(prepared, 'LICENSE'), 'utf8')).includes('MIT License'), true);
   await assert.rejects(() => publish(directory, { dryRun: true }), /ENOENT/);
@@ -175,13 +173,13 @@ test('native metadata hashes the actual executable, and a changed binary blocks 
   t.after(() => rm(directory, { recursive: true, force: true }));
   // This first target is checked before any host execution in validate().
   const binary = join(directory, 'fixture');
-  const bytes = macho('x64');
+  const bytes = macho('arm64');
   await writeFile(binary, bytes);
-  const prepared = await prepare({ out: directory, platform: 'darwin-x64', binary });
+  const prepared = await prepare({ out: directory, platform: 'darwin-arm64', binary });
   const manifest = JSON.parse(await readFile(join(prepared, 'package.json'), 'utf8'));
   assert.equal(manifest.justmux.sha256, createHash('sha256').update(bytes).digest('hex'));
   assert.deepEqual(manifest.os, ['darwin']);
-  assert.deepEqual(manifest.cpu, ['x64']);
+  assert.deepEqual(manifest.cpu, ['arm64']);
   bytes[63] = 42;
   await writeFile(join(prepared, 'bin/jm'), bytes);
   await assert.rejects(() => validate(directory), /checksum mismatch/);

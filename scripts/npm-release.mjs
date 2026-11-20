@@ -22,13 +22,13 @@ Usage:
 
 Platforms: ${SUPPORTED_PLATFORMS.map(id).join(', ')}
 
-build defaults to the current platform. --all prepares and packs all five npm
+build defaults to the current platform. --all prepares and packs all three npm
 packages. A partial build prepares only selected native packages plus the main
 package, and cannot be published. Partial and failed builds retain an
 .build-incomplete marker that prevents stale artifacts from being published.
 Build output defaults to dist/npm.
 
-macOS can build both macOS targets with its Apple SDK. Linux cross-builds use
+The macOS target uses the Apple SDK. Linux cross-builds use
 Zig and cargo-zigbuild. Native Linux musl builds require musl-gcc. This script
 does not install tools or alter Git, npm authentication, or published packages.
 
@@ -157,7 +157,7 @@ function build(options) {
   console.log(`Output: ${out}`);
   if (options.dryRun) {
     console.log(complete ? 'Dry run: all packages would be validated and packed; nothing changed.'
-      : 'Dry run: partial development build; publication requires all four native packages.');
+      : 'Dry run: partial development build; publication requires both native packages.');
     return;
   }
   preflight(platforms, plans);
@@ -192,7 +192,7 @@ function build(options) {
     const quoted = `'${out.replaceAll("'", "'\\''")}'`;
     console.log(`Local release prepared. Review and test it before publishing:\nnode scripts/npm-packages.mjs publish --dir ${quoted} --dry-run`);
   } else {
-    console.log('Partial development build prepared. Publishing is disabled until all four native packages are prepared at the same version.');
+    console.log('Partial development build prepared. Publishing is disabled until both native packages are prepared at the same version.');
   }
 }
 
