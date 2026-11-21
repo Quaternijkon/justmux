@@ -14,7 +14,7 @@ justmux
 Run the same npm install command to update to the latest release.
 
 Global installations also check npm at most once a day when launched
-interactively without a command, including `--fullscreen`. A newer version opens
+interactively without a command, including `--fullscreen` and `--inline`. A newer version opens
 a compact TUI picker with `Update`, `Skip`, and `Skip this version`, in that
 order. Use Up/Down and Enter, or press 1, 2, or 3. `Update` is initially selected
 and installs that exact version, then exits; run `jm` again afterward. `Skip`

@@ -1,12 +1,13 @@
 //! Argument parsing, diagnostics, and the blocking TUI event loop.
 use crate::{
     app::{App, AppOptions, Exit},
-    terminal::{ScreenMode, TerminalGuard, exec_tmux, install_restore_hooks},
+    config::{CliOverrides, LoadedConfig},
+    terminal::{ScreenMode, TerminalGuard, TerminalSettings, exec_tmux, install_restore_hooks},
     tmux::{SocketSpec, Tmux, TmuxClient},
 };
 use anyhow::{Context, Result};
 use clap::Parser;
-use crossterm::event::{self, Event, KeyEventKind};
+use crossterm::event::{self, Event, KeyEventKind, MouseButton, MouseEventKind};
 use ratatui::{Terminal, TerminalOptions, Viewport, backend::CrosstermBackend};
 use std::{
     io::{self, IsTerminal},
@@ -31,9 +32,21 @@ struct Cli {
     /// Use a tmux socket path (same as tmux -S).
     #[arg(short = 'S', long = "socket-path", conflicts_with = "socket_name")]
     socket_path: Option<PathBuf>,
-    /// Use an alternate fullscreen display instead of the native inline interface.
+    /// Use the alternate fullscreen display (default).
     #[arg(long)]
     fullscreen: bool,
+    /// Use the native inline display instead of fullscreen.
+    #[arg(long, conflicts_with = "fullscreen")]
+    inline: bool,
+    /// Override color theme preset (aurora, codex, claude, matrix, classic).
+    #[arg(long, value_name = "THEME")]
+    theme: Option<String>,
+    /// Path to configuration TOML file.
+    #[arg(short = 'c', long = "config", value_name = "PATH")]
+    config: Option<PathBuf>,
+    /// Print starter config.toml and exit.
+    #[arg(long)]
+    print_config: bool,
     /// Print a recommended Popup binding without editing any file.
     #[arg(long)]
     print_keybind: bool,
@@ -67,19 +80,43 @@ pub fn main() -> ExitCode {
     }
 }
 
+fn cli_screen_override(cli: &Cli) -> Option<ScreenMode> {
+    if cli.fullscreen {
+        Some(ScreenMode::Fullscreen)
+    } else if cli.inline {
+        Some(ScreenMode::Inline)
+    } else {
+        None
+    }
+}
+
+fn cli_overrides(cli: &Cli) -> CliOverrides {
+    CliOverrides {
+        config_path: cli.config.clone(),
+        screen_mode: cli_screen_override(cli),
+        theme: cli.theme.clone(),
+    }
+}
+
 fn run(cli: Cli) -> Result<()> {
-    let tmux = TmuxClient::new(cli.socket());
+    if cli.print_config {
+        print!("{}", crate::config::starter_config_toml());
+        return Ok(());
+    }
     if cli.print_keybind {
         println!("# tmux 3.2+; add this to your tmux configuration:\n{KEYBIND}");
         return Ok(());
     }
+    let tmux = TmuxClient::new(cli.socket());
     if cli.doctor || cli.command.first().map(String::as_str) == Some("doctor") {
-        return doctor(&tmux);
+        let loaded = crate::config::load(&cli_overrides(&cli))?;
+        return doctor(&tmux, &loaded);
     }
     tmux.version().context("cannot start JustMux")?;
     if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
         anyhow::bail!("JustMux needs an interactive terminal; try jm doctor or jm --print-keybind");
     }
+    let loaded = crate::config::load(&cli_overrides(&cli))?;
     let initial_command = cli.command.first().map(|name| {
         let mut text = String::from("/");
         text.push_str(name.trim_start_matches('/'));
@@ -89,12 +126,7 @@ fn run(cli: Cli) -> Result<()> {
         }
         text
     });
-    let mode = if cli.fullscreen {
-        ScreenMode::Fullscreen
-    } else {
-        ScreenMode::Inline
-    };
-    run_tui(&tmux, AppOptions { initial_command }, mode)
+    run_tui(&tmux, AppOptions { initial_command }, loaded)
 }
 
 fn quote_argument(argument: &str) -> String {
@@ -111,7 +143,7 @@ fn quote_argument(argument: &str) -> String {
     }
 }
 
-fn doctor(tmux: &TmuxClient) -> Result<()> {
+fn doctor(tmux: &TmuxClient, loaded: &LoadedConfig) -> Result<()> {
     let version = tmux.version().context("cannot query tmux")?;
     println!("JustMux {}", env!("CARGO_PKG_VERSION"));
     println!("tmux: {version}");
@@ -138,13 +170,37 @@ fn doctor(tmux: &TmuxClient) -> Result<()> {
         io::stdin().is_terminal(),
         io::stdout().is_terminal()
     );
+    let config_label = match &loaded.path {
+        Some(path) if loaded.loaded_from_file => format!("{} (loaded)", path.display()),
+        Some(path) => format!("{} (default; file not created)", path.display()),
+        None => "default (no config path)".to_owned(),
+    };
+    println!("Config: {config_label}");
+    println!("Screen mode: {}", loaded.config.screen_mode.as_str());
+    println!("Theme: {}", theme_summary(loaded.config.effective_theme()));
     Ok(())
 }
 
-fn run_tui(tmux: &TmuxClient, options: AppOptions, mode: ScreenMode) -> Result<()> {
+fn theme_summary(theme: crate::ui::Theme) -> String {
+    let color_mode = if theme.no_color {
+        "NO_COLOR"
+    } else if theme.truecolor {
+        "truecolor"
+    } else {
+        "ANSI"
+    };
+    format!("{} ({color_mode})", theme.preset.name())
+}
+
+fn run_tui(tmux: &TmuxClient, options: AppOptions, loaded: LoadedConfig) -> Result<()> {
     install_restore_hooks()?;
-    let mut guard = TerminalGuard::enter(mode)?;
-    let viewport = match mode {
+    let settings = TerminalSettings {
+        mode: loaded.config.screen_mode,
+        mouse: loaded.config.mouse && loaded.config.screen_mode == ScreenMode::Fullscreen,
+        inline_height: loaded.config.inline_height,
+    };
+    let mut guard = TerminalGuard::enter_with(settings)?;
+    let viewport = match settings.mode {
         ScreenMode::Inline => Viewport::Fixed(guard.inline_area(None)?),
         ScreenMode::Fullscreen => Viewport::Fullscreen,
     };
@@ -153,7 +209,7 @@ fn run_tui(tmux: &TmuxClient, options: AppOptions, mode: ScreenMode) -> Result<(
         TerminalOptions { viewport },
     )
     .context("could not initialise terminal")?;
-    let mut app = App::new(tmux, options);
+    let mut app = App::with_config(tmux, options, loaded.config, loaded.path);
     loop {
         // Hand control back before drawing another frame.
         if let Some(exit) = app.exit().cloned() {
@@ -193,7 +249,7 @@ fn run_tui(tmux: &TmuxClient, options: AppOptions, mode: ScreenMode) -> Result<(
         }
         // A resize burst needs one cursor report and one region reservation.
         // Waiting for a remote terminal once per resize event adds avoidable RTTs.
-        if resized && mode == ScreenMode::Inline && app.exit().is_none() {
+        if resized && settings.mode == ScreenMode::Inline && app.exit().is_none() {
             let previous = terminal.get_frame().area();
             let area = guard.inline_area(Some(previous))?;
             terminal = Terminal::with_options(
@@ -210,7 +266,13 @@ fn redraw_event(event: &Event) -> bool {
     match event {
         Event::Key(key) => key.kind != KeyEventKind::Release,
         Event::Paste(_) | Event::Resize(_, _) => true,
-        Event::Mouse(_) | Event::FocusGained | Event::FocusLost => false,
+        Event::Mouse(mouse) => matches!(
+            mouse.kind,
+            MouseEventKind::Down(MouseButton::Left)
+                | MouseEventKind::ScrollUp
+                | MouseEventKind::ScrollDown
+        ),
+        Event::FocusGained | Event::FocusLost => false,
     }
 }
 
@@ -218,16 +280,44 @@ fn redraw_event(event: &Event) -> bool {
 mod tests {
     use super::*;
     #[test]
-    fn inline_is_default_and_fullscreen_is_explicit() {
-        assert!(!Cli::try_parse_from(["jm"]).expect("default CLI").fullscreen);
-        let cli = Cli::try_parse_from(["jm", "--fullscreen", "resume"]).expect("fullscreen CLI");
-        assert!(cli.fullscreen);
-        assert_eq!(cli.command, vec!["resume"]);
+    fn fullscreen_is_default_and_inline_or_fullscreen_are_explicit() {
+        let default_cli = Cli::try_parse_from(["jm"]).expect("default CLI");
+        assert!(!default_cli.fullscreen);
+        assert!(!default_cli.inline);
+        assert_eq!(cli_screen_override(&default_cli), None);
+
+        let inline_cli = Cli::try_parse_from(["jm", "--inline", "resume"]).expect("inline CLI");
+        assert!(inline_cli.inline);
+        assert_eq!(cli_screen_override(&inline_cli), Some(ScreenMode::Inline));
+        assert_eq!(inline_cli.command, vec!["resume"]);
+
+        let full_cli = Cli::try_parse_from(["jm", "--fullscreen", "resume"]).expect("full CLI");
+        assert!(full_cli.fullscreen);
+        assert_eq!(cli_screen_override(&full_cli), Some(ScreenMode::Fullscreen));
+        assert_eq!(full_cli.command, vec!["resume"]);
+
+        assert!(Cli::try_parse_from(["jm", "--inline", "--fullscreen"]).is_err());
+    }
+
+    #[test]
+    fn parses_config_theme_and_print_config_flags() {
+        let cli = Cli::try_parse_from([
+            "jm",
+            "-c",
+            "/tmp/custom.toml",
+            "--theme",
+            "codex",
+            "--print-config",
+        ])
+        .expect("config CLI");
+        assert_eq!(cli.config, Some(PathBuf::from("/tmp/custom.toml")));
+        assert_eq!(cli.theme.as_deref(), Some("codex"));
+        assert!(cli.print_config);
     }
 
     #[test]
     fn focus_and_key_release_events_do_not_trigger_redraws() {
-        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent};
         assert!(!redraw_event(&Event::FocusGained));
         assert!(!redraw_event(&Event::FocusLost));
         let key = KeyEvent::new(KeyCode::Down, KeyModifiers::NONE);
@@ -237,6 +327,36 @@ mod tests {
             ..key
         })));
         assert!(redraw_event(&Event::Resize(80, 24)));
+        assert!(redraw_event(&Event::Mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 2,
+            row: 3,
+            modifiers: KeyModifiers::NONE,
+        })));
+        assert!(redraw_event(&Event::Mouse(MouseEvent {
+            kind: MouseEventKind::ScrollUp,
+            column: 2,
+            row: 3,
+            modifiers: KeyModifiers::NONE,
+        })));
+        assert!(redraw_event(&Event::Mouse(MouseEvent {
+            kind: MouseEventKind::ScrollDown,
+            column: 2,
+            row: 3,
+            modifiers: KeyModifiers::NONE,
+        })));
+        assert!(!redraw_event(&Event::Mouse(MouseEvent {
+            kind: MouseEventKind::Moved,
+            column: 2,
+            row: 3,
+            modifiers: KeyModifiers::NONE,
+        })));
+        assert!(!redraw_event(&Event::Mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Right),
+            column: 2,
+            row: 3,
+            modifiers: KeyModifiers::NONE,
+        })));
     }
 
     #[test]
@@ -271,6 +391,23 @@ mod tests {
             Cli::try_parse_from(["jm", "--print-keybind"])
                 .expect("keybind CLI")
                 .print_keybind
+        );
+    }
+
+    #[test]
+    fn doctor_theme_summary_reports_preset_and_color_mode() {
+        use crate::ui::{Theme, ThemePreset};
+        assert_eq!(
+            theme_summary(Theme::default().with_preset(ThemePreset::AntigravityAurora)),
+            "Antigravity Aurora (truecolor)"
+        );
+        assert_eq!(theme_summary(Theme::default()), "Classic (ANSI)");
+        assert_eq!(
+            theme_summary(Theme {
+                no_color: true,
+                ..Theme::default()
+            }),
+            "Classic (NO_COLOR)"
         );
     }
 }

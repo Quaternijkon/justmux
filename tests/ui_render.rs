@@ -80,6 +80,8 @@ fn home_and_command_popup_are_visible_in_test_backend() {
     let commands = [CommandItem {
         name: "resume",
         description: "Open a window in an existing tmux session",
+        alias: None,
+        indices: &[],
     }];
     terminal
         .draw(|frame| {
@@ -155,6 +157,51 @@ fn canonical_command_for_an_alias_is_visible_even_without_fuzzy_match() {
     key(&mut app, KeyCode::Enter);
     terminal.draw(|frame| app.render(frame)).expect("draw");
     assert!(screen(&terminal).contains("Rename session"));
+}
+
+#[test]
+fn alias_prefix_is_highlighted_and_completes_to_the_command_name() {
+    let tmux = private_tmux();
+    let mut app = App::new(&tmux, AppOptions::default());
+    type_text(&mut app, "/att");
+    let mut terminal = Terminal::new(TestBackend::new(40, 12)).expect("test terminal");
+    terminal.draw(|frame| app.render(frame)).expect("draw");
+    assert!(screen(&terminal).contains("/resume /attach"));
+    assert_eq!(
+        terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .filter(|cell| cell.modifier.contains(Modifier::UNDERLINED))
+            .map(|cell| cell.symbol())
+            .collect::<String>(),
+        "att"
+    );
+    key(&mut app, KeyCode::Tab);
+    terminal.draw(|frame| app.render(frame)).expect("draw");
+    let output = screen(&terminal);
+    assert!(
+        output.contains("› /resume") || output.contains("> /resume"),
+        "{output}"
+    );
+    key(&mut app, KeyCode::Enter);
+    terminal.draw(|frame| app.render(frame)).expect("draw");
+    assert!(screen(&terminal).contains("No tmux sessions"));
+}
+
+#[test]
+fn misspelled_command_shows_guidance_without_opening_a_view() {
+    let tmux = private_tmux();
+    let mut app = App::new(&tmux, AppOptions::default());
+    type_text(&mut app, "/reusme");
+    key(&mut app, KeyCode::Enter);
+    let mut terminal = Terminal::new(TestBackend::new(72, 18)).expect("test terminal");
+    terminal.draw(|frame| app.render(frame)).expect("draw");
+    let output = screen(&terminal);
+    assert!(output.contains("Did you mean /resume?"));
+    assert!(output.contains("/reusme"));
+    assert!(app.exit().is_none());
 }
 
 #[test]

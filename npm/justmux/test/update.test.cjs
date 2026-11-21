@@ -43,8 +43,8 @@ function fixture(t, overrides = {}) {
   return { directory, prefix, packageRoot, options, calls, cache };
 }
 
-test('only interactive global npm startup checks for an update, including fullscreen', async (t) => {
-  for (const args of [[], ['--fullscreen']]) {
+test('only interactive global npm startup checks for an update, including fullscreen and inline', async (t) => {
+  for (const args of [[], ['--fullscreen'], ['--inline']]) {
     const app = fixture(t);
     assert.deepEqual(await maybeUpdate(args, app.options), { action: 'continue' });
     assert.equal(app.calls.fetch.length, 1);

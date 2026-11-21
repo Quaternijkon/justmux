@@ -23,7 +23,7 @@ pub mod parser;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-pub use client::TmuxClient;
+pub use client::{TmuxClient, sanitize_captured_lines};
 pub use error::{TmuxError, TmuxResult};
 pub use model::{
     Context, InsideContext, Pane, PaneId, Session, SessionId, SplitDirection, Target, TmuxVersion,
@@ -106,6 +106,12 @@ pub trait Tmux {
     fn split_pane(&self, target: &PaneId, direction: SplitDirection) -> TmuxResult<Pane>;
 
     fn kill_pane(&self, id: &PaneId) -> TmuxResult<()>;
+
+    /// Capture the visible lines of `target` (session's active pane, window's active pane, or pane)
+    /// as plain printable lines (ANSI escapes stripped), trimmed to the last `max_lines` non-empty block.
+    fn capture_pane(&self, _target: &Target, _max_lines: usize) -> TmuxResult<Vec<String>> {
+        Ok(Vec::new())
+    }
 
     // --- going somewhere --------------------------------------------------
 

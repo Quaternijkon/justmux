@@ -9,6 +9,7 @@ import os
 import pty
 import selectors
 import shlex
+import shutil
 import signal
 import struct
 import subprocess
@@ -36,6 +37,7 @@ def clean_env():
     for name in ("TMUX", "TMUX_PANE", "JUSTMUX_CLIENT", "JUSTMUX_PANE", "JUSTMUX_POPUP", "TMUX_POPUP"):
         env.pop(name, None)
     env["TERM"] = "xterm-256color"
+    env["JUSTMUX_CONFIG"] = "/dev/null"
     return env
 
 
@@ -210,13 +212,31 @@ class PTY:
         self.until(exited, "PTY child did not exit", timeout)
         self.read(.1)
 
-    def assert_restored(self, fullscreen=False, native_tmux=False):
+    def assert_restored(self, fullscreen=False, native_tmux=False, bracketed_paste=False):
         require(termios.tcgetattr(self.fd) == self.baseline, "terminal termios was not fully restored")
         require(b"\x1b[?25h" in self.out, "cursor Show sequence missing")
+        if bracketed_paste:
+            self.assert_paste_restored()
         if fullscreen or native_tmux:
+            self.assert_mouse_restored()
             require(b"\x1b[?1049l" in self.out, "LeaveAlternateScreen sequence missing")
         else:
             self.assert_native_screen()
+
+    def assert_mouse_restored(self):
+        for code in (b"1000", b"1002", b"1003", b"1006"):
+            enable = b"\x1b[?" + code + b"h"
+            disable = b"\x1b[?" + code + b"l"
+            pos = self.out.rfind(enable)
+            if pos >= 0:
+                require(self.out.rfind(disable) > pos, f"jm left mouse capture {code.decode()} enabled")
+
+    def assert_paste_restored(self, output=None):
+        output = self.out if output is None else output
+        enabled = output.rfind(b"\x1b[?2004h")
+        disabled = output.rfind(b"\x1b[?2004l")
+        require(enabled >= 0, "jm did not enable bracketed paste")
+        require(disabled > enabled, "jm left bracketed paste enabled")
 
     def assert_native_screen(self):
         for forbidden in (b"\x1b[?1049h", b"\x1b[?1049l", b"\x1b[2J", b"\x1b[3J",
@@ -268,7 +288,7 @@ class Socket:
 
 def inline_terminal(sock):
     prefix = b"JM_NATIVE_HISTORY_1\r\nJM_NATIVE_HISTORY_2\r\nJM_NATIVE_PROMPT\r\n"
-    command = (shlex.quote(str(JM)) + " -L " + shlex.quote(sock.name)
+    command = (shlex.quote(str(JM)) + " --inline -L " + shlex.quote(sock.name)
                + '; status=$?; printf "JM_SHELL_RETURN:%s\\n" "$status"')
     with PTY(["/bin/sh", "-c", command], prefix=prefix) as p:
         p.text("JustMux")
@@ -302,27 +322,47 @@ def inline_terminal(sock):
         p.send("\x1b")
         p.text("JM_SHELL_RETURN:0")
         p.wait_exit()
-        p.assert_restored()
+        p.assert_restored(bracketed_paste=True)
         shell_rows = [i for i, row in enumerate(p.screen.cells) if "JM_SHELL_RETURN:0" in "".join(row)]
         require(shell_rows and min(shell_rows) > ui_bottom, "shell resumed over the inline UI instead of below it")
     print(f"PASS inline: native history + non-top cursor + resize + shell placement; idle 0 bytes, 10-key burst {navigation_bytes} bytes")
 
 
 def fullscreen(sock):
-    with PTY([str(JM), "--fullscreen", "-L", sock.name]) as p:
+    with PTY([str(JM), "-L", sock.name]) as p:
         p.text("JustMux")
-        require(b"\x1b[?1049h" in p.out, "--fullscreen did not enter alternate screen")
+        require(b"\x1b[?1049h" in p.out, "default fullscreen launch did not enter alternate screen")
+        require(b"\x1b[?1000h" in p.out and b"\x1b[?1006h" in p.out, "default fullscreen launch did not enable mouse capture")
         p.send("\x1b")
         p.wait_exit()
         require(os.waitstatus_to_exitcode(p.status) == 0, "fullscreen quit failed")
-        p.assert_restored(fullscreen=True)
-    print("PASS --fullscreen: explicit alternate screen entry/exit and termios restored")
+        p.assert_restored(fullscreen=True, bracketed_paste=True)
+    print("PASS default fullscreen: alternate screen + mouse capture entry/exit and termios restored")
+
+
+def paste(sock, fullscreen=True):
+    args = [str(JM), "-L", sock.name]
+    if not fullscreen:
+        args.append("--inline")
+    with PTY(args) as p:
+        p.text("JustMux")
+        require(b"\x1b[?2004h" in p.out, "jm did not request bracketed paste")
+        os.write(p.fd, b"\x1b[200~/quit\r\n\x1b[201~")
+        p.until(lambda: "/quit" in p.screen.text(), "bracketed paste did not reach the composer")
+        p.read(.15)
+        require(not (termios.tcgetattr(p.fd)[3] & termios.ICANON),
+                "a newline in pasted text executed the command")
+        p.send("\r")
+        p.wait_exit()
+        require(os.waitstatus_to_exitcode(p.status) == 0, "pasted quit command failed after Enter")
+        p.assert_restored(fullscreen=fullscreen, bracketed_paste=True)
+    print(f"PASS bracketed paste{' (default fullscreen)' if fullscreen else ' --inline'}: newline edits until Enter; terminal mode restored")
 
 
 def inline_bottom(sock):
     prefix = b"JM_DEEP_HISTORY\r\n" + b"".join(
         f"JM_BEFORE_LINE_{index:02d}\r\n".encode() for index in range(40))
-    command = (shlex.quote(str(JM)) + " -L " + shlex.quote(sock.name)
+    command = (shlex.quote(str(JM)) + " --inline -L " + shlex.quote(sock.name)
                + '; status=$?; printf "JM_BOTTOM_RETURN:%s\\n" "$status"')
     with PTY(["/bin/sh", "-c", command], prefix=prefix) as p:
         p.text("JustMux")
@@ -341,7 +381,7 @@ def inline_bottom(sock):
         p.send("\x1b")
         p.text("JM_BOTTOM_RETURN:0")
         p.wait_exit()
-        p.assert_restored()
+        p.assert_restored(bracketed_paste=True)
         rows = ["".join(row) for row in p.screen.cells]
         footer = next((i for i, row in enumerate(rows) if "Type / for commands" in row), None)
         shell = next((i for i, row in enumerate(rows) if "JM_BOTTOM_RETURN:0" in row), None)
@@ -360,7 +400,7 @@ def external(sock):
         p.send("/resume\r")
         p.until(lambda: any("orion" in row and "lyra" in row for row in p.screen.text().splitlines()),
                 "session headers were not displayed side by side")
-        p.assert_native_screen()
+        require(b"\x1b[?1049h" in p.out, "default external launch did not enter alternate screen")
         pid = p.pid
         p.send("lyra")
         os.write(p.fd, b"\x1b[B")
@@ -384,6 +424,47 @@ def external(sock):
     print("PASS external /resume: column layout, linked window in chosen session, exec and terminal restoration")
 
 
+def paste_handoff(sock):
+    # tmux may flush queued terminal output during initialization. This fixture
+    # observes jm's restoration before passing the same PID to the real tmux.
+    executable = shutil.which("tmux")
+    require(executable is not None, "tmux executable was not found")
+    sock.run("new-session", "-d", "-s", "paste-handoff", "/bin/sh")
+    with tempfile.TemporaryDirectory(prefix="jm-handoff-") as directory:
+        wrapper = Path(directory) / "tmux"
+        wrapper.write_text(f"#!{sys.executable}\n" + "\n".join([
+            "import os, sys, termios, time",
+            "if 'attach-session' in sys.argv[1:]:",
+            "    flags = termios.tcgetattr(0)[3]",
+            "    if not (flags & termios.ICANON and flags & termios.ECHO):",
+            "        sys.exit('tmux inherited raw mode')",
+            "    print('JM_HANDOFF_RESTORED', flush=True)",
+            "    time.sleep(.25)",
+            f"os.execv({executable!r}, [{executable!r}, *sys.argv[1:]])",
+        ]) + "\n")
+        wrapper.chmod(0o700)
+        previous = os.environ.get("PATH", "")
+        os.environ["PATH"] = directory + os.pathsep + previous
+        try:
+            terminal = PTY([str(JM), "-L", sock.name])
+        finally:
+            os.environ["PATH"] = previous
+        with terminal as p:
+            p.text("JustMux")
+            p.send("/resume\r")
+            p.text("Search:")
+            p.send("paste-handoff\r")
+            p.text("JM_HANDOFF_RESTORED")
+            marker = p.out.find(b"JM_HANDOFF_RESTORED")
+            p.assert_paste_restored(p.out[:marker])
+            p.until(lambda: p.pid in sock.clients(), "handoff fixture did not exec native tmux")
+            p.send("\x02d")
+            p.wait_exit()
+            require(os.waitstatus_to_exitcode(p.status) == 0, "handoff fixture detach failed")
+            p.assert_restored(native_tmux=True)
+    print("PASS native handoff: paste disabled and canonical input restored before exec")
+
+
 def create(sock):
     with PTY([str(JM), "-L", sock.name]) as p:
         p.text("JustMux")
@@ -398,7 +479,7 @@ def create(sock):
         p.send("\x1b"); p.read(.15); p.send("\x1b"); p.read(.15)
         p.send("\x15/quit\r")
         p.wait_exit()
-        p.assert_restored()
+        p.assert_restored(fullscreen=True, bracketed_paste=True)
     require("smoke-new" in sock.run("list-sessions", "-F", "#{session_name}"), "session did not outlive jm")
     print("PASS /new: native session and cwd verified; /quit restores terminal; session survives")
 
@@ -450,14 +531,14 @@ def detach(sock):
         outside.send("/exit\r")
         outside.wait_exit()
         require(os.waitstatus_to_exitcode(outside.status) == 0, "/exit from outside tmux did not quit")
-        outside.assert_restored()
+        outside.assert_restored(fullscreen=True, bracketed_paste=True)
     print("PASS standalone /exit: quits JustMux and restores the terminal")
 
 
-def interrupt(sock, method, fullscreen=False):
+def interrupt(sock, method, fullscreen=True):
     args = [str(JM), "-L", sock.name]
-    if fullscreen:
-        args.append("--fullscreen")
+    if not fullscreen:
+        args.append("--inline")
     with PTY(args) as p:
         p.text("JustMux")
         require(not (termios.tcgetattr(p.fd)[3] & termios.ICANON), "jm did not enter raw mode")
@@ -466,11 +547,47 @@ def interrupt(sock, method, fullscreen=False):
         else:
             os.kill(p.pid, signal.SIGTERM)
         p.wait_exit()
-        p.assert_restored(fullscreen=fullscreen)
+        p.assert_restored(fullscreen=fullscreen, bracketed_paste=True)
         expected = 0 if method == "Ctrl+C" else 128 + signal.SIGTERM
         require(os.waitstatus_to_exitcode(p.status) == expected, f"unexpected {method} status: {p.status}")
     screen = "with alternate screen restored" if fullscreen else "without alternate screen"
-    print(f"PASS {method}{' --fullscreen' if fullscreen else ''}: full termios and cursor restored {screen}")
+    print(f"PASS {method}{' (default fullscreen)' if fullscreen else ' --inline'}: full termios and cursor restored {screen}")
+
+
+def config_file(sock):
+    with tempfile.TemporaryDirectory(prefix="jm-cfg-") as directory:
+        cfg_path = Path(directory) / "config.toml"
+        cfg_path.write_text(
+            '[ui]\ntheme = "codex"\n\n[terminal]\nscreen_mode = "inline"\n',
+            encoding="utf-8",
+        )
+        prefix = b"JM_CONFIG_HISTORY\r\n"
+        command = (
+            shlex.quote(str(JM))
+            + " --config "
+            + shlex.quote(str(cfg_path))
+            + " -L "
+            + shlex.quote(sock.name)
+            + '; status=$?; printf "JM_CFG_RETURN:%s\\n" "$status"'
+        )
+        with PTY(["/bin/sh", "-c", command], prefix=prefix) as p:
+            p.text("JustMux")
+            p.text(">_ codex")
+            require("JM_CONFIG_HISTORY" in p.screen.text(), "config inline mode overwrote terminal history")
+            p.assert_native_screen()
+            p.send("\x1b")
+            p.text("JM_CFG_RETURN:0")
+            p.wait_exit()
+            p.assert_restored(fullscreen=False, bracketed_paste=True)
+
+        with PTY([str(JM), "--config", str(cfg_path), "--fullscreen", "-L", sock.name]) as p:
+            p.text("JustMux")
+            p.text(">_ codex")
+            require(b"\x1b[?1049h" in p.out, "--fullscreen did not override config.toml screen_mode = inline")
+            p.send("\x1b")
+            p.wait_exit()
+            p.assert_restored(fullscreen=True, bracketed_paste=True)
+    print("PASS --config & CLI precedence: config.toml inline+codex respected and overridden by --fullscreen")
 
 
 def popup(sock):
@@ -547,12 +664,17 @@ def main():
         inline_terminal(sock)
         inline_bottom(sock)
         fullscreen(sock)
+        paste(sock)
+        paste(sock, fullscreen=False)
         external(sock)
+        paste_handoff(sock)
         create(sock)
         detach(sock)
         interrupt(sock, "Ctrl+C")
         interrupt(sock, "SIGTERM")
-        interrupt(sock, "SIGTERM", fullscreen=True)
+        interrupt(sock, "Ctrl+C", fullscreen=False)
+        interrupt(sock, "SIGTERM", fullscreen=False)
+        config_file(sock)
         popup(sock)
     finally:
         sock.cleanup()

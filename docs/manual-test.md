@@ -6,10 +6,13 @@ They complement the automated test suite; they are not run by CI.
 The repeatable PTY version is `python3 scripts/pty_smoke.py`; it uses a fresh
 socket, a 100x30 xterm PTY, deadline based reads, and cleanup on every path.
 
-1. Build with `cargo build --release`, print a few lines of shell output, and
-   run `./target/release/jm` from a normal shell. Confirm it uses a compact
-   region below that output and native terminal scrollback remains available.
-   Repeat with `--fullscreen` to check the optional alternate-screen layout.
+1. Build with `cargo build --release` and run `./target/release/jm` from a normal
+   shell. Confirm it launches in the Fullscreen studio by default (`1049h`) with
+   8 quick commands, up to 6 Live Workspaces, and an embedded Active Workspace
+   Preview card on wide terminals (`>= 80x24`). Repeat with `--inline` after
+   printing a few lines of shell output to confirm the compact inline region
+   preserves native scrollback above it without entering an alternate screen or
+   enabling mouse capture.
 2. Type `/`, then `/res`; verify filtering, Tab completion, Up/Down navigation,
    Esc, and the empty-session message.
 3. Run `/new`, create a temporary session, choose its resume action, and detach
@@ -23,10 +26,50 @@ socket, a 100x30 xterm PTY, deadline based reads, and cleanup on every path.
    is unchanged. Run `/exit` in a pane or in the popup and confirm it detaches
    only your client. Reattach to verify the original pane is still running.
 6. Resize a narrow popup and test `/list`, `/rename`, `/kill`, `/window`,
-   `/pane`, and `/split`. Confirm kill dialogs default to Cancel.
-7. Interrupt with Ctrl+C and SIGTERM and verify raw mode and the cursor are
-   restored. In the default inline mode, the shell prompt should follow the UI;
-   with `--fullscreen`, the original screen should return.
+   `/pane`, and `/split`. Confirm `/split` previews side-by-side and stacked
+   pane wireframes, `/list` and `/resume` show live captured terminal previews
+   on wide screens, and `/kill` shows the Codex-style Approval Card defaulting
+   to Cancel.
+7. Test the zero-learning studio UX, modes, `@` targeting, and themes:
+   - On an empty Command & @Jump bar, press `↓` to open the `/` command menu,
+     `?` to open `/help`, and `1`–`9` to jump straight to a numbered live
+     workspace.
+   - Press `Shift+Tab` to cycle `Command & @Jump` -> `Live Radar` (browse
+     sessions with live terminal output preview) -> `Quick Launch` (Enter
+     launches/attaches workspace).
+   - Type `@` standalone and after `/kill ` / `/rename ` / `/split ` to verify
+     the `@ Targets` popup, Tab completion, and direct execution.
+   - Press `Ctrl+P` (or `Ctrl+K` inside `/help`) to return straight to the `/`
+     palette; confirm `Ctrl+K` inside an active text input still kills to end
+     of line.
+   - Test bare commands (`resume`), natural phrases (`new demo`, `split right`,
+     `split down`, `kill demo`), and exact session names without `/`.
+   - Press `Ctrl+T` to cycle themes, and open `/theme` (or `/theme aurora`) to
+     verify live preview, `Esc` revert, and `Enter` apply.
+   - Press `Ctrl+b` on the home screen to verify the prefix-retirement message,
+     and explore `/codex`, `/claude`, `/antigravity`, `/vibe`, `/boost`, and
+     `/compact` tribute views/toasts.
+   - Re-run with `NO_COLOR=1 ./target/release/jm` and `jm doctor` to confirm
+     clean fallback colors, resolved `Config:` status, `Screen mode:`, and
+     `Theme:` output.
+8. Test unified TOML config, `/config`, and Fullscreen mouse support:
+   - Run `./target/release/jm --print-config > /tmp/jm-test-config.toml`, edit
+     `theme = "codex"` or `screen_mode = "inline"`, and launch
+     `./target/release/jm --config /tmp/jm-test-config.toml` plus
+     `--fullscreen` / `--theme claude` to confirm `CLI > Env > config.toml > defaults`
+     precedence.
+   - Open `/config`, move across all 8 rows with `↑`/`↓`, toggle settings with
+     `←`/`→`/`Enter`, verify restart hint `"Takes effect on next jm launch (press s to save)"`
+     when changing `screen_mode`/`mouse`/`inline_height`, and press `s` to save
+     to `/tmp/jm-test-config.toml`.
+   - Open `/theme`, select a preset, and press `s` to confirm it persists to
+     the active config file.
+   - In Fullscreen mode (`mouse = true`), verify mouse scroll navigates lists
+     and left-clicking a picker/Live Radar row selects and opens it without
+     leaving mouse capture enabled after exit or tmux attach.
+9. Interrupt with Ctrl+C and SIGTERM and verify raw mode and the cursor are
+   restored. In default Fullscreen mode, the original screen and mouse mode
+   should return; with `--inline`, the shell prompt should follow the UI.
 
 Do not run these destructive steps against a user's default server. Replace
 the tmux socket with a unique `-L` name or a temporary `-S` path and clean it
@@ -41,11 +84,15 @@ original `jm` PID becomes the native tmux client, sends a pane command whose
 result is checked via tmux, detaches, and compares complete termios attributes.
 It also checks `/new` creates the named native session with the requested cwd,
 that the session survives `/quit`, and that Ctrl+C and SIGTERM restore termios
-and the cursor. Inline checks answer actual cursor-position reports, start below
+and the cursor. `--inline` checks answer actual cursor-position reports, start below
 existing shell output, resize the PTY, and check that the shell returns below
-the interface. The main screen must not receive alternate-screen, whole-screen
-clear, scrollback-clear, or mouse-capture sequences. `--fullscreen` separately
-checks alternate-screen entry, exit, and restoration after SIGTERM.
+the interface. Inline output must not emit alternate-screen, whole-screen
+clear, scrollback-clear, or mouse-capture sequences. Default Fullscreen checks
+alternate-screen entry/exit, mouse-capture entry/cleanup, `--config` precedence
+with CLI overrides, and restoration after Ctrl+C and SIGTERM.
+In both modes a bracketed paste containing a newline waits for Enter. The
+handoff test also checks that JustMux disables bracketed paste and restores
+terminal input before the native tmux client starts.
 The pane `/exit` check links the same window into two sessions and verifies
 that neither client detaches while they share the window. Once only one
 client is viewing it, `/exit` detaches that client and restores the pane's

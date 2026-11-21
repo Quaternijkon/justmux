@@ -12,15 +12,19 @@
 //! app        state machine: composer + view stack, turns key events into tmux calls
 //! ui         tmux-agnostic widgets (composer, command popup, picker, dialogs, theme)
 //! commands   slash-command registry and parser
+//! config     TOML configuration loading, validation, precedence, and persistence
 //! fuzzy      fuzzy matching / ranking
 //! tmux       typed adapter over the tmux CLI (the only module that spawns tmux)
 //! terminal   inline/fullscreen lifecycle, restoration, and exec hand-off to tmux
+//! tributes   celebration cards, micro-tributes, and session badges
 //! ```
 
 pub mod app;
 pub mod cli;
 pub mod commands;
+pub mod config;
 pub mod fuzzy;
 pub mod terminal;
 pub mod tmux;
+pub mod tributes;
 pub mod ui;

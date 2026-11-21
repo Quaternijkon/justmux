@@ -379,6 +379,14 @@ impl Tmux for TmuxClient {
     fn kill_pane(&self, id: &PaneId) -> TmuxResult<()> {
         self.checked(&["kill-pane", "-t", id.as_str()]).map(|_| ())
     }
+    fn capture_pane(&self, target: &Target, max_lines: usize) -> TmuxResult<Vec<String>> {
+        if max_lines == 0 {
+            return Ok(Vec::new());
+        }
+        let target = target.to_string();
+        let stdout = self.text(&["capture-pane", "-p", "-t", &target])?;
+        Ok(sanitize_captured_lines(&stdout, max_lines))
+    }
     fn select(&self, target: &Target) -> TmuxResult<()> {
         match target {
             Target::Session(_) => Ok(()),
@@ -450,5 +458,346 @@ fn same_socket(a: &Path, b: &Path) -> bool {
     match (a.canonicalize(), b.canonicalize()) {
         (Ok(a), Ok(b)) => a == b,
         _ => a == b,
+    }
+}
+
+/// Strip ANSI escape sequences and control characters from captured terminal
+/// output, drop trailing completely empty lines, and return up to the last
+/// `max_lines` lines.
+pub fn sanitize_captured_lines(raw: &str, max_lines: usize) -> Vec<String> {
+    if max_lines == 0 {
+        return Vec::new();
+    }
+
+    let mut lines: Vec<String> = raw.lines().map(sanitize_captured_line).collect();
+    while lines.last().is_some_and(String::is_empty) {
+        lines.pop();
+    }
+    if lines.len() > max_lines {
+        let start = lines.len() - max_lines;
+        lines.drain(..start);
+    }
+    lines
+}
+
+fn sanitize_captured_line(line: &str) -> String {
+    let mut out = String::with_capacity(line.len());
+    let mut chars = line.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '\x1b' {
+            match chars.peek().copied() {
+                // CSI: ESC [ <params/intermediates 0x20..=0x3f>* <final 0x40..=0x7e>
+                Some('[') => {
+                    chars.next();
+                    while let Some(&next) = chars.peek() {
+                        if next.is_ascii() && (0x20..=0x3f).contains(&(next as u8)) {
+                            chars.next();
+                        } else if next.is_ascii() && (0x40..=0x7e).contains(&(next as u8)) {
+                            chars.next();
+                            break;
+                        } else {
+                            break;
+                        }
+                    }
+                }
+                // OSC: ESC ] ... (BEL | ESC \ | C1 ST)
+                Some(']') => {
+                    chars.next();
+                    while let Some(next) = chars.next() {
+                        if next == '\x07' || next == '\u{009c}' {
+                            break;
+                        }
+                        if next == '\x1b' && chars.peek() == Some(&'\\') {
+                            chars.next();
+                            break;
+                        }
+                    }
+                }
+                // 3-byte charset / line-attribute ESC sequences (e.g. ESC ( B, ESC ) 0, ESC # 8)
+                Some('(' | ')' | '*' | '+' | '-' | '.' | '/' | '#') => {
+                    chars.next();
+                    if let Some(&final_ch) = chars.peek()
+                        && final_ch.is_ascii()
+                        && (0x30..=0x7e).contains(&(final_ch as u8))
+                    {
+                        chars.next();
+                    }
+                }
+                // Simple 2-byte ESC sequence: ESC <0x20..=0x7e>
+                Some(next) if next.is_ascii() && (0x20..=0x7e).contains(&(next as u8)) => {
+                    chars.next();
+                }
+                _ => {}
+            }
+        } else if ch == '\t' {
+            out.push_str("  ");
+        } else if !ch.is_control() {
+            out.push(ch);
+        }
+    }
+    let trimmed_len = out.trim_end().len();
+    out.truncate(trimmed_len);
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::thread;
+    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+    static TEST_SOCKET_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    struct PrivateTmuxServer {
+        socket: String,
+        client: TmuxClient,
+    }
+
+    impl PrivateTmuxServer {
+        fn new() -> Self {
+            let stamp = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos();
+            let seq = TEST_SOCKET_COUNTER.fetch_add(1, Ordering::Relaxed);
+            let socket = format!("jm-tmux-cap-{}-{}-{}", std::process::id(), stamp, seq);
+            let client =
+                TmuxClient::new(SocketSpec::Name(socket.clone())).with_config_file("/dev/null");
+            Self { socket, client }
+        }
+
+        fn tmux(&self, args: &[&str]) -> Output {
+            Command::new("tmux")
+                .arg("-L")
+                .arg(&self.socket)
+                .arg("-f")
+                .arg("/dev/null")
+                .args(args)
+                .env_remove("TMUX")
+                .env_remove("TMUX_PANE")
+                .output()
+                .expect("tmux executable")
+        }
+
+        fn wait_for_capture(&self, target: &Target, expected: &str) -> Vec<String> {
+            let deadline = Instant::now() + Duration::from_secs(3);
+            loop {
+                let lines = self
+                    .client
+                    .capture_pane(target, 20)
+                    .expect("capture_pane succeeded");
+                if lines.iter().any(|line| line.contains(expected)) {
+                    return lines;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "timed out waiting for {expected:?} in capture of {target:?}: {lines:?}"
+                );
+                thread::sleep(Duration::from_millis(20));
+            }
+        }
+    }
+
+    impl Drop for PrivateTmuxServer {
+        fn drop(&mut self) {
+            let _ = self.tmux(&["kill-server"]);
+        }
+    }
+
+    #[test]
+    fn sanitize_strips_csi_sgr_and_cursor_sequences() {
+        let raw = "\x1b[2J\x1b[1;1H\x1b[?2004h\x1b[38;2;120;180;255;1m$ cargo test\x1b[0m\x1b[?2004l\x1b[K  \n\x1b[32mok\x1b[0m\n";
+        assert_eq!(
+            sanitize_captured_lines(raw, 10),
+            vec!["$ cargo test".to_string(), "ok".to_string()]
+        );
+    }
+
+    #[test]
+    fn sanitize_strips_osc_and_simple_esc_sequences() {
+        let raw = concat!(
+            "\x1b]0;zsh - justmux\x07\x1bM\x1b7prompt>\x1b8 \n",
+            "\x1b]8;;https://example.com\x1b\\open docs\x1b]8;;\x1b\\\n",
+            "\x1b(Bplain\x1b)0 text\x1b=\x1b>\x1b\n",
+            "\x1b]2;unterminated title\n",
+            "next line survives\n",
+        );
+        assert_eq!(
+            sanitize_captured_lines(raw, 10),
+            vec![
+                "prompt>".to_string(),
+                "open docs".to_string(),
+                "plain text".to_string(),
+                "".to_string(),
+                "next line survives".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn sanitize_handles_tabs_controls_whitespace_and_utf8_cjk() {
+        let raw = "  \x1b[36m项目进度:\x1b[0m\t🚀 100% │ 完成\x07\x08\x00\x7f\u{0085}   \r\n\tsecond\tline\t \n";
+        assert_eq!(
+            sanitize_captured_lines(raw, 10),
+            vec![
+                "  项目进度:  🚀 100% │ 完成".to_string(),
+                "  second  line".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn sanitize_drops_trailing_blanks_keeps_context_and_truncates() {
+        let raw = "line-1\n\nline-3\nline-4\n\n   \n\t\n";
+        assert_eq!(
+            sanitize_captured_lines(raw, 10),
+            vec![
+                "line-1".to_string(),
+                "".to_string(),
+                "line-3".to_string(),
+                "line-4".to_string(),
+            ]
+        );
+        assert_eq!(
+            sanitize_captured_lines(raw, 2),
+            vec!["line-3".to_string(), "line-4".to_string()]
+        );
+        assert_eq!(
+            sanitize_captured_lines(raw, 3),
+            vec!["".to_string(), "line-3".to_string(), "line-4".to_string()]
+        );
+        assert!(sanitize_captured_lines(raw, 0).is_empty());
+        assert!(sanitize_captured_lines("\n   \n\t\r\n", 10).is_empty());
+    }
+
+    #[test]
+    fn capture_pane_reads_session_window_and_pane_on_private_socket() {
+        let server = PrivateTmuxServer::new();
+
+        let missing_server_target = Target::Session(SessionId::new("$0").expect("session id"));
+        assert!(matches!(
+            server.client.capture_pane(&missing_server_target, 5),
+            Err(TmuxError::NoServer)
+        ));
+
+        let out = server.tmux(&[
+            "new-session",
+            "-d",
+            "-s",
+            "alpha",
+            "-x",
+            "80",
+            "-y",
+            "12",
+            "sh -c \"printf 'alpha-one\\n\\nalpha-two   \\n'; sleep 30\"",
+        ]);
+        assert!(
+            out.status.success(),
+            "new-session failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+
+        let sessions = server.client.list_sessions().expect("list sessions");
+        assert_eq!(sessions.len(), 1);
+        let session_id = sessions[0].id.clone();
+
+        let windows = server
+            .client
+            .list_windows(Some(&session_id))
+            .expect("list windows");
+        let win0_id = windows[0].id.clone();
+        let pane0_id = server
+            .client
+            .list_panes(Some(&win0_id))
+            .expect("list panes")[0]
+            .id
+            .clone();
+
+        let out = server.tmux(&[
+            "new-window",
+            "-d",
+            "-P",
+            "-F",
+            "#{window_id}",
+            "-t",
+            session_id.as_str(),
+            "-n",
+            "beta",
+            "sh -c \"printf 'beta-one\\nbeta-two\\n'; sleep 30\"",
+        ]);
+        assert!(
+            out.status.success(),
+            "new-window failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let win1_id = WindowId::new(String::from_utf8_lossy(&out.stdout).trim().to_string())
+            .expect("window id");
+
+        let out = server.tmux(&[
+            "split-window",
+            "-d",
+            "-P",
+            "-F",
+            "#{pane_id}",
+            "-t",
+            pane0_id.as_str(),
+            "sh -c \"printf 'split-one\\nsplit-two\\n'; sleep 30\"",
+        ]);
+        assert!(
+            out.status.success(),
+            "split-window failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let pane1_id =
+            PaneId::new(String::from_utf8_lossy(&out.stdout).trim().to_string()).expect("pane id");
+
+        let session_target = Target::Session(session_id.clone());
+        let window_target = Target::Window(session_id.clone(), win1_id.clone());
+        let pane_target = Target::Pane(pane1_id);
+
+        let session_lines = server.wait_for_capture(&session_target, "alpha-two");
+        assert_eq!(session_lines, vec!["alpha-one", "", "alpha-two"]);
+
+        let window_lines = server.wait_for_capture(&window_target, "beta-two");
+        assert_eq!(window_lines, vec!["beta-one", "beta-two"]);
+
+        let pane_lines = server.wait_for_capture(&pane_target, "split-two");
+        assert_eq!(pane_lines, vec!["split-one", "split-two"]);
+
+        assert_eq!(
+            server
+                .client
+                .capture_pane(&window_target, 1)
+                .expect("max_lines=1"),
+            vec!["beta-two"]
+        );
+        assert!(
+            server
+                .client
+                .capture_pane(&window_target, 0)
+                .expect("max_lines=0")
+                .is_empty()
+        );
+
+        assert!(matches!(
+            server
+                .client
+                .capture_pane(&Target::Session(SessionId::new("$9999").expect("id")), 5),
+            Err(TmuxError::SessionNotFound)
+        ));
+        assert!(matches!(
+            server.client.capture_pane(
+                &Target::Window(session_id, WindowId::new("@9999").expect("id")),
+                5
+            ),
+            Err(TmuxError::WindowNotFound)
+        ));
+        assert!(matches!(
+            server
+                .client
+                .capture_pane(&Target::Pane(PaneId::new("%9999").expect("id")), 5),
+            Err(TmuxError::PaneNotFound)
+        ));
     }
 }

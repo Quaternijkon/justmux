@@ -134,7 +134,7 @@ const quote = (value) => `'${value.replaceAll("'", "'\\''")}'`;
 async function maybeUpdate(args, options = {}) {
   const runtime = options.runtime ?? process;
   const env = runtime.env ?? {};
-  if (!Array.isArray(args) || !(args.length === 0 || (args.length === 1 && args[0] === '--fullscreen'))
+  if (!Array.isArray(args) || !(args.length === 0 || (args.length === 1 && (args[0] === '--fullscreen' || args[0] === '--inline')))
     || !runtime.stdin?.isTTY || !runtime.stdout?.isTTY || env.CI
     || env.JUSTMUX_NO_UPDATE_CHECK === '1' || env.NO_UPDATE_CHECK === '1'
     || !((runtime.platform === 'darwin' && runtime.arch === 'arm64') || (runtime.platform === 'linux' && runtime.arch === 'x64'))) {
