@@ -11,9 +11,9 @@ use ratatui::{
     Frame,
     layout::{Constraint, Layout, Rect},
     text::{Line, Span},
-    widgets::{Block, Borders, List, ListItem, ListState, Paragraph},
+    widgets::{Block, Borders, Paragraph},
 };
-use resume::ResumePicker;
+use resume::{MatrixHitTarget, MatrixSelection, ResumePicker};
 
 use crate::{
     commands::{self, CommandKind, CommandMatch, ParsedCommand},
@@ -26,10 +26,14 @@ use crate::{
     },
     tributes::{self, MicroTributeKind, TributeId},
     ui::{
-        self, CommandItem, ComposerMode, ConfigItemView, HomeDetails, HomeSessionEntry,
-        HomeTelemetry, TextInput, Theme, ThemePreset,
+        self, CommandItem, ComposerMode, ConfigItemView, EmblemMode, HomeDetails, HomeSessionEntry,
+        HomeTelemetry, MatrixAction, SubviewContent, TargetScope, TextInput, Theme, ThemePreset,
+        WorkspaceHomeSpec, WorkspaceSubviewSpec, render_workspace_home, render_workspace_subview,
     },
 };
+
+const PREVIEW_CAPTURE_LINES: usize = 400;
+const PREVIEW_WHEEL_STEP: usize = 3;
 
 #[derive(Debug, Clone, Default)]
 pub struct AppOptions {
@@ -60,30 +64,18 @@ pub enum Exit {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PickerPurpose {
-    List,
-    Rename,
-    Kill,
-    Windows,
     Panes,
-    Split,
-    NewWindow,
 }
 impl PickerPurpose {
-    fn title(self) -> &'static str {
+    fn title_for(self, lang: ui::Language) -> &'static str {
         match self {
-            Self::List => "Sessions",
-            Self::Rename => "Rename session — select a session",
-            Self::Kill => "Kill session — select a session",
-            Self::Windows => "Windows",
-            Self::Panes => "Panes",
-            Self::Split => "Split pane — select a pane",
-            Self::NewWindow => "New window — select its session",
-        }
-    }
-    fn footer(self) -> &'static str {
-        match self {
-            Self::List | Self::Windows | Self::Panes => "Enter Select · Esc Back",
-            _ => "↑↓ Navigate · Enter Select · Esc Back",
+            Self::Panes => {
+                if lang.is_zh() {
+                    "窗格列表"
+                } else {
+                    "Panes"
+                }
+            }
         }
     }
 }
@@ -119,8 +111,23 @@ impl Resource {
             Self::Pane(p) => &p.session_id,
         }
     }
-    fn actions(&self) -> &'static [(&'static str, ResourceAction)] {
+    fn actions_for(&self, lang: ui::Language) -> &'static [(&'static str, ResourceAction)] {
         use ResourceAction::{Close, Open, Rename};
+        if lang.is_zh() {
+            return match self {
+                Self::Session(_) => &[
+                    ("恢复附着会话", Open),
+                    ("重命名会话", Rename),
+                    ("关闭会话", Close),
+                ],
+                Self::Window(_) => &[
+                    ("打开窗口", Open),
+                    ("重命名窗口", Rename),
+                    ("关闭窗口", Close),
+                ],
+                Self::Pane(_) => &[("跳转到窗格", Open), ("关闭窗格", Close)],
+            };
+        }
         match self {
             Self::Session(_) => &[
                 ("Resume session", Open),
@@ -142,37 +149,63 @@ impl Resource {
         theme: Theme,
     ) -> ui::RichPickerRow {
         let ascii = theme.ascii;
+        let zh = theme.language.is_zh() && !ascii;
         match self {
             Self::Session(s) => {
                 let is_current = context.current_session() == Some(&s.id);
                 let badge = if is_current {
                     Some((
-                        if ascii { "* current" } else { "★ current" }.to_owned(),
+                        if ascii {
+                            "* current"
+                        } else if zh {
+                            "★ 当前"
+                        } else {
+                            "★ current"
+                        }
+                        .to_owned(),
                         theme.accent,
                     ))
                 } else if s.attached > 0 {
                     Some((
-                        if ascii { "* attached" } else { "● attached" }.to_owned(),
+                        if ascii {
+                            "* attached"
+                        } else if zh {
+                            "● 已附着"
+                        } else {
+                            "● attached"
+                        }
+                        .to_owned(),
                         theme.success,
                     ))
                 } else {
                     Some((
-                        if ascii { "o detached" } else { "○ detached" }.to_owned(),
+                        if ascii {
+                            "o detached"
+                        } else if zh {
+                            "○ 未附着"
+                        } else {
+                            "○ detached"
+                        }
+                        .to_owned(),
                         theme.muted,
                     ))
                 };
-                let win_label = format!(
-                    "{} window{}",
-                    s.windows,
-                    if s.windows == 1 { "" } else { "s" }
-                );
+                let win_label = if zh {
+                    format!("{} 个窗口", s.windows)
+                } else {
+                    format!(
+                        "{} window{}",
+                        s.windows,
+                        if s.windows == 1 { "" } else { "s" }
+                    )
+                };
                 let mut parts = Vec::new();
                 if let Some(tag) = tributes::session_badge(&s.name, ascii) {
                     parts.push(tag.to_owned());
                 }
                 parts.push(win_label);
                 if is_current && s.attached > 0 {
-                    parts.push("attached".to_owned());
+                    parts.push(if zh { "已附着" } else { "attached" }.to_owned());
                 }
                 ui::RichPickerRow {
                     primary: s.name.clone(),
@@ -185,19 +218,30 @@ impl Resource {
             Self::Window(w) => {
                 let badge = w.active.then(|| {
                     (
-                        if ascii { "* active" } else { "★ active" }.to_owned(),
+                        if ascii {
+                            "* active"
+                        } else if zh {
+                            "★ 当前"
+                        } else {
+                            "★ active"
+                        }
+                        .to_owned(),
                         theme.accent,
                     )
                 });
                 ui::RichPickerRow {
                     primary: self.label(),
                     primary_indices,
-                    secondary: format!(
-                        "{} pane{} · {}",
-                        w.panes,
-                        if w.panes == 1 { "" } else { "s" },
-                        w.id
-                    ),
+                    secondary: if zh {
+                        format!("{} 个窗格 · {}", w.panes, w.id)
+                    } else {
+                        format!(
+                            "{} pane{} · {}",
+                            w.panes,
+                            if w.panes == 1 { "" } else { "s" },
+                            w.id
+                        )
+                    },
                     badge,
                     is_action: false,
                 }
@@ -205,14 +249,23 @@ impl Resource {
             Self::Pane(p) => {
                 let badge = if p.busy {
                     Some((
-                        if ascii { "! busy" } else { "⚡ busy" }.to_owned(),
+                        if ascii {
+                            "! busy"
+                        } else if zh {
+                            "⚡ 运行中"
+                        } else {
+                            "⚡ busy"
+                        }
+                        .to_owned(),
                         theme.warning,
                     ))
                 } else if p.active {
-                    Some((
-                        if ascii { "* active" } else { "★ active" }.to_owned(),
-                        theme.accent,
-                    ))
+                    let label = if ascii {
+                        theme.tr("* active", "* 当前")
+                    } else {
+                        theme.tr("★ active", "★ 当前")
+                    };
+                    Some((label.to_owned(), theme.accent))
                 } else {
                     None
                 };
@@ -239,7 +292,6 @@ struct Picker {
 #[derive(Debug, Clone, Copy)]
 enum PickerRow {
     Resource(usize),
-    NewWindow,
     Refresh,
 }
 
@@ -259,21 +311,11 @@ impl Picker {
             (score_a, idx_a).cmp(&(score_b, idx_b))
         });
 
-        let mut rows = Vec::new();
-        if self.purpose == PickerPurpose::Windows && self.query.value().is_empty() {
-            rows.push((PickerRow::NewWindow, Vec::new()));
-        }
-        rows.extend(
-            matched_rows
-                .into_iter()
-                .map(|(_, i, indices)| (PickerRow::Resource(i), indices)),
-        );
-        if self.query.value().is_empty()
-            && matches!(
-                self.purpose,
-                PickerPurpose::List | PickerPurpose::Windows | PickerPurpose::Panes
-            )
-        {
+        let mut rows: Vec<(PickerRow, Vec<usize>)> = matched_rows
+            .into_iter()
+            .map(|(_, i, indices)| (PickerRow::Resource(i), indices))
+            .collect();
+        if self.query.value().is_empty() && matches!(self.purpose, PickerPurpose::Panes) {
             rows.push((PickerRow::Refresh, Vec::new()));
         }
         rows
@@ -296,15 +338,8 @@ impl Picker {
                 PickerRow::Resource(index) => {
                     self.resources[index].rich_row(indices, context, theme)
                 }
-                PickerRow::NewWindow => ui::RichPickerRow {
-                    primary: "+ New window".into(),
-                    primary_indices: Vec::new(),
-                    secondary: String::new(),
-                    badge: None,
-                    is_action: true,
-                },
                 PickerRow::Refresh => ui::RichPickerRow {
-                    primary: "Refresh list".into(),
+                    primary: theme.tr("Refresh list", "刷新列表").into(),
                     primary_indices: Vec::new(),
                     secondary: String::new(),
                     badge: None,
@@ -345,7 +380,6 @@ enum ResourceAction {
 #[derive(Debug, Clone)]
 enum View {
     Picker(Picker),
-    Resume(ResumePicker),
     Actions(Resource, usize),
     Form(Form),
     Confirm(Confirm),
@@ -399,8 +433,14 @@ struct MentionCandidate {
     resource: Resource,
 }
 
-fn theme_toast(preset: ThemePreset) -> String {
-    format!("✦ Theme: {} ({})", preset.name(), preset.origin())
+const CONFIG_ITEM_COUNT: usize = 10;
+
+fn theme_toast(preset: ThemePreset, lang: ui::Language) -> String {
+    if lang.is_zh() {
+        format!("✦ 已切换主题：{} ({})", preset.name(), preset.origin())
+    } else {
+        format!("✦ Theme: {} ({})", preset.name(), preset.origin())
+    }
 }
 
 const fn composer_mode_slug(mode: ComposerMode) -> &'static str {
@@ -450,15 +490,25 @@ pub struct App<'a> {
     home_sessions: Vec<Session>,
     home_windows: Vec<Window>,
     home_panes: Vec<Pane>,
+    matrix: ResumePicker,
+    matrix_action: MatrixAction,
+    matrix_hits: Vec<resume::MatrixHit>,
+    tab_hits: [(Rect, MatrixAction); 4],
+    subview_list_rect: Option<Rect>,
     composer_mode: ComposerMode,
     radar_selected: usize,
     mention_selected: usize,
     tip_step: usize,
     cached_preview: Option<(String, String, Vec<String>)>,
+    preview_scroll: usize,
+    preview_rect: Option<Rect>,
+    preview_target: Option<Target>,
     picker_list_rect: Option<Rect>,
     picker_offset: usize,
     radar_list_rect: Option<Rect>,
     radar_offset: usize,
+    emblem_step: usize,
+    hydra_visible: bool,
     easter_step: usize,
     exit: Option<Exit>,
 }
@@ -510,15 +560,25 @@ impl<'a> App<'a> {
             home_sessions: Vec::new(),
             home_windows: Vec::new(),
             home_panes: Vec::new(),
+            matrix: ResumePicker::with_create_actions(),
+            matrix_action: MatrixAction::Open,
+            matrix_hits: Vec::new(),
+            tab_hits: Default::default(),
+            subview_list_rect: None,
             composer_mode,
             radar_selected: 0,
             mention_selected: 0,
             tip_step: 0,
             cached_preview: None,
+            preview_scroll: 0,
+            preview_rect: None,
+            preview_target: None,
             picker_list_rect: None,
             picker_offset: 0,
             radar_list_rect: None,
             radar_offset: 0,
+            emblem_step: 0,
+            hydra_visible: false,
             easter_step: 0,
             exit: None,
         };
@@ -547,6 +607,24 @@ impl<'a> App<'a> {
 
     pub fn status(&self) -> &str {
         &self.status
+    }
+
+    pub fn set_startup_tip(&mut self, tip: impl Into<String>) {
+        if self.status.is_empty() && self.views.top().is_none() {
+            self.status = tip.into();
+        }
+    }
+
+    pub fn emblem_step(&self) -> usize {
+        self.emblem_step
+    }
+
+    pub fn should_animate(&self) -> bool {
+        self.config.emblem_mode.should_animate() && self.hydra_visible
+    }
+
+    pub fn tick_animation(&mut self) {
+        self.emblem_step = self.emblem_step.wrapping_add(1);
     }
 
     pub fn handle_event(&mut self, event: Event) {
@@ -593,14 +671,20 @@ impl<'a> App<'a> {
                 }
                 Some(_) => {}
                 None => {
-                    if self.composer.value().is_empty() {
-                        self.exit = Some(Exit::Quit);
-                    } else {
+                    if !self.composer.value().is_empty() {
                         self.composer.set_value("");
                         self.palette_selected = 0;
                         self.mention_selected = 0;
+                        self.status.clear();
+                        self.sync_home_matrix();
+                        self.refresh_home_preview();
+                    } else if self.matrix_action != MatrixAction::Open {
+                        self.matrix_action = MatrixAction::Open;
+                        self.status.clear();
+                    } else {
+                        self.status.clear();
+                        self.exit = Some(Exit::Quit);
                     }
-                    self.status.clear();
                     return;
                 }
             }
@@ -612,16 +696,6 @@ impl<'a> App<'a> {
         match self.views.pop() {
             None => self.composer_key(key),
             Some(View::Picker(picker)) => self.picker_key(picker, key),
-            Some(View::Resume(mut picker)) => {
-                let target = picker.handle_key(key, &mut self.matcher);
-                if target.is_none() {
-                    self.update_resume_preview(&picker);
-                }
-                self.views.push(View::Resume(picker));
-                if let Some(target) = target {
-                    self.enter(target);
-                }
-            }
             Some(View::Actions(resource, selected)) => {
                 self.resource_action_key(resource, selected, key)
             }
@@ -681,7 +755,7 @@ impl<'a> App<'a> {
                 | View::Split(..)
                 | View::Created(..),
             ) => true,
-            Some(View::Picker(_) | View::Resume(_) | View::Form(_) | View::Confirm(_)) => false,
+            Some(View::Picker(_) | View::Form(_) | View::Confirm(_)) => false,
         }
     }
 
@@ -692,11 +766,11 @@ impl<'a> App<'a> {
             }
         }
         self.config_note = None;
-        self.refresh_home_data();
         self.composer.set_value("/");
         self.palette_selected = 0;
         self.mention_selected = 0;
         self.status.clear();
+        self.refresh_home_data();
     }
 
     fn sync_top_view_after_pop(&mut self) {
@@ -708,10 +782,6 @@ impl<'a> App<'a> {
             Some(View::Picker(picker)) => {
                 self.update_picker_preview(&picker);
                 self.views.push(View::Picker(picker));
-            }
-            Some(View::Resume(picker)) => {
-                self.update_resume_preview(&picker);
-                self.views.push(View::Resume(picker));
             }
             Some(other) => self.views.push(other),
         }
@@ -726,11 +796,8 @@ impl<'a> App<'a> {
                 self.palette_selected = 0;
                 self.mention_selected = 0;
                 self.status.clear();
-            }
-            Some(View::Resume(mut picker)) => {
-                picker.paste(&text, &mut self.matcher);
-                self.update_resume_preview(&picker);
-                self.views.push(View::Resume(picker));
+                self.sync_home_matrix();
+                self.refresh_home_preview();
             }
             Some(View::Picker(mut picker)) => {
                 picker.query.insert_str(&text);
@@ -795,15 +862,22 @@ impl<'a> App<'a> {
 
     fn all_mention_resources(&self) -> Vec<(String, &'static str, String, Resource)> {
         let mut items = Vec::new();
+        let attached_suffix = self.theme.tr(" · attached", " · 已附着");
+        let session_badge = self.theme.tr("session", "会话");
+        let window_badge = self.theme.tr("window", "窗口");
+        let pane_badge = self.theme.tr("pane", "窗格");
+        let busy_suffix = self.theme.tr(" · busy", " · 运行中");
+        let win_unit = self.theme.tr("w", "窗");
+        let pane_unit = self.theme.tr("p", "格");
         for s in &self.home_sessions {
             let detail = format!(
-                "{}w{}",
+                "{}{win_unit}{}",
                 s.windows,
-                if s.is_attached() { " · attached" } else { "" }
+                if s.is_attached() { attached_suffix } else { "" }
             );
             items.push((
                 format!("@{}", s.name),
-                "session",
+                session_badge,
                 detail,
                 Resource::Session(s.clone()),
             ));
@@ -811,19 +885,19 @@ impl<'a> App<'a> {
         for w in &self.home_windows {
             items.push((
                 format!("@{}:{}", w.session_name, w.index),
-                "window",
-                format!("{} · {}p", w.name, w.panes),
+                window_badge,
+                format!("{} · {}{pane_unit}", w.name, w.panes),
                 Resource::Window(w.clone()),
             ));
         }
         for p in &self.home_panes {
             items.push((
                 format!("@{}:{}.{}", p.session_name, p.window_index, p.index),
-                "pane",
+                pane_badge,
                 format!(
                     "{}{}",
                     p.current_command,
-                    if p.busy { " · busy" } else { "" }
+                    if p.busy { busy_suffix } else { "" }
                 ),
                 Resource::Pane(p.clone()),
             ));
@@ -901,11 +975,14 @@ impl<'a> App<'a> {
                     let next = self.theme.preset.next();
                     self.theme = self.theme.with_preset(next);
                     self.config.theme = next;
-                    self.status = theme_toast(next);
+                    self.status = theme_toast(next, self.theme.language);
                     return;
                 }
                 _ => {}
             }
+        }
+        if self.handle_preview_paging_key(key, self.composer.value().is_empty()) {
+            return;
         }
         if key.code == KeyCode::BackTab && !ctrl && !alt {
             self.composer_mode = self.composer_mode.next();
@@ -915,27 +992,89 @@ impl<'a> App<'a> {
             if self.composer_mode == ComposerMode::LiveRadar {
                 self.refresh_home_data();
             } else {
+                self.sync_home_matrix();
                 self.refresh_home_preview();
             }
             return;
         }
         if self.composer.value().is_empty() {
-            if self.composer_mode == ComposerMode::CommandJump
-                && !ctrl
-                && !alt
-                && let KeyCode::Char(d @ '1'..='9') = key.code
-            {
-                let idx = (d as usize) - ('1' as usize);
-                if let Some(session) = self.home_sessions.get(idx) {
-                    let id = session.id.clone();
-                    self.status.clear();
-                    self.enter(Target::Session(id));
-                    return;
+            if self.composer_mode == ComposerMode::CommandJump {
+                if !ctrl
+                    && !alt
+                    && let KeyCode::Char(d @ '1'..='9') = key.code
+                {
+                    let idx = (d as usize) - ('1' as usize);
+                    if let Some(session) = self.home_sessions.get(idx).cloned() {
+                        self.status.clear();
+                        if self.matrix_action == MatrixAction::Open {
+                            self.enter(Target::Session(session.id));
+                        } else {
+                            self.matrix.select_session(&session.id);
+                            self.refresh_home_preview();
+                        }
+                        return;
+                    }
+                    if self.home_sessions.is_empty() && d == '1' {
+                        self.status.clear();
+                        self.views.push(View::Form(Form {
+                            action: FormAction::NewSessionName,
+                            input: TextInput::default(),
+                        }));
+                        return;
+                    }
                 }
-                if self.home_sessions.is_empty() && d == '1' {
+                if key.modifiers.is_empty() {
+                    match key.code {
+                        KeyCode::Left => {
+                            if self.matrix.move_column(-1) {
+                                self.sync_action_scope_with_matrix();
+                                self.status.clear();
+                                self.refresh_home_preview();
+                            }
+                            return;
+                        }
+                        KeyCode::Right => {
+                            if self.matrix.move_column(1) {
+                                self.sync_action_scope_with_matrix();
+                                self.status.clear();
+                                self.refresh_home_preview();
+                            }
+                            return;
+                        }
+                        KeyCode::Up => {
+                            if self.matrix.move_row(-1) {
+                                self.sync_action_scope_with_matrix();
+                                self.status.clear();
+                                self.refresh_home_preview();
+                            }
+                            return;
+                        }
+                        KeyCode::Down => {
+                            if self.matrix.is_empty() {
+                                self.composer.set_value("/");
+                                self.palette_selected = 0;
+                                self.mention_selected = 0;
+                                self.status.clear();
+                            } else if self.matrix.move_row(1) {
+                                self.sync_action_scope_with_matrix();
+                                self.status.clear();
+                                self.refresh_home_preview();
+                            }
+                            return;
+                        }
+                        _ => {}
+                    }
+                }
+                let is_new_window = !ctrl
+                    && !alt
+                    && (key.code == KeyCode::Char('+')
+                        || (self.matrix_action == MatrixAction::Window
+                            && key.code == KeyCode::Char('n')
+                            && key.modifiers.is_empty()));
+                if is_new_window && let Some(session) = self.matrix.selected_session().cloned() {
                     self.status.clear();
                     self.views.push(View::Form(Form {
-                        action: FormAction::NewSessionName,
+                        action: FormAction::NewWindow(session.id),
                         input: TextInput::default(),
                     }));
                     return;
@@ -1059,24 +1198,61 @@ impl<'a> App<'a> {
                 }
             }
         }
+        if self.composer_mode == ComposerMode::CommandJump
+            && !self.composer.value().trim_start().starts_with('/')
+            && !self.composer.value().trim_start().starts_with('@')
+            && key.modifiers.is_empty()
+        {
+            match key.code {
+                KeyCode::Up => {
+                    if self.matrix.move_row(-1) {
+                        self.sync_action_scope_with_matrix();
+                        self.refresh_home_preview();
+                    }
+                    return;
+                }
+                KeyCode::Down => {
+                    if self.matrix.move_row(1) {
+                        self.sync_action_scope_with_matrix();
+                        self.refresh_home_preview();
+                    }
+                    return;
+                }
+                KeyCode::Tab => {
+                    self.matrix_action = self
+                        .matrix_action
+                        .cycle_workspace_tab(self.matrix.is_session_selected());
+                    self.status.clear();
+                    return;
+                }
+                _ => {}
+            }
+        }
         match key.code {
             KeyCode::Up | KeyCode::Down | KeyCode::Tab => {}
             KeyCode::Enter => {
+                let trimmed = self.composer.value().trim_start();
                 if self.composer_mode == ComposerMode::QuickLaunch
-                    && !self.composer.value().trim_start().starts_with('/')
-                    && !self.composer.value().trim_start().starts_with('@')
+                    && !trimmed.starts_with('/')
+                    && !trimmed.starts_with('@')
                 {
                     self.quick_launch_submit();
                     return;
                 }
-                let text = self.composer.value().to_string();
-                self.execute_text(&text);
+                if trimmed.starts_with('/') || trimmed.starts_with('@') {
+                    let text = self.composer.value().to_string();
+                    self.execute_text(&text);
+                    return;
+                }
+                self.submit_home_input();
             }
             _ => {
                 if self.composer.handle_key(key) {
                     self.palette_selected = 0;
                     self.mention_selected = 0;
                     self.status.clear();
+                    self.sync_home_matrix();
+                    self.refresh_home_preview();
                 }
             }
         }
@@ -1132,7 +1308,7 @@ impl<'a> App<'a> {
                 let preset = ThemePreset::ALL.get(selected).copied().unwrap_or(initial);
                 self.theme = self.theme.with_preset(preset);
                 self.config.theme = preset;
-                self.status = theme_toast(preset);
+                self.status = theme_toast(preset, self.theme.language);
             }
             KeyCode::Char('s' | 'S') if no_ctrl_alt => {
                 let preset = ThemePreset::ALL.get(selected).copied().unwrap_or(initial);
@@ -1146,16 +1322,29 @@ impl<'a> App<'a> {
                     Some(path) => match self.config.save(&path) {
                         Ok(()) => {
                             self.config_path = Some(path.clone());
-                            self.status =
-                                format!("✦ Saved theme '{}' to {}", preset.slug(), path.display());
+                            self.status = if self.theme.language.is_zh() {
+                                format!("✦ 已将主题 '{}' 保存到 {}", preset.slug(), path.display())
+                            } else {
+                                format!("✦ Saved theme '{}' to {}", preset.slug(), path.display())
+                            };
                         }
                         Err(error) => {
-                            self.status = format!("Could not save theme: {error}");
+                            self.status = if self.theme.language.is_zh() {
+                                format!("无法保存主题：{error}")
+                            } else {
+                                format!("Could not save theme: {error}")
+                            };
                             self.views.push(View::ThemePicker { initial, selected });
                         }
                     },
                     None => {
-                        self.status = "No config path available (set HOME or --config)".to_owned();
+                        self.status = self
+                            .theme
+                            .tr(
+                                "No config path available (set HOME or --config)",
+                                "未找到可用配置路径（请设置 HOME 或传入 --config）",
+                            )
+                            .to_owned();
                         self.views.push(View::ThemePicker { initial, selected });
                     }
                 }
@@ -1165,12 +1354,11 @@ impl<'a> App<'a> {
     }
 
     fn config_key(&mut self, mut selected: usize, key: KeyEvent) {
-        const COUNT: usize = 8;
         let no_ctrl_alt = !key.modifiers.contains(KeyModifiers::CONTROL)
             && !key.modifiers.contains(KeyModifiers::ALT);
         match key.code {
             KeyCode::Up => selected = selected.saturating_sub(1),
-            KeyCode::Down => selected = (selected + 1).min(COUNT - 1),
+            KeyCode::Down => selected = (selected + 1).min(CONFIG_ITEM_COUNT - 1),
             KeyCode::Left if no_ctrl_alt => self.cycle_config_setting(selected, false, false),
             KeyCode::Right if no_ctrl_alt => self.cycle_config_setting(selected, true, false),
             KeyCode::Enter => self.cycle_config_setting(selected, true, true),
@@ -1184,18 +1372,32 @@ impl<'a> App<'a> {
                     Some(path) => match self.config.save(&path) {
                         Ok(()) => {
                             self.config_path = Some(path.clone());
-                            let message = format!("✦ Saved config to {}", path.display());
+                            let message = if self.theme.language.is_zh() {
+                                format!("✦ 已保存配置到 {}", path.display())
+                            } else {
+                                format!("✦ Saved config to {}", path.display())
+                            };
                             self.config_note = Some(message.clone());
                             self.status = message;
                         }
                         Err(error) => {
-                            let message = format!("Could not save config: {error}");
+                            let message = if self.theme.language.is_zh() {
+                                format!("无法保存配置：{error}")
+                            } else {
+                                format!("Could not save config: {error}")
+                            };
                             self.config_note = Some(message.clone());
                             self.status = message;
                         }
                     },
                     None => {
-                        let message = "No config path available (set HOME or --config)".to_owned();
+                        let message = self
+                            .theme
+                            .tr(
+                                "No config path available (set HOME or --config)",
+                                "未找到可用配置路径（请设置 HOME 或传入 --config）",
+                            )
+                            .to_owned();
                         self.config_note = Some(message.clone());
                         self.status = message;
                     }
@@ -1243,7 +1445,7 @@ impl<'a> App<'a> {
                 if self.config.live_preview {
                     self.refresh_home_preview();
                 } else {
-                    self.cached_preview = None;
+                    self.clear_preview();
                 }
             }
             4 => {
@@ -1251,6 +1453,16 @@ impl<'a> App<'a> {
                 restart_changed = true;
             }
             5 => {
+                self.config.emblem_mode = if forward {
+                    self.config.emblem_mode.next()
+                } else {
+                    self.config.emblem_mode.prev()
+                };
+                if !self.config.emblem_mode.should_animate() {
+                    self.emblem_step = 0;
+                }
+            }
+            6 => {
                 let prev = self.config.inline_height;
                 self.config.inline_height = if forward {
                     if prev >= 40 {
@@ -1263,62 +1475,114 @@ impl<'a> App<'a> {
                 };
                 restart_changed = self.config.inline_height != prev;
             }
-            6 => {
+            7 => {
                 self.config.ascii = !self.config.ascii;
                 self.theme = self.config.effective_theme();
             }
-            7 => {
+            8 => {
                 self.config.no_color = !self.config.no_color;
+                self.theme = self.config.effective_theme();
+            }
+            9 => {
+                self.config.language = self.config.language.toggle();
                 self.theme = self.config.effective_theme();
             }
             _ => {}
         }
         if restart_changed {
-            self.config_note = Some("Takes effect on next jm launch (press s to save)".into());
+            self.config_note = Some(
+                self.theme
+                    .tr(
+                        "Takes effect on next jm launch (press s to save)",
+                        "重启 jm 后生效 · 按 s 保存",
+                    )
+                    .into(),
+            );
         }
     }
 
     fn config_modal_items(&self) -> Vec<ConfigItemView<'static>> {
+        let tr = |en, zh| self.theme.tr(en, zh);
         vec![
             ConfigItemView {
                 key: "screen_mode",
                 value: self.config.screen_mode.as_str().to_owned(),
-                description: "Alternate fullscreen or native inline scrollback (restart)",
+                description: tr(
+                    "Alternate fullscreen or native inline scrollback (restart)",
+                    "备用全屏或终端内嵌模式（重启生效）",
+                ),
             },
             ConfigItemView {
                 key: "theme",
                 value: self.config.theme.slug().to_owned(),
-                description: "Color palette preset (aurora, codex, claude, matrix, classic)",
+                description: tr(
+                    "Color palette preset (aurora, codex, claude, matrix, classic)",
+                    "色彩主题预设（aurora / codex / claude / matrix / classic）",
+                ),
             },
             ConfigItemView {
                 key: "composer_mode",
                 value: composer_mode_slug(self.config.composer_mode).to_owned(),
-                description: "Default home studio mode (Shift+Tab)",
+                description: tr(
+                    "Default home studio mode (Shift+Tab)",
+                    "主页默认工作模式 · Shift+Tab 切换",
+                ),
             },
             ConfigItemView {
                 key: "live_preview",
                 value: self.config.live_preview.to_string(),
-                description: "Capture live tmux pane previews",
+                description: tr(
+                    "Capture live tmux pane previews",
+                    "实时捕获 tmux 窗格终端预览内容",
+                ),
             },
             ConfigItemView {
                 key: "mouse",
                 value: self.config.mouse.to_string(),
-                description: "Mouse wheel & click support in Fullscreen (restart)",
+                description: tr(
+                    "Mouse wheel & click support in Fullscreen (restart)",
+                    "全屏模式下启用鼠标滚轮与点击（重启生效）",
+                ),
+            },
+            ConfigItemView {
+                key: "emblem_mode",
+                value: self.config.emblem_mode.as_str().to_owned(),
+                description: tr(
+                    "Hydra Braille emblem style (static, spin, inverted-spin)",
+                    "九头蛇点阵徽标动画模式（static / spin / inverted-spin）",
+                ),
             },
             ConfigItemView {
                 key: "inline_height",
                 value: self.config.inline_height.to_string(),
-                description: "Reserved viewport rows for inline mode 8..=40 (restart)",
+                description: tr(
+                    "Reserved viewport rows for inline mode 8..=40 (restart)",
+                    "内嵌模式预留视口行数 8..=40（重启生效）",
+                ),
             },
             ConfigItemView {
                 key: "ascii",
                 value: self.config.ascii.to_string(),
-                description: "Pure ASCII box borders and markers",
+                description: tr(
+                    "Pure ASCII box borders and markers",
+                    "纯 7-bit ASCII 边框与符号兼容模式",
+                ),
             },
             ConfigItemView {
                 key: "no_color",
                 value: self.config.no_color.to_string(),
-                description: "Disable ANSI color attributes",
+                description: tr(
+                    "Disable ANSI color attributes",
+                    "禁用所有 ANSI 颜色输出（NO_COLOR）",
+                ),
+            },
+            ConfigItemView {
+                key: "language",
+                value: self.config.language.as_str().to_owned(),
+                description: tr(
+                    "Interface language (en = English, zh = Chinese)",
+                    "界面语言：英文 (en) / 简体中文 (zh)",
+                ),
             },
         ]
     }
@@ -1356,12 +1620,21 @@ impl<'a> App<'a> {
         self.theme = self.theme.with_preset(preset);
         self.config.theme = preset;
         let card = tributes::card(id, step);
-        self.status = format!(
-            "✦ {} theme applied: {} ({})",
-            card.badge,
-            preset.name(),
-            preset.origin()
-        );
+        self.status = if self.theme.language.is_zh() {
+            format!(
+                "✦ 已应用 {} 主题：{} ({})",
+                card.badge,
+                preset.name(),
+                preset.origin()
+            )
+        } else {
+            format!(
+                "✦ {} theme applied: {} ({})",
+                card.badge,
+                preset.name(),
+                preset.origin()
+            )
+        };
     }
 
     fn resolve_mention_resource(&mut self, raw_token: &str) -> Option<Resource> {
@@ -1473,7 +1746,9 @@ impl<'a> App<'a> {
                 if let Some(pane) = self.resolve_pane_for_resource(&resource) {
                     self.views.push(View::Split(Resource::Pane(pane), 0));
                 } else {
-                    self.open_picker(PickerPurpose::Split);
+                    self.views = ViewStack::default();
+                    self.matrix_action = MatrixAction::Split;
+                    self.refresh_home_data();
                 }
             }
             CommandKind::Rename => {
@@ -1499,7 +1774,9 @@ impl<'a> App<'a> {
                         }
                         Resource::Window(window) => self.tmux.rename_window(&window.id, &new_name),
                         Resource::Pane(_) => {
-                            self.open_picker(PickerPurpose::Rename);
+                            self.views = ViewStack::default();
+                            self.matrix_action = MatrixAction::Rename(TargetScope::Window);
+                            self.refresh_home_data();
                             return;
                         }
                     };
@@ -1509,7 +1786,7 @@ impl<'a> App<'a> {
                                 inside.session_name = Some(new_name);
                             }
                             self.refresh_home_data();
-                            self.status = "Renamed".into();
+                            self.status = self.theme.tr("Renamed", "已重命名").into();
                         }
                         Err(error) => self.status = error.to_string(),
                     }
@@ -1520,10 +1797,16 @@ impl<'a> App<'a> {
             CommandKind::Window => match resource {
                 Resource::Window(_) => self.views.push(View::Actions(resource, 0)),
                 Resource::Session(session) => {
-                    self.open_picker_with_query(PickerPurpose::Windows, &session.name);
+                    self.views = ViewStack::default();
+                    self.matrix_action = MatrixAction::Window;
+                    self.composer.set_value(&session.name);
+                    self.refresh_home_data();
                 }
                 Resource::Pane(pane) => {
-                    self.open_picker_with_query(PickerPurpose::Windows, &pane.session_name);
+                    self.views = ViewStack::default();
+                    self.matrix_action = MatrixAction::Window;
+                    self.composer.set_value(&pane.session_name);
+                    self.refresh_home_data();
                 }
             },
             CommandKind::Pane => match resource {
@@ -1564,13 +1847,282 @@ impl<'a> App<'a> {
         if let Some(pane) = self.active_or_first_pane() {
             match self.tmux.split_pane(&pane.id, direction) {
                 Ok(_) => {
-                    self.status = "Pane split. Native tmux layout updated.".into();
+                    self.status = self
+                        .theme
+                        .tr(
+                            "Pane split. Native tmux layout updated.",
+                            "窗格已拆分，tmux 原生布局已更新。",
+                        )
+                        .into();
                     self.refresh_home_data();
                 }
                 Err(error) => self.status = error.to_string(),
             }
         } else {
-            self.open_picker(PickerPurpose::Split);
+            self.views = ViewStack::default();
+            self.matrix_action = MatrixAction::Split;
+            self.refresh_home_data();
+        }
+    }
+
+    fn try_run_natural_phrase(&mut self, trimmed: &str) -> bool {
+        let lower = trimmed.to_ascii_lowercase();
+        if let Some(rest) = lower
+            .strip_prefix("create ")
+            .or_else(|| (lower == "create").then_some(""))
+        {
+            let original_rest = trimmed.get(6..).map(str::trim).unwrap_or("");
+            let rewritten = if rest.is_empty() {
+                "/new".to_owned()
+            } else {
+                format!("/new {original_rest}")
+            };
+            self.run_parsed_command(commands::parse(&rewritten));
+            return true;
+        }
+        if lower == "new" || lower.starts_with("new ") || lower.starts_with("theme ") {
+            self.run_parsed_command(commands::parse(&format!("/{trimmed}")));
+            return true;
+        }
+        if matches!(lower.as_str(), "split right" | "hsplit") {
+            self.status.clear();
+            self.composer.set_value("");
+            self.palette_selected = 0;
+            self.split_quick_direction(SplitDirection::SideBySide);
+            return true;
+        }
+        if matches!(lower.as_str(), "split down" | "vsplit") {
+            self.status.clear();
+            self.composer.set_value("");
+            self.palette_selected = 0;
+            self.split_quick_direction(SplitDirection::Stacked);
+            return true;
+        }
+        if let Some(target_part) = trimmed
+            .strip_prefix("kill ")
+            .or_else(|| trimmed.strip_prefix("KILL "))
+            .or_else(|| trimmed.strip_prefix("close "))
+            .or_else(|| trimmed.strip_prefix("CLOSE "))
+            .or_else(|| {
+                (lower.starts_with("kill ") || lower.starts_with("close ")).then(|| {
+                    let skip = if lower.starts_with("kill ") { 5 } else { 6 };
+                    trimmed.get(skip..).unwrap_or("")
+                })
+            })
+        {
+            let target_name = target_part.trim();
+            if !target_name.is_empty() {
+                self.refresh_home_data();
+                if let Some(resource) = self.resolve_mention_resource(target_name) {
+                    self.status.clear();
+                    self.composer.set_value("");
+                    self.palette_selected = 0;
+                    self.kill_confirm(resource);
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    fn submit_home_input(&mut self) {
+        let text = self.composer.value().to_string();
+        let trimmed = text.trim();
+        if trimmed.is_empty() {
+            self.activate_matrix_selection();
+            return;
+        }
+        if trimmed.starts_with('/') || trimmed.starts_with('@') {
+            self.execute_text(&text);
+            return;
+        }
+        if self.try_run_natural_phrase(trimmed) {
+            return;
+        }
+        if !trimmed.contains(char::is_whitespace)
+            && let Ok(parsed) = commands::parse(&format!("/{trimmed}"))
+        {
+            let non_matrix = matches!(
+                parsed.command,
+                CommandKind::Update
+                    | CommandKind::Help
+                    | CommandKind::Config
+                    | CommandKind::Quit
+                    | CommandKind::Exit
+                    | CommandKind::Theme
+                    | CommandKind::Tribute(_)
+                    | CommandKind::MicroTribute(_)
+            );
+            if non_matrix || !self.matrix.has_visible_matches() {
+                self.run_parsed_command(Ok(parsed));
+                return;
+            }
+        }
+        if self.matrix.has_visible_matches() {
+            self.activate_matrix_selection();
+            return;
+        }
+        self.run_parsed_command(commands::parse(&text));
+    }
+
+    fn sync_action_scope_with_matrix(&mut self) {
+        let scope = match self.matrix.selection() {
+            Some(MatrixSelection::Session(_)) => TargetScope::Session,
+            Some(MatrixSelection::Window(_, _)) => TargetScope::Window,
+            _ => return,
+        };
+        match &mut self.matrix_action {
+            MatrixAction::Rename(current) => *current = scope,
+            MatrixAction::Kill(current) => *current = scope,
+            _ => {}
+        }
+    }
+
+    fn activate_matrix_selection(&mut self) {
+        enum SelectedMatrixTarget {
+            Session(Session),
+            Window(Session, Window),
+            NewWindow(Session),
+            NewSession,
+        }
+
+        let target = match self.matrix.selection() {
+            Some(MatrixSelection::Session(session)) => {
+                Some(SelectedMatrixTarget::Session(session.clone()))
+            }
+            Some(MatrixSelection::Window(session, window)) => Some(SelectedMatrixTarget::Window(
+                session.clone(),
+                window.clone(),
+            )),
+            Some(MatrixSelection::NewWindow(session)) => {
+                Some(SelectedMatrixTarget::NewWindow(session.clone()))
+            }
+            Some(MatrixSelection::NewSession) => Some(SelectedMatrixTarget::NewSession),
+            None if self.home_sessions.is_empty() => Some(SelectedMatrixTarget::NewSession),
+            None => None,
+        };
+        let Some(target) = target else {
+            return;
+        };
+
+        match target {
+            SelectedMatrixTarget::NewSession => {
+                self.status.clear();
+                self.composer.set_value("");
+                self.sync_home_matrix();
+                self.views.push(View::Form(Form {
+                    action: FormAction::NewSessionName,
+                    input: TextInput::default(),
+                }));
+            }
+            SelectedMatrixTarget::NewWindow(session) => {
+                self.status.clear();
+                self.composer.set_value("");
+                self.sync_home_matrix();
+                self.views.push(View::Form(Form {
+                    action: FormAction::NewWindow(session.id),
+                    input: TextInput::default(),
+                }));
+            }
+            SelectedMatrixTarget::Session(session) => match self.matrix_action {
+                MatrixAction::Open => {
+                    self.enter(Target::Session(session.id));
+                    if self.exit.is_some() {
+                        self.composer.set_value("");
+                    }
+                }
+                MatrixAction::Rename(_) => {
+                    self.matrix_action = MatrixAction::Open;
+                    self.composer.set_value("");
+                    self.sync_home_matrix();
+                    self.rename_form(Resource::Session(session));
+                }
+                MatrixAction::Kill(_) => {
+                    self.matrix_action = MatrixAction::Open;
+                    self.composer.set_value("");
+                    self.sync_home_matrix();
+                    self.kill_confirm(Resource::Session(session));
+                }
+                MatrixAction::Split => {
+                    self.matrix_action = MatrixAction::Open;
+                    self.composer.set_value("");
+                    self.sync_home_matrix();
+                    if let Some(pane) = self.resolve_pane_for_resource(&Resource::Session(session))
+                    {
+                        self.views.push(View::Split(Resource::Pane(pane), 0));
+                    } else {
+                        self.open_picker(PickerPurpose::Panes);
+                    }
+                }
+                MatrixAction::Window => {
+                    self.status.clear();
+                    self.composer.set_value("");
+                    self.sync_home_matrix();
+                    self.views.push(View::Form(Form {
+                        action: FormAction::NewWindow(session.id),
+                        input: TextInput::default(),
+                    }));
+                }
+                MatrixAction::Inspect => {
+                    self.composer.set_value("");
+                    self.sync_home_matrix();
+                    self.views
+                        .push(View::Actions(Resource::Session(session), 0));
+                }
+            },
+            SelectedMatrixTarget::Window(session, window) => match self.matrix_action {
+                MatrixAction::Open => {
+                    self.enter(Target::Window(session.id, window.id));
+                    if self.exit.is_some() {
+                        self.composer.set_value("");
+                    }
+                }
+                MatrixAction::Rename(TargetScope::Window) => {
+                    self.matrix_action = MatrixAction::Open;
+                    self.composer.set_value("");
+                    self.sync_home_matrix();
+                    self.rename_form(Resource::Window(window));
+                }
+                MatrixAction::Rename(TargetScope::Session) => {
+                    self.matrix_action = MatrixAction::Open;
+                    self.composer.set_value("");
+                    self.sync_home_matrix();
+                    self.rename_form(Resource::Session(session));
+                }
+                MatrixAction::Kill(TargetScope::Window) => {
+                    self.matrix_action = MatrixAction::Open;
+                    self.composer.set_value("");
+                    self.sync_home_matrix();
+                    self.kill_confirm(Resource::Window(window));
+                }
+                MatrixAction::Kill(TargetScope::Session) => {
+                    self.matrix_action = MatrixAction::Open;
+                    self.composer.set_value("");
+                    self.sync_home_matrix();
+                    self.kill_confirm(Resource::Session(session));
+                }
+                MatrixAction::Split => {
+                    self.matrix_action = MatrixAction::Open;
+                    self.composer.set_value("");
+                    self.sync_home_matrix();
+                    if let Some(pane) = self.resolve_pane_for_resource(&Resource::Window(window)) {
+                        self.views.push(View::Split(Resource::Pane(pane), 0));
+                    } else {
+                        self.open_picker(PickerPurpose::Panes);
+                    }
+                }
+                MatrixAction::Window => {
+                    self.composer.set_value("");
+                    self.sync_home_matrix();
+                    self.views.push(View::Actions(Resource::Window(window), 0));
+                }
+                MatrixAction::Inspect => {
+                    self.composer.set_value("");
+                    self.sync_home_matrix();
+                    self.views
+                        .push(View::Actions(Resource::Session(session), 0));
+                }
+            },
         }
     }
 
@@ -1600,7 +2152,11 @@ impl<'a> App<'a> {
                     self.mention_selected = 0;
                     self.execute_command_on_resource(parsed_head.command, resource, extra_arg);
                 } else {
-                    self.status = format!("No target matching '{token}'.");
+                    self.status = if self.theme.language.is_zh() {
+                        format!("未找到匹配 '{token}' 的目标。")
+                    } else {
+                        format!("No target matching '{token}'.")
+                    };
                 }
                 return;
             }
@@ -1616,7 +2172,11 @@ impl<'a> App<'a> {
                 self.mention_selected = 0;
                 self.enter(resource.target());
             } else {
-                self.status = format!("No target matching '{trimmed}'.");
+                self.status = if self.theme.language.is_zh() {
+                    format!("未找到匹配 '{trimmed}' 的目标。")
+                } else {
+                    format!("No target matching '{trimmed}'.")
+                };
             }
             return;
         }
@@ -1626,57 +2186,8 @@ impl<'a> App<'a> {
                 self.run_parsed_command(Ok(command));
                 return;
             }
-            let lower = trimmed.to_ascii_lowercase();
-            if let Some(rest) = lower
-                .strip_prefix("create ")
-                .or_else(|| (lower == "create").then_some(""))
-            {
-                let original_rest = trimmed.get(6..).map(str::trim).unwrap_or("");
-                let rewritten = if rest.is_empty() {
-                    "/new".to_owned()
-                } else {
-                    format!("/new {original_rest}")
-                };
-                self.run_parsed_command(commands::parse(&rewritten));
+            if self.try_run_natural_phrase(trimmed) {
                 return;
-            }
-            if matches!(lower.as_str(), "split right" | "hsplit") {
-                self.status.clear();
-                self.composer.set_value("");
-                self.palette_selected = 0;
-                self.split_quick_direction(SplitDirection::SideBySide);
-                return;
-            }
-            if matches!(lower.as_str(), "split down" | "vsplit") {
-                self.status.clear();
-                self.composer.set_value("");
-                self.palette_selected = 0;
-                self.split_quick_direction(SplitDirection::Stacked);
-                return;
-            }
-            if let Some(target_part) = trimmed
-                .strip_prefix("kill ")
-                .or_else(|| trimmed.strip_prefix("KILL "))
-                .or_else(|| trimmed.strip_prefix("close "))
-                .or_else(|| trimmed.strip_prefix("CLOSE "))
-                .or_else(|| {
-                    (lower.starts_with("kill ") || lower.starts_with("close ")).then(|| {
-                        let skip = if lower.starts_with("kill ") { 5 } else { 6 };
-                        trimmed.get(skip..).unwrap_or("")
-                    })
-                })
-            {
-                let target_name = target_part.trim();
-                if !target_name.is_empty() {
-                    self.refresh_home_data();
-                    if let Some(resource) = self.resolve_mention_resource(target_name) {
-                        self.status.clear();
-                        self.composer.set_value("");
-                        self.palette_selected = 0;
-                        self.kill_confirm(resource);
-                        return;
-                    }
-                }
             }
             if let Some(session) = self
                 .home_sessions
@@ -1710,6 +2221,8 @@ impl<'a> App<'a> {
                 let message = error.to_string();
                 self.status = if message.ends_with('?') {
                     message
+                } else if self.theme.language.is_zh() {
+                    format!("{message}。输入 / 可选择命令。")
                 } else {
                     format!("{message}. Type / to choose a command.")
                 };
@@ -1721,13 +2234,24 @@ impl<'a> App<'a> {
         use CommandKind as C;
         match parsed.command {
             C::Resume => {
-                let mut picker = ResumePicker::default();
-                self.reload_resume(&mut picker);
-                self.views.push(View::Resume(picker));
+                self.views = ViewStack::default();
+                self.matrix_action = MatrixAction::Open;
+                self.refresh_home_data();
             }
-            C::List => self.open_picker(PickerPurpose::List),
-            C::Rename => self.open_picker(PickerPurpose::Rename),
+            C::List => {
+                self.views = ViewStack::default();
+                self.matrix_action = MatrixAction::Inspect;
+                self.refresh_home_data();
+            }
+            C::Rename => {
+                self.views = ViewStack::default();
+                self.refresh_home_data();
+                self.matrix.focus_session_header();
+                self.matrix_action = MatrixAction::Rename(TargetScope::Session);
+                self.refresh_home_preview();
+            }
             C::Kill => {
+                self.views = ViewStack::default();
                 if !parsed.args.is_empty() {
                     let target_name = parsed.args.join(" ");
                     self.refresh_home_data();
@@ -1735,12 +2259,27 @@ impl<'a> App<'a> {
                         self.kill_confirm(resource);
                         return;
                     }
-                    self.open_picker_with_query(PickerPurpose::Kill, &target_name);
+                    self.composer.set_value(target_name);
+                    self.matrix_action = MatrixAction::Kill(TargetScope::Session);
+                    self.sync_home_matrix();
+                    self.refresh_home_preview();
                     return;
                 }
-                self.open_picker(PickerPurpose::Kill);
+                self.refresh_home_data();
+                self.matrix.focus_window_row();
+                let scope = if self.matrix.is_session_selected() {
+                    TargetScope::Session
+                } else {
+                    TargetScope::Window
+                };
+                self.matrix_action = MatrixAction::Kill(scope);
+                self.refresh_home_preview();
             }
-            C::Window => self.open_picker(PickerPurpose::Windows),
+            C::Window => {
+                self.views = ViewStack::default();
+                self.matrix_action = MatrixAction::Window;
+                self.refresh_home_data();
+            }
             C::Pane => self.open_picker(PickerPurpose::Panes),
             C::Split => {
                 if let Some(arg) = parsed.args.first() {
@@ -1757,7 +2296,9 @@ impl<'a> App<'a> {
                         return;
                     }
                 }
-                self.open_picker(PickerPurpose::Split);
+                self.views = ViewStack::default();
+                self.matrix_action = MatrixAction::Split;
+                self.refresh_home_data();
             }
             C::New => {
                 if let Some(name) = parsed.args.first() {
@@ -1782,10 +2323,14 @@ impl<'a> App<'a> {
                     if let Some(preset) = ThemePreset::from_name(&arg) {
                         self.theme = self.theme.with_preset(preset);
                         self.config.theme = preset;
-                        self.status = theme_toast(preset);
+                        self.status = theme_toast(preset, self.theme.language);
                         return;
                     }
-                    self.status = format!("Unknown theme '{arg}'. Pick a preset below.");
+                    self.status = if self.theme.language.is_zh() {
+                        format!("未知主题 '{arg}'，请从下方选择预设。")
+                    } else {
+                        format!("Unknown theme '{arg}'. Pick a preset below.")
+                    };
                 }
                 let selected = ThemePreset::ALL
                     .iter()
@@ -1820,6 +2365,15 @@ impl<'a> App<'a> {
                 self.views.push(View::Config { selected: 0 });
             }
             C::Help => self.views.push(View::Help),
+            C::Update => {
+                self.status = self
+                    .theme
+                    .tr(
+                        "✦ Run 'jm update' (or 'justmux update') in your terminal to check & install updates.",
+                        "✦ 请在终端运行 'jm update'（或 'justmux update'）检查并安装更新。",
+                    )
+                    .to_owned();
+            }
             C::Exit => self.detach(),
             C::Quit => self.exit = Some(Exit::Quit),
         }
@@ -1827,17 +2381,10 @@ impl<'a> App<'a> {
 
     fn read_resources(&self, purpose: PickerPurpose) -> TmuxResult<Vec<Resource>> {
         match purpose {
-            PickerPurpose::Windows => self
-                .tmux
-                .list_windows(None)
-                .map(|rows| rows.into_iter().map(Resource::Window).collect()),
-            PickerPurpose::Panes | PickerPurpose::Split => self
+            PickerPurpose::Panes => self
                 .tmux
                 .list_panes(None)
                 .map(|rows| rows.into_iter().map(Resource::Pane).collect()),
-            _ => self
-                .recent_sessions()
-                .map(|rows| rows.into_iter().map(Resource::Session).collect()),
         }
     }
 
@@ -1851,6 +2398,26 @@ impl<'a> App<'a> {
         Ok(sessions)
     }
 
+    fn sync_home_matrix(&mut self) {
+        let raw = self.composer.value();
+        let trimmed = raw.trim_start();
+        let filter = if self.composer_mode == ComposerMode::QuickLaunch
+            || trimmed.starts_with('/')
+            || trimmed.starts_with('@')
+        {
+            ""
+        } else {
+            raw
+        };
+        self.matrix.sync(
+            self.home_sessions.clone(),
+            self.home_windows.clone(),
+            filter,
+            &mut self.matcher,
+        );
+        self.sync_action_scope_with_matrix();
+    }
+
     fn refresh_home_data(&mut self) {
         let Some(sessions) = self.recent_sessions().ok() else {
             self.home_sessions.clear();
@@ -1858,6 +2425,7 @@ impl<'a> App<'a> {
             self.home_panes.clear();
             self.telemetry = CachedTelemetry::default();
             self.radar_selected = 0;
+            self.sync_home_matrix();
             self.cached_preview = None;
             return;
         };
@@ -1871,6 +2439,7 @@ impl<'a> App<'a> {
                 attached: Some(0),
             };
             self.radar_selected = 0;
+            self.sync_home_matrix();
             self.cached_preview = None;
             return;
         }
@@ -1893,42 +2462,198 @@ impl<'a> App<'a> {
         self.radar_selected = self
             .radar_selected
             .min(self.home_sessions.len().saturating_sub(1));
+        self.sync_home_matrix();
         if self.views.top().is_none() {
             self.refresh_home_preview();
         }
     }
 
-    fn refresh_home_preview(&mut self) {
+    fn clear_preview(&mut self) {
+        self.cached_preview = None;
+        self.preview_target = None;
+        self.preview_scroll = 0;
+    }
+
+    fn preview_visible_rows(&self) -> usize {
+        self.preview_rect
+            .map_or(10, |r| usize::from(r.height.saturating_sub(2)).max(1))
+    }
+
+    fn max_preview_scroll(&self) -> usize {
         if !self.config.live_preview {
-            self.cached_preview = None;
+            return 0;
+        }
+        self.cached_preview
+            .as_ref()
+            .map_or(0, |(_, _, lines)| lines.len())
+            .saturating_sub(self.preview_visible_rows())
+    }
+
+    fn scroll_preview_up(&mut self, lines: usize) {
+        if !self.config.live_preview {
             return;
         }
-        let index = if self.composer_mode == ComposerMode::LiveRadar {
-            self.radar_selected
-        } else {
-            0
-        };
-        let Some(session) = self.home_sessions.get(index) else {
-            self.cached_preview = None;
+        self.preview_scroll = self
+            .preview_scroll
+            .saturating_add(lines)
+            .min(self.max_preview_scroll());
+    }
+
+    fn scroll_preview_down(&mut self, lines: usize) {
+        if !self.config.live_preview {
             return;
+        }
+        let max = self.max_preview_scroll();
+        self.preview_scroll = self.preview_scroll.min(max).saturating_sub(lines);
+    }
+
+    fn page_preview(&mut self, up: bool, half: bool) {
+        let rows = self.preview_visible_rows();
+        let step = if half {
+            (rows / 2).max(1)
+        } else {
+            rows.saturating_sub(2).max(1)
         };
-        let subtitle = self
-            .home_windows
-            .iter()
-            .find(|w| w.session_id == session.id && w.active)
-            .or_else(|| {
-                self.home_windows
-                    .iter()
-                    .find(|w| w.session_id == session.id)
-            })
-            .map(|w| w.name.clone())
-            .unwrap_or_else(|| format!("{}w", session.windows));
+        if up {
+            self.scroll_preview_up(step);
+        } else {
+            self.scroll_preview_down(step);
+        }
+    }
+
+    fn handle_preview_paging_key(&mut self, key: KeyEvent, input_empty: bool) -> bool {
+        if !self.config.live_preview || key.modifiers.contains(KeyModifiers::ALT) {
+            return false;
+        }
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        match key.code {
+            KeyCode::PageUp => {
+                self.page_preview(true, false);
+                true
+            }
+            KeyCode::PageDown => {
+                self.page_preview(false, false);
+                true
+            }
+            KeyCode::Char('u' | 'U') if input_empty && ctrl => {
+                self.page_preview(true, true);
+                true
+            }
+            KeyCode::Char('d' | 'D') if input_empty && ctrl => {
+                self.page_preview(false, true);
+                true
+            }
+            KeyCode::Home if input_empty && !ctrl => {
+                self.preview_scroll = self.max_preview_scroll();
+                true
+            }
+            KeyCode::End if input_empty && !ctrl => {
+                self.preview_scroll = 0;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    fn scroll_preview_wheel(&mut self, column: u16, row: u16, up: bool) -> bool {
+        if self.config.live_preview
+            && self
+                .preview_rect
+                .is_some_and(|rect| rect.contains((column, row).into()))
+        {
+            if up {
+                self.scroll_preview_up(PREVIEW_WHEEL_STEP);
+            } else {
+                self.scroll_preview_down(PREVIEW_WHEEL_STEP);
+            }
+            true
+        } else {
+            false
+        }
+    }
+
+    fn capture_and_store_preview(&mut self, target: Target, title: String, subtitle: String) {
         let lines = self
             .tmux
-            .capture_pane(&Target::Session(session.id.clone()), 12)
+            .capture_pane(&target, PREVIEW_CAPTURE_LINES)
             .ok()
             .unwrap_or_default();
-        self.cached_preview = Some((session.name.clone(), subtitle, lines));
+        let max_scroll = lines.len().saturating_sub(self.preview_visible_rows());
+        if self.preview_target.as_ref() != Some(&target) {
+            self.preview_target = Some(target);
+            self.preview_scroll = 0;
+        } else {
+            self.preview_scroll = self.preview_scroll.min(max_scroll);
+        }
+        self.cached_preview = Some((title, subtitle, lines));
+    }
+
+    fn refresh_home_preview(&mut self) {
+        if !self.config.live_preview {
+            self.clear_preview();
+            return;
+        }
+        if self.composer_mode == ComposerMode::LiveRadar {
+            let Some(session) = self.home_sessions.get(self.radar_selected) else {
+                self.clear_preview();
+                return;
+            };
+            let subtitle = self
+                .home_windows
+                .iter()
+                .find(|w| w.session_id == session.id && w.active)
+                .or_else(|| {
+                    self.home_windows
+                        .iter()
+                        .find(|w| w.session_id == session.id)
+                })
+                .map(|w| w.name.clone())
+                .unwrap_or_else(|| format!("{}w", session.windows));
+            self.capture_and_store_preview(
+                Target::Session(session.id.clone()),
+                session.name.clone(),
+                subtitle,
+            );
+            return;
+        }
+        if matches!(self.matrix.selection(), Some(MatrixSelection::NewSession))
+            && !self.matrix.is_empty()
+        {
+            self.preview_target = None;
+            self.preview_scroll = 0;
+            self.cached_preview = Some((
+                self.theme.tr("New Session", "新建会话").into(),
+                self.theme
+                    .tr("create tmux workspace", "创建 tmux 工作区")
+                    .into(),
+                vec![
+                    self.theme
+                        .tr(
+                            "Press Enter to name and launch a new tmux session.",
+                            "按 Enter 输入名称并启动新的 tmux 会话。",
+                        )
+                        .into(),
+                    self.theme
+                        .tr(
+                            "Tip: Leave working directory empty to use the current folder.",
+                            "提示：工作目录留空将默认使用当前目录。",
+                        )
+                        .into(),
+                ],
+            ));
+            return;
+        }
+        let Some((session, window)) = self
+            .matrix
+            .preview_window()
+            .map(|(s, w)| (s.clone(), w.clone()))
+        else {
+            self.clear_preview();
+            return;
+        };
+        let target = Target::Window(session.id.clone(), window.id.clone());
+        let subtitle = format!("{}: {}", window.index, window.name);
+        self.capture_and_store_preview(target, session.name, subtitle);
     }
 
     fn refresh_radar_preview(&mut self) {
@@ -1937,16 +2662,16 @@ impl<'a> App<'a> {
 
     fn update_picker_preview(&mut self, picker: &Picker) {
         if !self.config.live_preview {
-            self.cached_preview = None;
+            self.clear_preview();
             return;
         }
         let rows = picker.rows(&mut self.matcher);
         let Some(PickerRow::Resource(index)) = rows.get(picker.selected).copied() else {
-            self.cached_preview = None;
+            self.clear_preview();
             return;
         };
         let Some(resource) = picker.resources.get(index) else {
-            self.cached_preview = None;
+            self.clear_preview();
             return;
         };
         let target = resource.target();
@@ -1956,46 +2681,7 @@ impl<'a> App<'a> {
             Resource::Window(w) => w.id.to_string(),
             Resource::Pane(p) => p.id.to_string(),
         };
-        let lines = self.tmux.capture_pane(&target, 12).ok().unwrap_or_default();
-        self.cached_preview = Some((title, subtitle, lines));
-    }
-
-    fn update_resume_preview(&mut self, picker: &ResumePicker) {
-        if !self.config.live_preview {
-            self.cached_preview = None;
-            return;
-        }
-        let Some((target, label)) = picker.selected_target_info() else {
-            self.cached_preview = None;
-            return;
-        };
-        let lines = self.tmux.capture_pane(&target, 12).ok().unwrap_or_default();
-        self.cached_preview = Some((label, String::new(), lines));
-    }
-
-    fn reload_resume(&mut self, picker: &mut ResumePicker) {
-        let result = self.recent_sessions().and_then(|sessions| {
-            let windows = if sessions.is_empty() {
-                Vec::new()
-            } else {
-                self.tmux.list_windows(None)?
-            };
-            Ok((sessions, windows))
-        });
-        match result {
-            Ok((sessions, windows)) => {
-                self.telemetry = CachedTelemetry {
-                    sessions: Some(sessions.len()),
-                    windows: Some(windows.len()),
-                    attached: Some(sessions.iter().filter(|s| s.is_attached()).count()),
-                };
-                self.home_sessions = sessions.clone();
-                self.home_windows = windows.clone();
-                picker.replace(sessions, windows, &mut self.matcher);
-                self.update_resume_preview(picker);
-            }
-            Err(error) => self.status = error.to_string(),
-        }
+        self.capture_and_store_preview(target, title, subtitle);
     }
 
     fn open_picker(&mut self, purpose: PickerPurpose) {
@@ -2010,9 +2696,13 @@ impl<'a> App<'a> {
                 Vec::new()
             }
         };
+        let mut query = TextInput::default();
+        if !initial_query.is_empty() {
+            query.set_value(initial_query);
+        }
         let picker = Picker {
             purpose,
-            query: TextInput::new(initial_query),
+            query,
             resources,
             selected: 0,
         };
@@ -2021,6 +2711,10 @@ impl<'a> App<'a> {
     }
 
     fn picker_key(&mut self, mut picker: Picker, key: KeyEvent) {
+        if self.handle_preview_paging_key(key, picker.query.value().is_empty()) {
+            self.views.push(View::Picker(picker));
+            return;
+        }
         match key.code {
             KeyCode::Up => {
                 picker.selected = picker.selected.saturating_sub(1);
@@ -2049,10 +2743,6 @@ impl<'a> App<'a> {
 
     fn activate_picker_row(&mut self, mut picker: Picker, row: PickerRow) {
         match row {
-            PickerRow::NewWindow => {
-                self.views.push(View::Picker(picker));
-                self.open_picker(PickerPurpose::NewWindow);
-            }
             PickerRow::Refresh => {
                 match self.read_resources(picker.purpose) {
                     Ok(resources) => {
@@ -2071,28 +2761,16 @@ impl<'a> App<'a> {
                     self.views.push(View::Picker(picker));
                     return;
                 };
-                let purpose = picker.purpose;
                 self.views.push(View::Picker(picker));
-                match purpose {
-                    PickerPurpose::Rename => self.rename_form(resource),
-                    PickerPurpose::Kill => self.kill_confirm(resource),
-                    PickerPurpose::Split => self.views.push(View::Split(resource, 0)),
-                    PickerPurpose::NewWindow => self.views.push(View::Form(Form {
-                        action: FormAction::NewWindow(resource.session_id().clone()),
-                        input: TextInput::default(),
-                    })),
-                    PickerPurpose::List | PickerPurpose::Windows | PickerPurpose::Panes => {
-                        self.views.push(View::Actions(resource, 0));
-                    }
-                }
+                self.views.push(View::Actions(resource, 0));
             }
         }
     }
 
     fn handle_mouse(&mut self, mouse: MouseEvent) {
         match mouse.kind {
-            MouseEventKind::ScrollUp => self.mouse_scroll(true),
-            MouseEventKind::ScrollDown => self.mouse_scroll(false),
+            MouseEventKind::ScrollUp => self.mouse_scroll(mouse.column, mouse.row, true),
+            MouseEventKind::ScrollDown => self.mouse_scroll(mouse.column, mouse.row, false),
             MouseEventKind::Down(MouseButton::Left) => {
                 self.mouse_left_click(mouse.column, mouse.row)
             }
@@ -2100,7 +2778,7 @@ impl<'a> App<'a> {
         }
     }
 
-    fn mouse_scroll(&mut self, up: bool) {
+    fn mouse_scroll(&mut self, column: u16, row: u16, up: bool) {
         match self.views.pop() {
             None => {
                 if commands::popup_query(self.composer.value()).is_some() {
@@ -2121,6 +2799,7 @@ impl<'a> App<'a> {
                             (self.mention_selected + 1).min(count - 1)
                         };
                     }
+                } else if self.scroll_preview_wheel(column, row, up) {
                 } else if self.composer_mode == ComposerMode::LiveRadar
                     && !self.home_sessions.is_empty()
                 {
@@ -2130,26 +2809,26 @@ impl<'a> App<'a> {
                         (self.radar_selected + 1).min(self.home_sessions.len() - 1)
                     };
                     self.refresh_radar_preview();
+                } else if self.composer_mode == ComposerMode::CommandJump
+                    && self.matrix.move_row(if up { -1 } else { 1 })
+                {
+                    self.refresh_home_preview();
                 }
             }
             Some(View::Picker(mut picker)) => {
-                let count = picker.rows(&mut self.matcher).len();
-                picker.selected = if up {
-                    picker.selected.saturating_sub(1)
-                } else {
-                    (picker.selected + 1).min(count.saturating_sub(1))
-                };
-                self.update_picker_preview(&picker);
+                if !self.scroll_preview_wheel(column, row, up) {
+                    let count = picker.rows(&mut self.matcher).len();
+                    picker.selected = if up {
+                        picker.selected.saturating_sub(1)
+                    } else {
+                        (picker.selected + 1).min(count.saturating_sub(1))
+                    };
+                    self.update_picker_preview(&picker);
+                }
                 self.views.push(View::Picker(picker));
             }
-            Some(View::Resume(mut picker)) => {
-                let code = if up { KeyCode::Up } else { KeyCode::Down };
-                picker.handle_key(KeyEvent::new(code, KeyModifiers::NONE), &mut self.matcher);
-                self.update_resume_preview(&picker);
-                self.views.push(View::Resume(picker));
-            }
             Some(View::Actions(resource, mut selected)) => {
-                let count = resource.actions().len();
+                let count = resource.actions_for(self.theme.language).len();
                 selected = if up {
                     selected.saturating_sub(1)
                 } else {
@@ -2177,7 +2856,7 @@ impl<'a> App<'a> {
                 selected = if up {
                     selected.saturating_sub(1)
                 } else {
-                    (selected + 1).min(7)
+                    (selected + 1).min(CONFIG_ITEM_COUNT - 1)
                 };
                 self.views.push(View::Config { selected });
             }
@@ -2190,6 +2869,15 @@ impl<'a> App<'a> {
                 self.views.push(View::Confirm(confirm));
             }
             Some(other) => self.views.push(other),
+        }
+    }
+
+    fn list_scroll_offset(selected: usize, height: u16) -> usize {
+        let visible = usize::from(height);
+        if visible > 0 && selected >= visible {
+            selected + 1 - visible
+        } else {
+            0
         }
     }
 
@@ -2211,6 +2899,66 @@ impl<'a> App<'a> {
                             self.refresh_radar_preview();
                         }
                     }
+                } else if self.composer_mode == ComposerMode::CommandJump {
+                    if let Some((_, action)) = self
+                        .tab_hits
+                        .iter()
+                        .find(|(rect, _)| rect.contains((column, row).into()))
+                        .copied()
+                    {
+                        let scope = if self.matrix.is_session_selected() {
+                            TargetScope::Session
+                        } else {
+                            TargetScope::Window
+                        };
+                        self.matrix_action = match action {
+                            MatrixAction::Rename(_) => MatrixAction::Rename(scope),
+                            MatrixAction::Kill(_) => MatrixAction::Kill(scope),
+                            other => other,
+                        };
+                        self.status.clear();
+                        return;
+                    }
+                    if let Some(hit) = self
+                        .matrix_hits
+                        .iter()
+                        .find(|hit| hit.rect.contains((column, row).into()))
+                        .cloned()
+                    {
+                        let activate = self.matrix.select_hit(&hit.target);
+                        self.sync_action_scope_with_matrix();
+                        match hit.target {
+                            MatrixHitTarget::NewWindow(_) | MatrixHitTarget::NewSession => {
+                                if activate {
+                                    self.activate_matrix_selection();
+                                } else {
+                                    self.refresh_home_preview();
+                                }
+                            }
+                            MatrixHitTarget::Session(_) => {
+                                if activate
+                                    && matches!(
+                                        self.matrix_action,
+                                        MatrixAction::Open
+                                            | MatrixAction::Inspect
+                                            | MatrixAction::Rename(_)
+                                            | MatrixAction::Kill(_)
+                                    )
+                                {
+                                    self.activate_matrix_selection();
+                                } else {
+                                    self.refresh_home_preview();
+                                }
+                            }
+                            MatrixHitTarget::Window { .. } => {
+                                if activate {
+                                    self.activate_matrix_selection();
+                                } else {
+                                    self.refresh_home_preview();
+                                }
+                            }
+                        }
+                    }
                 }
             }
             Some(View::Picker(mut picker)) => {
@@ -2230,12 +2978,51 @@ impl<'a> App<'a> {
                 }
                 self.views.push(View::Picker(picker));
             }
+            Some(View::Config { mut selected }) => {
+                if let Some(rect) = self.subview_list_rect
+                    && rect.contains((column, row).into())
+                {
+                    let clicked =
+                        Self::list_scroll_offset(selected, rect.height) + usize::from(row - rect.y);
+                    if clicked < CONFIG_ITEM_COUNT {
+                        if clicked == selected {
+                            self.cycle_config_setting(clicked, true, true);
+                        } else {
+                            selected = clicked;
+                            self.config_note = None;
+                        }
+                    }
+                }
+                self.views.push(View::Config { selected });
+            }
+            Some(View::ThemePicker {
+                initial,
+                mut selected,
+            }) => {
+                if let Some(rect) = self.subview_list_rect
+                    && rect.contains((column, row).into())
+                {
+                    let clicked =
+                        Self::list_scroll_offset(selected, rect.height) + usize::from(row - rect.y);
+                    if let Some(&preset) = ThemePreset::ALL.get(clicked) {
+                        if clicked == selected {
+                            self.theme = self.theme.with_preset(preset);
+                            self.config.theme = preset;
+                            self.status = theme_toast(preset, self.theme.language);
+                            return;
+                        }
+                        selected = clicked;
+                        self.theme = self.theme.with_preset(preset);
+                    }
+                }
+                self.views.push(View::ThemePicker { initial, selected });
+            }
             Some(other) => self.views.push(other),
         }
     }
 
     fn resource_action_key(&mut self, resource: Resource, mut selected: usize, key: KeyEvent) {
-        let actions = resource.actions();
+        let actions = resource.actions_for(self.theme.language);
         match key.code {
             KeyCode::Up => selected = selected.saturating_sub(1),
             KeyCode::Down => selected = (selected + 1).min(actions.len() - 1),
@@ -2279,21 +3066,39 @@ impl<'a> App<'a> {
                 })
                 .unwrap_or(true),
         };
-        let mut message = format!(
-            "Permanently kill {}? All programs in the target will terminate.",
-            resource.label()
-        );
+        let label = resource.label();
+        let zh = self.theme.language.is_zh();
+        let mut message = if zh {
+            format!("确定要永久关闭 {label} 吗？该目标内的所有进程都将终止。")
+        } else {
+            format!("Permanently kill {label}? All programs in the target will terminate.")
+        };
         if attached {
-            message.push_str(" Attached clients will be affected.");
+            message.push_str(if zh {
+                " 已附着的客户端将受影响。"
+            } else {
+                " Attached clients will be affected."
+            });
         }
         if busy {
-            message.push_str(" A running task may be lost.");
+            message.push_str(if zh {
+                " 正在运行的任务可能会丢失。"
+            } else {
+                " A running task may be lost."
+            });
         }
         if current {
-            message
-                .push_str(" This is in your current session; tmux may close this popup or client.");
+            message.push_str(if zh {
+                " 这是你当前所在会话；tmux 可能会关闭此弹窗或客户端。"
+            } else {
+                " This is in your current session; tmux may close this popup or client."
+            });
         }
-        message.push_str(" Type yes, then Enter to confirm. Empty input cancels.");
+        message.push_str(if zh {
+            " 输入 yes 后按 Enter 确认，留空则取消。"
+        } else {
+            " Type yes, then Enter to confirm. Empty input cancels."
+        });
         self.views.push(View::Confirm(Confirm {
             resource,
             input: TextInput::default(),
@@ -2318,7 +3123,10 @@ impl<'a> App<'a> {
         }
         if key.code == KeyCode::Enter {
             if confirm.input.value() != "yes" {
-                self.status = "Cancelled. Nothing was killed.".into();
+                self.status = self
+                    .theme
+                    .tr("Cancelled. Nothing was killed.", "已取消，未关闭任何目标。")
+                    .into();
                 return;
             }
             let result = match &confirm.resource {
@@ -2328,7 +3136,7 @@ impl<'a> App<'a> {
             };
             match result {
                 Ok(()) => {
-                    self.status = "Target killed".into();
+                    self.status = self.theme.tr("Target killed", "已关闭目标").into();
                     self.refresh_parent();
                 }
                 Err(error) => {
@@ -2384,7 +3192,7 @@ impl<'a> App<'a> {
                         if renamed_current && let Context::Inside(inside) = &mut self.context {
                             inside.session_name = Some(value);
                         }
-                        self.status = "Renamed".into();
+                        self.status = self.theme.tr("Renamed", "已重命名").into();
                         self.refresh_parent();
                     }
                     Err(error) => {
@@ -2401,10 +3209,11 @@ impl<'a> App<'a> {
                 };
                 match self.tmux.new_window(session, name, None) {
                     Ok(window) => {
-                        self.refresh_home_data();
-                        self.status = "Window created".into();
                         self.views = ViewStack::default();
-                        self.open_picker(PickerPurpose::Windows);
+                        self.matrix_action = MatrixAction::Window;
+                        self.composer.set_value("");
+                        self.refresh_home_data();
+                        self.status = self.theme.tr("Window created", "窗口已创建").into();
                         self.views.push(View::Created(Resource::Window(window)));
                     }
                     Err(error) => {
@@ -2424,10 +3233,19 @@ impl<'a> App<'a> {
         };
         match self.tmux.new_session(name, &path) {
             Ok(session) => {
-                self.refresh_home_data();
-                self.status = "Session created. Enter to enter it, or Esc to keep managing.".into();
                 self.views = ViewStack::default();
-                self.open_picker(PickerPurpose::List);
+                self.matrix_action = MatrixAction::Inspect;
+                self.composer.set_value("");
+                self.refresh_home_data();
+                self.matrix.select_session(&session.id);
+                self.refresh_home_preview();
+                self.status = self
+                    .theme
+                    .tr(
+                        "Session created. Enter to enter it, or Esc to keep managing.",
+                        "会话已创建 · 按 Enter 立即进入，或 Esc 继续管理。",
+                    )
+                    .into();
                 self.views.push(View::Created(Resource::Session(session)));
                 true
             }
@@ -2442,11 +3260,6 @@ impl<'a> App<'a> {
         self.refresh_home_data();
         let popped = self.views.pop();
         let picker = match popped {
-            Some(View::Resume(mut picker)) => {
-                self.reload_resume(&mut picker);
-                self.views.push(View::Resume(picker));
-                return;
-            }
             Some(View::Picker(picker)) => Some(picker),
             Some(_) => match self.views.pop() {
                 Some(View::Picker(picker)) => Some(picker),
@@ -2484,11 +3297,22 @@ impl<'a> App<'a> {
                 self.exit = Some(Exit::Detach(client.clone()));
             }
             Context::ForeignServer => {
-                self.status = "This is a different tmux server. Use tmux's detach key.".into()
+                self.status = self
+                    .theme
+                    .tr(
+                        "This is a different tmux server. Use tmux's detach key.",
+                        "当前处于另一个 tmux 服务，请使用 tmux 原生 detach 快捷键。",
+                    )
+                    .into()
             }
             _ => {
-                self.status =
-                    "Cannot identify this tmux client. Use the Popup or tmux's detach key.".into()
+                self.status = self
+                    .theme
+                    .tr(
+                        "Cannot identify this tmux client. Use the Popup or tmux's detach key.",
+                        "无法识别当前 tmux 客户端，请使用 Popup 或 tmux 原生 detach 快捷键。",
+                    )
+                    .into()
             }
         }
     }
@@ -2500,8 +3324,13 @@ impl<'a> App<'a> {
             match self.tmux.has_session(id) {
                 Ok(true) => {}
                 Ok(false) => {
-                    self.status =
-                        "That session no longer exists. The list has been refreshed.".into();
+                    self.status = self
+                        .theme
+                        .tr(
+                            "That session no longer exists. The list has been refreshed.",
+                            "该会话已不存在，列表已自动刷新。",
+                        )
+                        .into();
                     self.refresh_parent();
                     return;
                 }
@@ -2514,20 +3343,46 @@ impl<'a> App<'a> {
         match &self.context {
             Context::Inside(_) => match self.tmux.switch_client(&target) {
                 Ok(()) => self.exit = Some(Exit::Switched),
-                Err(error) => { self.status = error.to_string(); self.refresh_parent(); }
+                Err(error) => {
+                    self.status = error.to_string();
+                    self.refresh_home_data();
+                }
             },
-            Context::ForeignServer => self.status = "You are inside another tmux server. Open jm outside tmux to enter this server; management still works.".into(),
-            Context::Unavailable => self.status = "The launching tmux client is unavailable. Return to a live tmux client or open jm outside tmux; no nested client was started.".into(),
+            Context::ForeignServer => {
+                self.status = self
+                    .theme
+                    .tr(
+                        "You are inside another tmux server. Open jm outside tmux to enter this server; management still works.",
+                        "你当前处于另一个 tmux 服务中，请在 tmux 外部打开 jm 进入该服务；会话管理仍可正常使用。",
+                    )
+                    .into()
+            }
+            Context::Unavailable => {
+                self.status = self
+                    .theme
+                    .tr(
+                        "The launching tmux client is unavailable. Return to a live tmux client or open jm outside tmux; no nested client was started.",
+                        "启动时的 tmux 客户端已不可用，请返回活跃的 tmux 客户端或在 tmux 外部打开 jm（未嵌套启动客户端）。",
+                    )
+                    .into()
+            }
             Context::Outside => match self.tmux.select(&target) {
                 Ok(()) => self.exit = Some(Exit::Attach(target)),
-                Err(error) => { self.status = error.to_string(); self.refresh_parent(); }
+                Err(error) => {
+                    self.status = error.to_string();
+                    self.refresh_home_data();
+                }
             },
         }
     }
 
     pub fn render(&mut self, frame: &mut Frame) {
+        self.preview_rect = None;
         self.picker_list_rect = None;
+        self.subview_list_rect = None;
         self.radar_list_rect = None;
+        self.tab_hits = Default::default();
+        self.matrix_hits.clear();
         let area = frame.area();
         let indent = if area.width >= 24 { 2 } else { 0 };
         let area = Rect {
@@ -2576,11 +3431,12 @@ impl<'a> App<'a> {
                 }
             }
             let commands = self.palette();
+            let lang = self.theme.language;
             let items: Vec<_> = commands
                 .iter()
                 .map(|candidate| CommandItem {
                     name: candidate.command.name,
-                    description: candidate.command.description,
+                    description: commands::description_for(candidate.command.kind, lang),
                     alias: candidate.alias,
                     indices: &candidate.indices,
                 })
@@ -2629,244 +3485,327 @@ impl<'a> App<'a> {
                     title: title.as_str(),
                     subtitle: subtitle.as_str(),
                     lines: lines.as_slice(),
+                    scroll: self.preview_scroll,
                 });
             let (context, session) = match &self.context {
-                Context::Outside => ("standalone", None),
+                Context::Outside => (self.theme.tr("standalone", "独立模式"), None),
                 Context::Inside(inside) => (
-                    if inside.popup { "popup" } else { "pane" },
+                    if inside.popup {
+                        self.theme.tr("popup", "弹窗")
+                    } else {
+                        self.theme.tr("pane", "窗格")
+                    },
                     inside.session_name.as_deref(),
                 ),
-                Context::ForeignServer => ("different server", None),
-                Context::Unavailable => ("client unavailable", None),
+                Context::ForeignServer => (self.theme.tr("different server", "外部服务"), None),
+                Context::Unavailable => (self.theme.tr("client unavailable", "客户端不可用"), None),
             };
             let badge = format!(
                 "{} {}",
                 self.theme.preset.badge_icon(self.theme.ascii),
                 self.theme.preset.slug()
             );
-            ui::render_home_studio(
+            let highlight_header = matches!(
+                self.matrix_action,
+                MatrixAction::Rename(TargetScope::Session)
+                    | MatrixAction::Kill(TargetScope::Session)
+            );
+            let mut hits = Vec::new();
+            let matrix = &mut self.matrix;
+            let theme = self.theme;
+            let layout = render_workspace_home(
                 frame,
                 area,
                 &self.composer,
-                &items,
-                self.palette_selected,
-                HomeDetails {
-                    directory: self.directory.as_deref(),
-                    context,
-                    session,
-                    status: (!self.status.is_empty()).then_some(self.status.as_str()),
-                },
-                HomeTelemetry {
-                    sessions: self.telemetry.sessions,
-                    windows: self.telemetry.windows,
-                    attached: self.telemetry.attached,
-                    hint_badge: (self.theme.preset != ThemePreset::Classic)
-                        .then_some(badge.as_str()),
-                },
-                ui::HomeDashboardState {
-                    mode: self.composer_mode,
+                WorkspaceHomeSpec {
+                    details: HomeDetails {
+                        directory: self.directory.as_deref(),
+                        context,
+                        session,
+                        status: (!self.status.is_empty()).then_some(self.status.as_str()),
+                    },
+                    telemetry: HomeTelemetry {
+                        sessions: self.telemetry.sessions,
+                        windows: self.telemetry.windows,
+                        attached: self.telemetry.attached,
+                        hint_badge: (self.theme.preset != ThemePreset::Classic)
+                            .then_some(badge.as_str()),
+                    },
+                    action: self.matrix_action,
+                    composer_mode: self.composer_mode,
                     sessions: &session_entries,
                     mentions: &mention_items,
                     mention_selected: self.mention_selected,
                     radar_selected: self.radar_selected,
                     preview,
-                    tip_step: self.tip_step,
+                    live_preview: self.config.live_preview,
+                    emblem_mode: self.config.emblem_mode,
+                    emblem_step: if self.config.emblem_mode.should_animate() {
+                        self.emblem_step
+                    } else {
+                        0
+                    },
+                    popup: &items,
+                    popup_selected: self.palette_selected,
                 },
-                self.theme,
+                theme,
+                |frame, body| {
+                    hits = matrix.render_matrix_body(
+                        frame,
+                        body,
+                        current_session.as_ref(),
+                        highlight_header,
+                        theme,
+                    );
+                },
             );
+            self.matrix_hits = hits;
+            self.tab_hits = layout.tab_hits;
+            self.preview_rect = layout.preview_area;
+            self.hydra_visible = layout.hydra_rendered;
             return;
         }
-        let preview_lines: Option<Vec<String>> = self
-            .cached_preview
-            .as_ref()
-            .map(|(_, _, lines)| lines.clone());
-        let preview_meta = self
-            .cached_preview
-            .as_ref()
-            .map(|(title, subtitle, _)| (title.clone(), subtitle.clone()));
-        if let Some(View::Resume(picker)) = self.views.0.last_mut() {
-            if let Some(lines) = preview_lines.as_deref() {
-                picker.render_with_preview(
-                    frame,
-                    area,
-                    self.context.current_session(),
-                    &self.status,
-                    Some(lines),
-                    self.theme,
-                );
+        fn draw_subview(
+            frame: &mut Frame<'_>,
+            area: Rect,
+            details: HomeDetails<'_>,
+            telemetry: HomeTelemetry<'_>,
+            emblem: (EmblemMode, usize),
+            theme: Theme,
+            content: SubviewContent<'_>,
+        ) -> ui::WorkspaceSubviewLayout {
+            render_workspace_subview(
+                frame,
+                area,
+                &WorkspaceSubviewSpec {
+                    details,
+                    telemetry,
+                    emblem_mode: emblem.0,
+                    emblem_step: emblem.1,
+                    footer_hint: "",
+                    content,
+                },
+                theme,
+            )
+        }
+
+        let compact = area.width < 36 || area.height < 12;
+        let (subview_area, compact_chunks) = if compact {
+            let chunks = Layout::vertical([
+                Constraint::Min(1),
+                Constraint::Length(2),
+                Constraint::Length(1),
+            ])
+            .areas::<3>(area);
+            (chunks[0], Some(chunks))
+        } else {
+            (area, None)
+        };
+        let picker_rows = if let Some(View::Picker(picker)) = self.views.0.last() {
+            Some(picker.rich_rows(&mut self.matcher, &self.context, self.theme))
+        } else {
+            None
+        };
+        let (context, session) = match &self.context {
+            Context::Outside => (self.theme.tr("standalone", "独立模式"), None),
+            Context::Inside(inside) => (
+                if inside.popup {
+                    self.theme.tr("popup", "弹窗")
+                } else {
+                    self.theme.tr("pane", "窗格")
+                },
+                inside.session_name.as_deref(),
+            ),
+            Context::ForeignServer => (self.theme.tr("different server", "外部服务"), None),
+            Context::Unavailable => (self.theme.tr("client unavailable", "客户端不可用"), None),
+        };
+        let badge = format!(
+            "{} {}",
+            self.theme.preset.badge_icon(self.theme.ascii),
+            self.theme.preset.slug()
+        );
+        let details = HomeDetails {
+            directory: self.directory.as_deref(),
+            context,
+            session,
+            status: (!self.status.is_empty()).then_some(self.status.as_str()),
+        };
+        let telemetry = HomeTelemetry {
+            sessions: self.telemetry.sessions,
+            windows: self.telemetry.windows,
+            attached: self.telemetry.attached,
+            hint_badge: (self.theme.preset != ThemePreset::Classic).then_some(badge.as_str()),
+        };
+        let emblem = (
+            self.config.emblem_mode,
+            if self.config.emblem_mode.should_animate() {
+                self.emblem_step
             } else {
-                picker.render(
-                    frame,
-                    area,
-                    self.context.current_session(),
-                    &self.status,
-                    self.theme,
-                );
-            }
-            return;
-        }
-        let chunks = Layout::vertical([
-            Constraint::Min(1),
-            Constraint::Length(2),
-            Constraint::Length(1),
-        ])
-        .split(area);
-        let main = chunks[0];
-        match self.views.0.last_mut() {
+                0
+            },
+        );
+        let preview = self
+            .cached_preview
+            .as_ref()
+            .filter(|_| self.config.live_preview)
+            .map(|(title, subtitle, lines)| ui::PanePreview {
+                title: title.as_str(),
+                subtitle: subtitle.as_str(),
+                lines: lines.as_slice(),
+                scroll: self.preview_scroll,
+            });
+        let mut picker_selected_and_len = None;
+        let sub_layout = match self.views.0.last() {
             Some(View::Picker(picker)) => {
-                let rows = picker.rich_rows(&mut self.matcher, &self.context, self.theme);
-                let preview = preview_meta.as_ref().zip(preview_lines.as_deref()).map(
-                    |((title, subtitle), lines)| ui::PanePreview {
-                        title: title.as_str(),
-                        subtitle: subtitle.as_str(),
-                        lines,
-                    },
-                );
-                let [_, _, body_area, _] = Layout::vertical([
-                    Constraint::Length(1),
-                    Constraint::Length(1),
-                    Constraint::Min(1),
-                    Constraint::Length(1),
-                ])
-                .areas(main);
-                let list_area = match &preview {
-                    Some(_) if main.width >= 68 && body_area.height >= 4 => {
-                        Layout::horizontal([Constraint::Percentage(52), Constraint::Percentage(48)])
-                            .areas::<2>(body_area)[0]
-                    }
-                    _ => body_area,
-                };
-                if !rows.is_empty() && list_area.height > 0 && list_area.width > 0 {
-                    let visible_rows = usize::from(list_area.height);
-                    let selected = picker.selected.min(rows.len() - 1);
-                    self.picker_offset = (selected + 1).saturating_sub(visible_rows);
-                    self.picker_list_rect = Some(list_area);
-                }
-                ui::render_rich_picker_with_preview(
+                let rows = picker_rows.as_deref().unwrap_or(&[]);
+                picker_selected_and_len = Some((picker.selected, rows.len()));
+                draw_subview(
                     frame,
-                    main,
-                    picker.purpose.title(),
-                    &picker.query,
-                    &rows,
-                    picker.selected,
-                    match picker.purpose {
-                        PickerPurpose::Windows => "No matching windows",
-                        PickerPurpose::NewWindow => {
-                            "No matching sessions. Use /new to create a session."
-                        }
-                        _ => "No matches or sessions. Esc back · /new creates a session",
-                    },
-                    picker.purpose.footer(),
-                    preview,
+                    subview_area,
+                    details,
+                    telemetry,
+                    emblem,
                     self.theme,
-                );
+                    SubviewContent::Picker {
+                        title: picker.purpose.title_for(self.theme.language),
+                        query: &picker.query,
+                        rows,
+                        selected: picker.selected,
+                        empty: self
+                            .theme
+                            .tr("No matching panes. Esc back", "没有匹配的窗格 · Esc 返回"),
+                        preview,
+                    },
+                )
             }
             Some(View::Actions(resource, selected)) => {
-                let actions = resource.actions();
-                let [title, target, choices, footer] = Layout::vertical([
-                    Constraint::Length(1),
-                    Constraint::Length(u16::from(main.height >= actions.len() as u16 + 3)),
-                    Constraint::Min(1),
-                    Constraint::Length(u16::from(main.height >= actions.len() as u16 + 2)),
-                ])
-                .areas(main);
-                frame.render_widget(
-                    Paragraph::new(match resource {
-                        Resource::Session(_) => "Session actions",
-                        Resource::Window(_) => "Window actions",
-                        Resource::Pane(_) => "Pane actions",
-                    })
-                    .style(
-                        self.theme
-                            .style(self.theme.accent)
-                            .add_modifier(ratatui::style::Modifier::BOLD),
-                    ),
-                    title,
-                );
-                frame.render_widget(
-                    Paragraph::new(resource.label()).style(self.theme.style(self.theme.muted)),
-                    target,
-                );
-                let rows = actions.iter().map(|(label, _)| ListItem::new(*label));
-                let mut state = ListState::default().with_selected(Some(*selected));
-                frame.render_stateful_widget(
-                    List::new(rows)
-                        .highlight_style(self.theme.selected_style())
-                        .highlight_symbol(format!("{} ", self.theme.marker())),
-                    choices,
-                    &mut state,
-                );
-                frame.render_widget(
-                    Paragraph::new(self.theme.adapt("Enter Select · Esc Back"))
-                        .style(self.theme.style(self.theme.muted)),
-                    footer,
-                );
+                let actions = resource.actions_for(self.theme.language);
+                let action_labels: Vec<&str> = actions.iter().map(|(label, _)| *label).collect();
+                let title = match resource {
+                    Resource::Session(_) => self.theme.tr("Session actions", "会话操作"),
+                    Resource::Window(_) => self.theme.tr("Window actions", "窗口操作"),
+                    Resource::Pane(_) => self.theme.tr("Pane actions", "窗格操作"),
+                };
+                let target_label = resource.label();
+                draw_subview(
+                    frame,
+                    subview_area,
+                    details,
+                    telemetry,
+                    emblem,
+                    self.theme,
+                    SubviewContent::Actions {
+                        title,
+                        target_label: &target_label,
+                        actions: &action_labels,
+                        selected: *selected,
+                    },
+                )
             }
             Some(View::Form(form)) => {
                 let rename_label;
                 let (title, label) = match &form.action {
-                    FormAction::NewSessionName => ("New session", "Session name"),
+                    FormAction::NewSessionName => (
+                        self.theme.tr("New session", "新建会话"),
+                        self.theme.tr("Session name", "会话名称"),
+                    ),
                     FormAction::NewSessionDirectory { .. } => (
-                        "New session",
-                        "Working directory (empty = current directory)",
+                        self.theme.tr("New session", "新建会话"),
+                        self.theme.tr(
+                            "Working directory (empty = current directory)",
+                            "工作目录（留空则使用当前目录）",
+                        ),
                     ),
                     FormAction::Rename(resource) => {
-                        rename_label = format!("New name for {}", resource.label());
-                        ("Rename", rename_label.as_str())
+                        rename_label = if self.theme.language.is_zh() {
+                            format!("将 {} 重命名为", resource.label())
+                        } else {
+                            format!("New name for {}", resource.label())
+                        };
+                        (self.theme.tr("Rename", "重命名"), rename_label.as_str())
                     }
-                    FormAction::NewWindow(_) => ("New window", "Window name (optional)"),
+                    FormAction::NewWindow(_) => (
+                        self.theme.tr("New window", "新建窗口"),
+                        self.theme.tr("Window name (optional)", "窗口名称（可选）"),
+                    ),
                 };
-                ui::render_form(
+                draw_subview(
                     frame,
-                    main,
-                    title,
-                    label,
-                    &form.input,
-                    "Enter Submit · Esc Back",
+                    subview_area,
+                    details,
+                    telemetry,
+                    emblem,
                     self.theme,
-                );
+                    SubviewContent::Form {
+                        title,
+                        label,
+                        input: &form.input,
+                    },
+                )
             }
             Some(View::Confirm(confirm)) => {
                 let summary = confirm.resource.label();
-                confirm.scroll = ui::render_confirm_card(
+                draw_subview(
                     frame,
-                    main,
-                    "Confirm irreversible action",
-                    &summary,
-                    &confirm.message,
-                    &confirm.input,
-                    "↑↓ Review · Type yes + Enter to kill · Esc Back",
+                    subview_area,
+                    details,
+                    telemetry,
+                    emblem,
                     self.theme,
-                    confirm.scroll,
-                );
+                    SubviewContent::Confirm {
+                        title: self
+                            .theme
+                            .tr("Confirm irreversible action", "确认不可逆操作"),
+                        target_summary: &summary,
+                        message: &confirm.message,
+                        input: &confirm.input,
+                        scroll: confirm.scroll,
+                    },
+                )
             }
             Some(View::Created(resource)) => {
-                frame.render_widget(
-                    Paragraph::new(vec![
-                        Line::from("Created successfully"),
-                        Line::from(""),
-                        Line::from(resource.label()),
-                        Line::from(""),
-                        Line::from("Enter to enter native tmux · Esc to continue managing"),
-                    ]),
-                    main,
-                );
+                let target_label = resource.label();
+                draw_subview(
+                    frame,
+                    subview_area,
+                    details,
+                    telemetry,
+                    emblem,
+                    self.theme,
+                    SubviewContent::Created {
+                        target_label: &target_label,
+                    },
+                )
             }
             Some(View::Split(resource, selected)) => {
-                ui::render_split_selector(frame, main, &resource.label(), *selected, self.theme);
-            }
-            Some(View::ThemePicker { initial, selected }) => {
-                ui::render_theme_picker(
+                let target_label = resource.label();
+                draw_subview(
                     frame,
-                    main,
-                    ThemePreset::ALL,
-                    *selected,
-                    *initial,
+                    subview_area,
+                    details,
+                    telemetry,
+                    emblem,
                     self.theme,
-                );
+                    SubviewContent::Split {
+                        target_label: &target_label,
+                        selected: *selected,
+                    },
+                )
             }
+            Some(View::ThemePicker { initial, selected }) => draw_subview(
+                frame,
+                subview_area,
+                details,
+                telemetry,
+                emblem,
+                self.theme,
+                SubviewContent::Theme {
+                    presets: ThemePreset::ALL,
+                    selected: *selected,
+                    active: *initial,
+                },
+            ),
             Some(View::Config { selected }) => {
-                let selected = *selected;
                 let items = self.config_modal_items();
                 let path_label = self
                     .config_path
@@ -2874,22 +3813,31 @@ impl<'a> App<'a> {
                     .map(|p| p.display().to_string())
                     .or_else(|| config::resolve_config_path(None).map(|p| p.display().to_string()))
                     .unwrap_or_else(|| format!("~/{}", config::DEFAULT_CONFIG_REL_PATH));
-                ui::render_config_modal(
+                draw_subview(
                     frame,
-                    main,
-                    &path_label,
-                    &items,
-                    selected,
-                    self.config_note.as_deref(),
+                    subview_area,
+                    details,
+                    telemetry,
+                    emblem,
                     self.theme,
-                );
+                    SubviewContent::Config {
+                        path_label: &path_label,
+                        items: &items,
+                        selected: *selected,
+                        status_note: self.config_note.as_deref(),
+                    },
+                )
             }
             Some(View::Tribute { id, step }) => {
                 let card = tributes::card(*id, *step);
-                ui::render_tribute_modal(
+                draw_subview(
                     frame,
-                    main,
-                    ui::TributeModal {
+                    subview_area,
+                    details,
+                    telemetry,
+                    emblem,
+                    self.theme,
+                    SubviewContent::Tribute(ui::TributeModal {
                         badge: card.badge,
                         title: card.title,
                         subtitle: card.subtitle,
@@ -2902,30 +3850,55 @@ impl<'a> App<'a> {
                         highlights: card.highlights,
                         status_quip: &card.status_quip,
                         footer_hint: card.footer_hint,
-                    },
-                    self.theme,
-                );
+                    }),
+                )
             }
-            Some(View::Help) => ui::render_help(frame, main, self.theme),
-            Some(View::Resume(_)) | None => {}
-        }
-        frame.render_widget(
-            Paragraph::new(Line::from(vec![
-                Span::raw(format!("{} ", self.theme.marker())),
-                Span::styled(self.composer.value(), self.theme.style(self.theme.muted)),
-            ])),
-            chunks[1],
-        );
-        let status_style = if self.status.starts_with("Refreshed") || self.status.starts_with('✦')
-        {
-            self.theme.style(self.theme.success)
-        } else {
-            self.theme.style(self.theme.error)
+            Some(View::Help) => draw_subview(
+                frame,
+                subview_area,
+                details,
+                telemetry,
+                emblem,
+                self.theme,
+                SubviewContent::Help,
+            ),
+            None => ui::WorkspaceSubviewLayout::default(),
         };
-        frame.render_widget(
-            Paragraph::new(self.theme.adapt(&self.status)).style(status_style),
-            chunks[2],
-        );
+        self.hydra_visible = sub_layout.hydra_rendered;
+        self.preview_rect = sub_layout.preview_area;
+        self.subview_list_rect = sub_layout.list_rect;
+        if let Some((selected, rows_len)) = picker_selected_and_len
+            && rows_len > 0
+            && let Some(list_area) = sub_layout.list_rect
+            && list_area.height > 0
+        {
+            let visible_rows = usize::from(list_area.height);
+            let clamped = selected.min(rows_len - 1);
+            self.picker_offset = (clamped + 1).saturating_sub(visible_rows);
+            self.picker_list_rect = Some(list_area);
+        }
+        if let Some(View::Confirm(confirm)) = self.views.0.last_mut() {
+            confirm.scroll = sub_layout.confirm_scroll;
+        }
+        if let Some(chunks) = compact_chunks {
+            frame.render_widget(
+                Paragraph::new(Line::from(vec![
+                    Span::raw(format!("{} ", self.theme.marker())),
+                    Span::styled(self.composer.value(), self.theme.style(self.theme.muted)),
+                ])),
+                chunks[1],
+            );
+            let status_style =
+                if self.status.starts_with("Refreshed") || self.status.starts_with('✦') {
+                    self.theme.style(self.theme.success)
+                } else {
+                    self.theme.style(self.theme.error)
+                };
+            frame.render_widget(
+                Paragraph::new(self.theme.adapt(&self.status)).style(status_style),
+                chunks[2],
+            );
+        }
     }
 
     pub fn exit(&self) -> Option<&Exit> {
@@ -2953,7 +3926,7 @@ mod tests {
     #[test]
     fn picker_filters_and_sorts_fuzzy_matches() {
         let picker = Picker {
-            purpose: PickerPurpose::List,
+            purpose: PickerPurpose::Panes,
             query: TextInput::new("ori"),
             resources: vec![
                 Resource::Session(session("$1", "server")),
@@ -2974,7 +3947,7 @@ mod tests {
         let mut stack = ViewStack::default();
         stack.push(View::Help);
         stack.push(View::Picker(Picker {
-            purpose: PickerPurpose::List,
+            purpose: PickerPurpose::Panes,
             query: TextInput::default(),
             resources: vec![],
             selected: 0,

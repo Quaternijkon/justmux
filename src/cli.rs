@@ -13,9 +13,10 @@ use std::{
     io::{self, IsTerminal},
     path::PathBuf,
     process::ExitCode,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
+const EMBLEM_TICK: Duration = Duration::from_millis(85);
 const KEYBIND: &str = r#"bind-key j run-shell 'tmux display-popup -E -w 80% -h 70% -c #{q:client_name} "JUSTMUX_CLIENT=#{q:client_name} JUSTMUX_PANE=#{q:pane_id} JUSTMUX_POPUP=1 jm"'"#;
 
 #[derive(Debug, Parser)]
@@ -23,7 +24,7 @@ const KEYBIND: &str = r#"bind-key j run-shell 'tmux display-popup -E -w 80% -h 7
     name = "jm",
     version,
     about = "A modern slash-command interface for tmux",
-    long_about = "Just tmux. Just simpler.\nStart the TUI, or use `jm resume`, `jm doctor`, or `jm --print-keybind`."
+    long_about = "Just tmux. Just simpler.\nStart the TUI, or use `jm resume`, `jm update`, `jm doctor`, or `jm --print-keybind`."
 )]
 struct Cli {
     /// Use a named tmux socket (same as tmux -L).
@@ -55,7 +56,11 @@ struct Cli {
     doctor: bool,
     /// Open a slash command directly, followed by optional command arguments.
     /// Shell quoting is preserved by rebuilding a safely quoted slash input.
-    #[arg(value_name = "COMMAND", trailing_var_arg = true)]
+    #[arg(
+        value_name = "COMMAND",
+        trailing_var_arg = true,
+        allow_hyphen_values = true
+    )]
     command: Vec<String>,
 }
 
@@ -111,6 +116,13 @@ fn run(cli: Cli) -> Result<()> {
     if cli.doctor || cli.command.first().map(String::as_str) == Some("doctor") {
         let loaded = crate::config::load(&cli_overrides(&cli))?;
         return doctor(&tmux, &loaded);
+    }
+    if matches!(
+        cli.command.first().map(String::as_str),
+        Some("update" | "upgrade")
+    ) {
+        print!("{}", standalone_update_text(&cli.command[1..])?);
+        return Ok(());
     }
     tmux.version().context("cannot start JustMux")?;
     if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
@@ -178,6 +190,11 @@ fn doctor(tmux: &TmuxClient, loaded: &LoadedConfig) -> Result<()> {
     println!("Config: {config_label}");
     println!("Screen mode: {}", loaded.config.screen_mode.as_str());
     println!("Theme: {}", theme_summary(loaded.config.effective_theme()));
+    println!(
+        "Language: {} ({})",
+        loaded.config.language.as_str(),
+        loaded.config.language.display_name(loaded.config.ascii)
+    );
     Ok(())
 }
 
@@ -190,6 +207,48 @@ fn theme_summary(theme: crate::ui::Theme) -> String {
         "ANSI"
     };
     format!("{} ({color_mode})", theme.preset.name())
+}
+
+fn invoked_as_long_alias(arg0: Option<&std::ffi::OsStr>, invoked_env: Option<&str>) -> bool {
+    if let Some(value) = invoked_env.map(str::trim).filter(|v| !v.is_empty()) {
+        return value.eq_ignore_ascii_case("justmux");
+    }
+    arg0.and_then(|raw| std::path::Path::new(raw).file_stem())
+        .and_then(std::ffi::OsStr::to_str)
+        .is_some_and(|stem| stem.eq_ignore_ascii_case("justmux"))
+}
+
+fn standalone_update_text(args: &[String]) -> Result<String> {
+    for arg in args {
+        match arg.as_str() {
+            "-h" | "--help" => {
+                return Ok(concat!(
+                    "Usage: jm update [--check]\n\n",
+                    "Check npm for a newer JustMux release and update the global installation.\n",
+                    "Aliases: jm upgrade, justmux update, justmux upgrade\n\n",
+                    "Options:\n",
+                    "  --check     Only check whether a newer release is available\n",
+                    "  -h, --help  Print help\n",
+                )
+                .to_owned());
+            }
+            "--check" => {}
+            _ => {
+                anyhow::bail!("unexpected argument '{arg}' for 'update' (try 'jm update --help')");
+            }
+        }
+    }
+    Ok(format!(
+        concat!(
+            "JustMux {} (standalone native binary)\n\n",
+            "`jm update` / `justmux update` checks npm and updates global npm installations\n",
+            "(`npm install -g justmux@latest`). This binary was invoked directly instead of\n",
+            "through the npm wrapper:\n",
+            "  - npm global:   npm install -g justmux@latest\n",
+            "  - Cargo source: cargo install --path . --locked\n",
+        ),
+        env!("CARGO_PKG_VERSION")
+    ))
 }
 
 fn run_tui(tmux: &TmuxClient, options: AppOptions, loaded: LoadedConfig) -> Result<()> {
@@ -210,6 +269,14 @@ fn run_tui(tmux: &TmuxClient, options: AppOptions, loaded: LoadedConfig) -> Resu
     )
     .context("could not initialise terminal")?;
     let mut app = App::with_config(tmux, options, loaded.config, loaded.path);
+    if invoked_as_long_alias(
+        std::env::args_os().next().as_deref(),
+        std::env::var("JUSTMUX_INVOKED_AS").ok().as_deref(),
+    ) {
+        app.set_startup_tip(
+            "✦ Tip: You can also launch JustMux anytime with 'jm' · Type / for commands",
+        );
+    }
     loop {
         // Hand control back before drawing another frame.
         if let Some(exit) = app.exit().cloned() {
@@ -232,7 +299,15 @@ fn run_tui(tmux: &TmuxClient, options: AppOptions, loaded: LoadedConfig) -> Resu
         // arrow-key repeats or pasted text therefore don't emit a frame each.
         let mut changed = false;
         let mut resized = false;
+        let tick_deadline = app.should_animate().then(|| Instant::now() + EMBLEM_TICK);
         while !changed {
+            if let Some(deadline) = tick_deadline {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() || !event::poll(remaining)? {
+                    app.tick_animation();
+                    break;
+                }
+            }
             let first = event::read().context("could not read terminal input")?;
             let mut current = first;
             for index in 0..64 {
@@ -409,5 +484,62 @@ mod tests {
             }),
             "Classic (NO_COLOR)"
         );
+    }
+
+    #[test]
+    fn detects_long_justmux_alias_from_env_or_argv0() {
+        use std::ffi::OsStr;
+        assert!(invoked_as_long_alias(
+            Some(OsStr::new("./target/release/justmux")),
+            None
+        ));
+        assert!(invoked_as_long_alias(
+            Some(OsStr::new("/usr/local/bin/JustMux")),
+            None
+        ));
+        assert!(!invoked_as_long_alias(
+            Some(OsStr::new("./target/release/jm")),
+            None
+        ));
+        assert!(!invoked_as_long_alias(None, None));
+        assert!(invoked_as_long_alias(
+            Some(OsStr::new("/opt/bin/jm")),
+            Some("justmux")
+        ));
+        assert!(!invoked_as_long_alias(
+            Some(OsStr::new("/opt/bin/justmux")),
+            Some("jm")
+        ));
+        assert!(invoked_as_long_alias(
+            Some(OsStr::new("/opt/bin/justmux")),
+            Some("   ")
+        ));
+    }
+
+    #[test]
+    fn standalone_update_text_handles_default_check_help_and_unknown_args() {
+        let default = standalone_update_text(&[]).expect("default text");
+        assert!(default.contains("standalone native binary"));
+        assert!(default.contains("npm install -g justmux@latest"));
+        assert!(default.contains("cargo install --path . --locked"));
+
+        let check = standalone_update_text(&["--check".into()]).expect("check text");
+        assert_eq!(check, default);
+
+        let help = standalone_update_text(&["--help".into()]).expect("help text");
+        assert!(help.contains("Usage: jm update [--check]"));
+        assert!(help.contains("justmux update"));
+
+        let short_help = standalone_update_text(&["-h".into()]).expect("short help text");
+        assert_eq!(short_help, help);
+
+        let err = standalone_update_text(&["--bogus".into()]).expect_err("unknown arg fails");
+        assert!(err.to_string().contains("unexpected argument '--bogus'"));
+
+        // Ensure `--help` after `update` routes to subcommand args while top-level `jm --help` still displays CLI help.
+        let cli = Cli::try_parse_from(["justmux", "update", "--help"]).expect("update help CLI");
+        assert_eq!(cli.command, vec!["update", "--help"]);
+        let top_help = Cli::try_parse_from(["jm", "--help"]).expect_err("top-level help");
+        assert_eq!(top_help.kind(), clap::error::ErrorKind::DisplayHelp);
     }
 }

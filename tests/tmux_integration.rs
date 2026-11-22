@@ -107,7 +107,7 @@ fn session_management_works_through_keyboard_events() {
 
 #[test]
 fn window_and_pane_management_work_through_keyboard_events() {
-    use KeyCode::{Backspace, Down, Enter, Esc};
+    use KeyCode::{Char, Down, Enter, Esc, Right};
 
     let server = PrivateServer::new();
     let session = server.client.new_session("layout", cwd()).expect("session");
@@ -117,7 +117,8 @@ fn window_and_pane_management_work_through_keyboard_events() {
             initial_command: Some("/window".into()),
         },
     );
-    keys(&mut app, &[Enter, Enter]);
+    // In Unified Home Matrix `/window` mode, `+` opens the New Window form.
+    keys(&mut app, &[Char('+')]);
     text(&mut app, "build");
     keys(&mut app, &[Enter]);
     let windows = server
@@ -130,8 +131,12 @@ fn window_and_pane_management_work_through_keyboard_events() {
         .find(|w| w.name == "build")
         .expect("build window");
     keys(&mut app, &[Esc]);
+
+    // Filtering `"build"` in `/rename` mode focuses the window directly (no Tab toggle needed).
+    text(&mut app, "/rename");
+    keys(&mut app, &[Enter]);
     text(&mut app, "build");
-    keys(&mut app, &[Enter, Down, Enter]);
+    keys(&mut app, &[Enter]);
     text(&mut app, "tests");
     keys(&mut app, &[Enter]);
     assert!(
@@ -142,9 +147,12 @@ fn window_and_pane_management_work_through_keyboard_events() {
             .iter()
             .any(|w| w.id == added.id && w.name == "tests")
     );
-    keys(&mut app, &[Backspace; 5]);
+
+    // `/kill` defaults to Window scope; empty Enter cancels, `"yes"` confirms kill.
+    text(&mut app, "/kill");
+    keys(&mut app, &[Enter]);
     text(&mut app, "tests");
-    keys(&mut app, &[Enter, Down, Down, Enter, Enter]);
+    keys(&mut app, &[Enter, Enter]);
     assert_eq!(
         server
             .client
@@ -153,7 +161,10 @@ fn window_and_pane_management_work_through_keyboard_events() {
             .len(),
         2
     );
-    keys(&mut app, &[Enter, Down, Down, Enter]);
+    text(&mut app, "/kill");
+    keys(&mut app, &[Enter]);
+    text(&mut app, "tests");
+    keys(&mut app, &[Enter]);
     text(&mut app, "yes");
     keys(&mut app, &[Enter]);
     assert_eq!(
@@ -194,6 +205,31 @@ fn window_and_pane_management_work_through_keyboard_events() {
             .expect("confirmed pane kill")
             .len(),
         1
+    );
+
+    // Exercise `+ New window` and `+ New session` matrix creation cells directly from Home.
+    let mut matrix_app = App::new(&server.client, AppOptions::default());
+    keys(&mut matrix_app, &[Down, Enter]);
+    text(&mut matrix_app, "from-matrix");
+    keys(&mut matrix_app, &[Enter]);
+    assert!(
+        server
+            .client
+            .list_windows(Some(&session.id))
+            .expect("matrix new window")
+            .iter()
+            .any(|w| w.name == "from-matrix")
+    );
+    keys(&mut matrix_app, &[Esc, Right, Enter]);
+    text(&mut matrix_app, "matrix-workspace");
+    keys(&mut matrix_app, &[Enter, Enter]);
+    assert!(
+        server
+            .client
+            .list_sessions()
+            .expect("matrix new session")
+            .iter()
+            .any(|s| s.name == "matrix-workspace")
     );
 }
 

@@ -7,7 +7,14 @@ const path = require('node:path');
 const test = require('node:test');
 const { EventEmitter } = require('node:events');
 const { PassThrough } = require('node:stream');
-const { maybeUpdate, compareVersions, detectGlobalPrefix, updatePrompt } = require('../lib/update.cjs');
+const {
+  maybeUpdate,
+  isUpdateCommand,
+  runUpdate,
+  compareVersions,
+  detectGlobalPrefix,
+  updatePrompt,
+} = require('../lib/update.cjs');
 
 const DAY = 24 * 60 * 60 * 1000;
 const NOW = 1_800_000_000_000;
@@ -162,6 +169,7 @@ test('confirmation installs the exact version in the detected prefix with indepe
   assert.equal(args[args.indexOf('--prefix') + 1], app.prefix);
   assert.equal(options.shell ?? false, false);
   assert.equal(options.stdio, 'inherit');
+  assert.match(app.calls.output.join(''), /Run jm \(or justmux\) again/);
 });
 
 test('failed npm update keeps the existing native application available', async (t) => {
@@ -359,4 +367,129 @@ test('numeric versions do not confuse 0.10 with 0.9 or suggest downgrades', asyn
     assert.equal(app.calls.prompt.length, 0);
     assert.equal(app.calls.install.length, 0);
   }
+});
+
+function explicitFixture(t, overrides = {}) {
+  const app = fixture(t, overrides);
+  const stdout = [];
+  const stderr = [];
+  const runtime = {
+    stdin: { isTTY: false },
+    stdout: { isTTY: false, write: (text) => { stdout.push(String(text)); } },
+    stderr: { isTTY: false, write: (text) => { stderr.push(String(text)); } },
+    env: { CI: '1', JUSTMUX_NO_UPDATE_CHECK: '1', NO_UPDATE_CHECK: '1' },
+    platform: 'darwin',
+    arch: 'arm64',
+    ...overrides.runtime,
+  };
+  return {
+    ...app,
+    stdout,
+    stderr,
+    options: { ...app.options, ...overrides, runtime },
+  };
+}
+
+test('isUpdateCommand recognizes update and upgrade subcommands only', () => {
+  for (const args of [['update'], ['upgrade'], ['update', '--check'], ['upgrade', '--help']]) {
+    assert.equal(isUpdateCommand(args), true, JSON.stringify(args));
+  }
+  for (const args of [[], ['doctor'], ['--fullscreen'], ['--inline'], ['resume'], null, undefined]) {
+    assert.equal(isUpdateCommand(args), false, JSON.stringify(args));
+  }
+});
+
+test('runUpdate upgrades global installs while bypassing passive opt-outs, cache, and dismissals', async (t) => {
+  const app = explicitFixture(t);
+  app.cache({ version: '0.1.0', dismissedVersion: '0.2.0', time: NOW });
+  assert.deepEqual(await runUpdate([], app.options), { action: 'exit', code: 0 });
+  assert.equal(app.calls.fetch.length, 1);
+  assert.equal(app.calls.prompt.length, 0);
+  assert.equal(app.calls.install.length, 1);
+  assert.equal(app.calls.install[0][0], 'npm');
+  assert.deepEqual(app.calls.install[0][1], [
+    'install', '--global', '--prefix', app.prefix, 'justmux@0.2.0', '--include=optional',
+  ]);
+  const out = app.stdout.join('');
+  assert.match(out, /Updating JustMux 0\.1\.0 -> 0\.2\.0\.\.\./);
+  assert.match(out, /JustMux updated to 0\.2\.0\. Run jm \(or justmux\) again to start the new version\./);
+  assert.equal(app.stderr.join(''), '');
+  const saved = JSON.parse(fs.readFileSync(app.options.cachePath, 'utf8'));
+  assert.equal(saved.version, '0.2.0');
+  assert.equal(saved.dismissedVersion, undefined);
+});
+
+test('runUpdate reports up-to-date on same, older, or prerelease versions without installing', async (t) => {
+  for (const version of ['0.1.0', '0.0.9', '0.2.0-beta.1']) {
+    const app = explicitFixture(t, {
+      fetchImpl: async () => Response.json({ name: manifest.name, version }),
+    });
+    app.cache({ version: '0.1.0', dismissedVersion: '0.2.0', time: NOW - 2 * DAY });
+    assert.deepEqual(await runUpdate([], app.options), { action: 'exit', code: 0 });
+    assert.equal(app.calls.install.length, 0);
+    assert.match(app.stdout.join(''), /JustMux 0\.1\.0 is already up to date\./);
+    assert.equal(app.stderr.join(''), '');
+    if (!version.includes('-')) {
+      const saved = JSON.parse(fs.readFileSync(app.options.cachePath, 'utf8'));
+      assert.equal(saved.dismissedVersion, '0.2.0');
+    }
+  }
+});
+
+test('runUpdate --check reports availability without installing and refreshes cache', async (t) => {
+  const app = explicitFixture(t);
+  app.cache({ version: '0.1.0', dismissedVersion: '0.1.9', time: NOW - DAY });
+  assert.deepEqual(await runUpdate(['--check'], app.options), { action: 'exit', code: 0 });
+  assert.equal(app.calls.install.length, 0);
+  const out = app.stdout.join('');
+  assert.match(out, /JustMux update available: 0\.1\.0 -> 0\.2\.0/);
+  assert.match(out, /Run 'jm update' \(or 'justmux update'\) to install\./);
+  assert.equal(JSON.parse(fs.readFileSync(app.options.cachePath, 'utf8')).dismissedVersion, '0.1.9');
+});
+
+test('runUpdate -h/--help and unknown flags return expected exit codes without network', async (t) => {
+  for (const flag of ['-h', '--help']) {
+    const app = explicitFixture(t);
+    assert.deepEqual(await runUpdate([flag], app.options), { action: 'exit', code: 0 });
+    assert.match(app.stdout.join(''), /Usage: jm update \[--check\]/);
+    assert.equal(app.calls.fetch?.length ?? 0, 0);
+    assert.equal(app.calls.install.length, 0);
+  }
+  const bad = explicitFixture(t);
+  assert.deepEqual(await runUpdate(['--bogus'], bad.options), { action: 'exit', code: 2 });
+  assert.match(bad.stderr.join(''), /unexpected argument '--bogus' for 'update'/);
+  assert.equal(bad.calls.install.length, 0);
+});
+
+test('runUpdate refuses self-update on non-global installs while allowing --check', async (t) => {
+  const app = explicitFixture(t);
+  app.options.packageRoot = path.join(app.directory, 'project', 'node_modules', 'justmux');
+  fs.mkdirSync(app.options.packageRoot, { recursive: true });
+  assert.deepEqual(await runUpdate([], app.options), { action: 'exit', code: 1 });
+  assert.match(app.stderr.join(''), /cannot self-update a non-global installation/);
+  assert.match(app.stderr.join(''), /npm install -g justmux@latest/);
+  assert.equal(app.calls.install.length, 0);
+
+  const checkApp = explicitFixture(t);
+  checkApp.options.packageRoot = app.options.packageRoot;
+  assert.deepEqual(await runUpdate(['--check'], checkApp.options), { action: 'exit', code: 0 });
+  assert.match(checkApp.stdout.join(''), /JustMux update available: 0\.1\.0 -> 0\.2\.0/);
+  assert.equal(checkApp.calls.install.length, 0);
+});
+
+test('runUpdate surfaces registry fetch and npm install failures cleanly', async (t) => {
+  const netFail = explicitFixture(t, {
+    fetchImpl: async () => { throw new Error('registry offline'); },
+  });
+  assert.deepEqual(await runUpdate([], netFail.options), { action: 'exit', code: 1 });
+  assert.match(netFail.stderr.join(''), /failed to check npm for updates \(registry offline\)/);
+  assert.match(netFail.stderr.join(''), /npm install -g justmux@latest/);
+  assert.equal(netFail.calls.install.length, 0);
+
+  const installFail = explicitFixture(t, {
+    install: async () => ({ status: 7, signal: null }),
+  });
+  assert.deepEqual(await runUpdate([], installFail.options), { action: 'exit', code: 7 });
+  assert.match(installFail.stderr.join(''), /JustMux update failed\./);
+  assert.match(installFail.stderr.join(''), /To retry: npm 'install' '--global' '--prefix'/);
 });

@@ -75,10 +75,14 @@ function run(args, options = {}) {
     );
   }
   const executable = resolveExecutable(manifest, { platform: runtime.platform, arch: runtime.arch });
+  const entry = typeof runtime.argv?.[1] === 'string' ? path.basename(runtime.argv[1]).toLowerCase() : '';
+  const env = entry === 'justmux' || entry === 'jm'
+    ? { ...runtime.env, JUSTMUX_INVOKED_AS: entry }
+    : runtime.env;
   try {
     // Replace Node rather than supervising tmux: signals, stdio and the PID
     // belong directly to the Rust application, then to tmux after attach.
-    return runtime.execve(executable, [executable, ...args], runtime.env);
+    return runtime.execve(executable, [executable, ...args], env);
   } catch (error) {
     throw new Error(`Cannot execute the JustMux native binary: ${error.message}`, { cause: error });
   }

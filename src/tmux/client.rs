@@ -384,8 +384,9 @@ impl Tmux for TmuxClient {
             return Ok(Vec::new());
         }
         let target = target.to_string();
-        let stdout = self.text(&["capture-pane", "-p", "-t", &target])?;
-        Ok(sanitize_captured_lines(&stdout, max_lines))
+        let start = format!("-{}", max_lines.min(2_000));
+        let stdout = self.text(&["capture-pane", "-p", "-e", "-S", &start, "-t", &target])?;
+        Ok(sanitize_captured_sgr_lines(&stdout, max_lines))
     }
     fn select(&self, target: &Target) -> TmuxResult<()> {
         match target {
@@ -449,6 +450,7 @@ impl Tmux for TmuxClient {
             .env_remove("JUSTMUX_CLIENT")
             .env_remove("JUSTMUX_PANE")
             .env_remove("JUSTMUX_POPUP")
+            .env_remove("JUSTMUX_INVOKED_AS")
             .env_remove("TMUX_POPUP");
         cmd
     }
@@ -465,11 +467,27 @@ fn same_socket(a: &Path, b: &Path) -> bool {
 /// output, drop trailing completely empty lines, and return up to the last
 /// `max_lines` lines.
 pub fn sanitize_captured_lines(raw: &str, max_lines: usize) -> Vec<String> {
+    sanitize_lines_with(raw, max_lines, sanitize_captured_line)
+}
+
+/// Sanitize captured terminal output while preserving valid SGR color and
+/// attribute escapes (`\x1b[...m`), stripping unsafe CSI/OSC/ESC and control
+/// sequences, collapsing SGR-only/blank lines to `""`, dropping trailing empty
+/// lines, and returning up to the last `max_lines` lines.
+pub fn sanitize_captured_sgr_lines(raw: &str, max_lines: usize) -> Vec<String> {
+    sanitize_lines_with(raw, max_lines, sanitize_captured_sgr_line)
+}
+
+fn sanitize_lines_with(
+    raw: &str,
+    max_lines: usize,
+    sanitize_line: fn(&str) -> String,
+) -> Vec<String> {
     if max_lines == 0 {
         return Vec::new();
     }
 
-    let mut lines: Vec<String> = raw.lines().map(sanitize_captured_line).collect();
+    let mut lines: Vec<String> = raw.lines().map(sanitize_line).collect();
     while lines.last().is_some_and(String::is_empty) {
         lines.pop();
     }
@@ -481,7 +499,16 @@ pub fn sanitize_captured_lines(raw: &str, max_lines: usize) -> Vec<String> {
 }
 
 fn sanitize_captured_line(line: &str) -> String {
+    sanitize_line_impl(line, false)
+}
+
+fn sanitize_captured_sgr_line(line: &str) -> String {
+    sanitize_line_impl(line, true)
+}
+
+fn sanitize_line_impl(line: &str, keep_sgr: bool) -> String {
     let mut out = String::with_capacity(line.len());
+    let mut has_visible_non_ws = false;
     let mut chars = line.chars().peekable();
     while let Some(ch) = chars.next() {
         if ch == '\x1b' {
@@ -489,15 +516,31 @@ fn sanitize_captured_line(line: &str) -> String {
                 // CSI: ESC [ <params/intermediates 0x20..=0x3f>* <final 0x40..=0x7e>
                 Some('[') => {
                     chars.next();
+                    let mut params = String::new();
+                    let mut final_ch = None;
                     while let Some(&next) = chars.peek() {
                         if next.is_ascii() && (0x20..=0x3f).contains(&(next as u8)) {
+                            if keep_sgr {
+                                params.push(next);
+                            }
                             chars.next();
                         } else if next.is_ascii() && (0x40..=0x7e).contains(&(next as u8)) {
+                            final_ch = Some(next);
                             chars.next();
                             break;
                         } else {
                             break;
                         }
+                    }
+                    if keep_sgr
+                        && final_ch == Some('m')
+                        && params
+                            .bytes()
+                            .all(|b| matches!(b, b'0'..=b'9' | b';' | b':'))
+                    {
+                        out.push_str("\x1b[");
+                        out.push_str(&params);
+                        out.push('m');
                     }
                 }
                 // OSC: ESC ] ... (BEL | ESC \ | C1 ST)
@@ -532,12 +575,22 @@ fn sanitize_captured_line(line: &str) -> String {
         } else if ch == '\t' {
             out.push_str("  ");
         } else if !ch.is_control() {
+            if !ch.is_whitespace() {
+                has_visible_non_ws = true;
+            }
             out.push(ch);
         }
     }
-    let trimmed_len = out.trim_end().len();
-    out.truncate(trimmed_len);
-    out
+    if keep_sgr {
+        if !has_visible_non_ws {
+            return String::new();
+        }
+        out.trim_end_matches(' ').to_owned()
+    } else {
+        let trimmed_len = out.trim_end().len();
+        out.truncate(trimmed_len);
+        out
+    }
 }
 
 #[cfg(test)]
@@ -581,11 +634,20 @@ mod tests {
         }
 
         fn wait_for_capture(&self, target: &Target, expected: &str) -> Vec<String> {
+            self.wait_for_capture_lines(target, 20, expected)
+        }
+
+        fn wait_for_capture_lines(
+            &self,
+            target: &Target,
+            max_lines: usize,
+            expected: &str,
+        ) -> Vec<String> {
             let deadline = Instant::now() + Duration::from_secs(3);
             loop {
                 let lines = self
                     .client
-                    .capture_pane(target, 20)
+                    .capture_pane(target, max_lines)
                     .expect("capture_pane succeeded");
                 if lines.iter().any(|line| line.contains(expected)) {
                     return lines;
@@ -799,5 +861,127 @@ mod tests {
                 .capture_pane(&Target::Pane(PaneId::new("%9999").expect("id")), 5),
             Err(TmuxError::PaneNotFound)
         ));
+    }
+
+    #[test]
+    fn attach_command_clears_justmux_and_tmux_env_vars() {
+        let client = TmuxClient::new(SocketSpec::Name("jm-env-test".into()));
+        let cmd = client.attach_command(&Target::Session(SessionId::new("$1").expect("id")));
+        let removed: Vec<&std::ffi::OsStr> = cmd
+            .get_envs()
+            .filter_map(|(key, value)| value.is_none().then_some(key))
+            .collect();
+        for var in [
+            "TMUX",
+            "TMUX_PANE",
+            "JUSTMUX_CLIENT",
+            "JUSTMUX_PANE",
+            "JUSTMUX_POPUP",
+            "JUSTMUX_INVOKED_AS",
+            "TMUX_POPUP",
+        ] {
+            assert!(
+                removed.contains(&std::ffi::OsStr::new(var)),
+                "attach_command should remove {var}"
+            );
+        }
+    }
+
+    #[test]
+    fn capture_pane_includes_scrollback_history_on_private_socket() {
+        let server = PrivateTmuxServer::new();
+        let out = server.tmux(&[
+            "new-session",
+            "-d",
+            "-s",
+            "scroll",
+            "-x",
+            "80",
+            "-y",
+            "10",
+            "sh -c 'i=1; while [ \"$i\" -le 40 ]; do printf \"LINE_%02d\\n\" \"$i\"; i=$((i+1)); done; sleep 30'",
+        ]);
+        assert!(
+            out.status.success(),
+            "new-session failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+
+        let sessions = server.client.list_sessions().expect("list sessions");
+        assert_eq!(sessions.len(), 1);
+        let target = Target::Session(sessions[0].id.clone());
+
+        let expected_all: Vec<String> = (1..=40).map(|i| format!("LINE_{i:02}")).collect();
+        let captured_all = server.wait_for_capture_lines(&target, 200, "LINE_40");
+        assert_eq!(captured_all, expected_all);
+
+        let expected_tail: Vec<String> = (36..=40).map(|i| format!("LINE_{i:02}")).collect();
+        let captured_tail = server
+            .client
+            .capture_pane(&target, 5)
+            .expect("capture_pane tail");
+        assert_eq!(captured_tail, expected_tail);
+    }
+
+    #[test]
+    fn sanitize_sgr_preserves_colors_and_strips_unsafe_sequences() {
+        let raw = concat!(
+            "\x1b[2J\x1b[1;1H\x1b[?2004h\x1b]0;title\x07\x1bM\x1b(B",
+            "\x1b[1;32mGREEN\x1b[0m\t\x1b[38;5;208m256\x1b[m  \n",
+            "\x1b[38;2;120;180;255m\x1b[K   \x1b[0m\t\x07\x08\n",
+            "\x1b[38;2;120;180;255mRGB\x1b[0m \x1b[38:2::255:0:128mCOLON\x1b[0m\x1b[>4;2m\r\n",
+            "\x1b[31m   \x1b[0m   \n",
+        );
+        assert_eq!(
+            sanitize_captured_sgr_lines(raw, 10),
+            vec![
+                "\x1b[1;32mGREEN\x1b[0m  \x1b[38;5;208m256\x1b[m".to_string(),
+                String::new(),
+                "\x1b[38;2;120;180;255mRGB\x1b[0m \x1b[38:2::255:0:128mCOLON\x1b[0m".to_string(),
+            ]
+        );
+        assert_eq!(
+            sanitize_captured_sgr_lines(raw, 1),
+            vec!["\x1b[38;2;120;180;255mRGB\x1b[0m \x1b[38:2::255:0:128mCOLON\x1b[0m".to_string()]
+        );
+        assert!(sanitize_captured_sgr_lines(raw, 0).is_empty());
+        assert!(sanitize_captured_sgr_lines("\x1b[32m   \x1b[0m\n", 5).is_empty());
+    }
+
+    #[test]
+    fn capture_pane_preserves_sgr_colors_on_private_socket() {
+        let server = PrivateTmuxServer::new();
+        let out = server.tmux(&[
+            "new-session",
+            "-d",
+            "-s",
+            "colors",
+            "-x",
+            "80",
+            "-y",
+            "8",
+            "sh -c 'printf \"\\033[1;32mGREEN_OK\\033[0m \\033[38;2;120;180;255mRGB_OK\\033[0m\\n\"; sleep 30'",
+        ]);
+        assert!(
+            out.status.success(),
+            "new-session failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+
+        let sessions = server.client.list_sessions().expect("list sessions");
+        assert_eq!(sessions.len(), 1);
+        let target = Target::Session(sessions[0].id.clone());
+
+        let lines = server.wait_for_capture_lines(&target, 20, "RGB_OK");
+        assert_eq!(lines.len(), 1);
+        let line = &lines[0];
+        assert!(line.contains("\x1b["), "expected SGR escape in {line:?}");
+        assert!(line.contains("32m"), "expected green SGR in {line:?}");
+        assert!(
+            line.contains("38;2;120;180;255m"),
+            "expected RGB SGR in {line:?}"
+        );
+        assert!(line.contains("GREEN_OK"), "missing GREEN_OK in {line:?}");
+        assert!(line.contains("RGB_OK"), "missing RGB_OK in {line:?}");
     }
 }

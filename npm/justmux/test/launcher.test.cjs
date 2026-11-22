@@ -74,6 +74,29 @@ test('exec replacement passes argv and environment unchanged without invoking a 
   assert.deepEqual(invoked, ['/native/with spaces/jm', ['/native/with spaces/jm', ...args], env]);
 });
 
+test('exec replacement passes JUSTMUX_INVOKED_AS for justmux and jm entry names', () => {
+  const baseEnv = { TERM: 'xterm-256color' };
+  for (const [argv1, expected] of [['/usr/local/bin/justmux', 'justmux'], ['/usr/local/bin/jm', 'jm']]) {
+    let invoked;
+    run(['doctor'], {
+      manifest,
+      runtime: {
+        platform: 'linux',
+        arch: 'x64',
+        argv: ['node', argv1],
+        env: baseEnv,
+        execve(...values) { invoked = values; },
+      },
+      resolveExecutable: () => '/native/bin/jm',
+    });
+    assert.deepEqual(invoked, [
+      '/native/bin/jm',
+      ['/native/bin/jm', 'doctor'],
+      { ...baseEnv, JUSTMUX_INVOKED_AS: expected },
+    ]);
+  }
+});
+
 test('older runtimes fail instead of leaving a supervising Node process', () => {
   assert.throws(() => run([], {
     manifest, runtime: { platform: 'darwin', arch: 'arm64' },

@@ -115,6 +115,11 @@ class Screen:
                     if end >= len(self.pending): break
                     i = end + (1 if self.pending[end] == "\x07" else 2)
                     continue
+                if self.pending[i + 1] in "()*+":
+                    if i + 2 >= len(self.pending):
+                        break
+                    i += 3
+                    continue
                 i += 2
                 continue
             if char == "\r": self.col = 0

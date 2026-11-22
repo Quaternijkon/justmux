@@ -7,7 +7,7 @@ use std::{
 
 use crate::{
     terminal::{INLINE_HEIGHT, ScreenMode},
-    ui::{ComposerMode, Theme, ThemePreset},
+    ui::{ComposerMode, EmblemMode, Language, Theme, ThemePreset},
 };
 
 pub const DEFAULT_CONFIG_REL_PATH: &str = ".config/justmux/config.toml";
@@ -21,10 +21,12 @@ pub struct Config {
     pub theme: ThemePreset,
     pub composer_mode: ComposerMode,
     pub live_preview: bool,
+    pub emblem_mode: EmblemMode,
     pub mouse: bool,
     pub inline_height: u16,
     pub no_color: bool,
     pub ascii: bool,
+    pub language: Language,
 }
 
 impl Default for Config {
@@ -34,10 +36,12 @@ impl Default for Config {
             theme: ThemePreset::AntigravityAurora,
             composer_mode: ComposerMode::CommandJump,
             live_preview: true,
+            emblem_mode: EmblemMode::Spin,
             mouse: true,
             inline_height: INLINE_HEIGHT,
             no_color: false,
             ascii: false,
+            language: Language::En,
         }
     }
 }
@@ -48,6 +52,7 @@ impl Config {
         Theme {
             no_color: self.no_color,
             ascii: self.ascii,
+            language: self.language,
             ..Theme::default()
         }
         .with_preset(
@@ -73,6 +78,9 @@ impl Config {
         if let Some(live_preview) = partial.live_preview {
             self.live_preview = live_preview;
         }
+        if let Some(emblem_mode) = partial.emblem_mode {
+            self.emblem_mode = emblem_mode;
+        }
         if let Some(mouse) = partial.mouse {
             self.mouse = mouse;
         }
@@ -84,6 +92,9 @@ impl Config {
         }
         if let Some(ascii) = partial.ascii {
             self.ascii = ascii;
+        }
+        if let Some(language) = partial.language {
+            self.language = language;
         }
     }
 
@@ -98,8 +109,10 @@ impl Config {
              theme = \"{}\"\n\
              composer_mode = \"{}\"\n\
              live_preview = {}\n\
+             emblem_mode = \"{}\"\n\
              no_color = {}\n\
-             ascii = {}\n\n\
+             ascii = {}\n\
+             language = \"{}\"\n\n\
              [terminal]\n\
              screen_mode = \"{}\"\n\
              mouse = {}\n\
@@ -107,8 +120,10 @@ impl Config {
             self.theme.slug(),
             composer_mode_slug(self.composer_mode),
             self.live_preview,
+            self.emblem_mode.as_str(),
             self.no_color,
             self.ascii,
+            self.language.as_str(),
             self.screen_mode.as_str(),
             self.mouse,
             inline_height,
@@ -141,10 +156,12 @@ pub struct PartialConfig {
     pub theme: Option<ThemePreset>,
     pub composer_mode: Option<ComposerMode>,
     pub live_preview: Option<bool>,
+    pub emblem_mode: Option<EmblemMode>,
     pub mouse: Option<bool>,
     pub inline_height: Option<u16>,
     pub no_color: Option<bool>,
     pub ascii: Option<bool>,
+    pub language: Option<Language>,
 }
 
 /// CLI arguments that take highest precedence over env vars and `config.toml`.
@@ -224,10 +241,14 @@ pub fn starter_config_toml() -> &'static str {
      composer_mode = \"command-jump\"\n\n\
      # Show live tmux pane previews in Fullscreen studio, Live Radar, /list, and /resume\n\
      live_preview = true\n\n\
+     # Home Hydra emblem mode: \"static\" | \"spin\" | \"inverted-spin\"\n\
+     emblem_mode = \"spin\"\n\n\
      # Disable ANSI colors (also activated by NO_COLOR or TERM=dumb)\n\
      no_color = false\n\n\
      # Use pure ASCII box borders and symbols instead of Unicode\n\
      ascii = false\n\n\
+     # Interface language: \"en\" (English) | \"zh\" (Chinese)\n\
+     language = \"en\"\n\n\
      [terminal]\n\
      # Display mode: \"fullscreen\" (alternate screen) | \"inline\" (native scrollback)\n\
      screen_mode = \"fullscreen\"\n\n\
@@ -310,6 +331,10 @@ struct EnvSnapshot {
     lang: Option<String>,
     justmux_theme: Option<String>,
     justmux_screen_mode: Option<String>,
+    justmux_emblem_spin: Option<String>,
+    justmux_emblem_mode: Option<String>,
+    justmux_language: Option<String>,
+    justmux_lang: Option<String>,
 }
 
 impl EnvSnapshot {
@@ -329,6 +354,10 @@ impl EnvSnapshot {
             lang: std::env::var("LANG").ok(),
             justmux_theme: std::env::var("JUSTMUX_THEME").ok(),
             justmux_screen_mode: std::env::var("JUSTMUX_SCREEN_MODE").ok(),
+            justmux_emblem_spin: std::env::var("JUSTMUX_EMBLEM_SPIN").ok(),
+            justmux_emblem_mode: std::env::var("JUSTMUX_EMBLEM_MODE").ok(),
+            justmux_language: std::env::var("JUSTMUX_LANGUAGE").ok(),
+            justmux_lang: std::env::var("JUSTMUX_LANG").ok(),
         }
     }
 
@@ -450,6 +479,42 @@ fn load_with_env(overrides: &CliOverrides, env: &EnvSnapshot) -> Result<LoadedCo
         && let Some(mode) = ScreenMode::from_name(raw_mode)
     {
         config.screen_mode = mode;
+    }
+    if let Some(raw_spin) = env
+        .justmux_emblem_spin
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        && let Some(mode) = EmblemMode::from_name(raw_spin)
+    {
+        config.emblem_mode = mode;
+    }
+    if let Some(raw_mode) = env
+        .justmux_emblem_mode
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        && let Some(mode) = EmblemMode::from_name(raw_mode)
+    {
+        config.emblem_mode = mode;
+    }
+    if let Some(raw_lang) = env
+        .justmux_lang
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        && let Some(language) = Language::from_name(raw_lang)
+    {
+        config.language = language;
+    }
+    if let Some(raw_lang) = env
+        .justmux_language
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        && let Some(language) = Language::from_name(raw_lang)
+    {
+        config.language = language;
     }
 
     if let Some(mode) = overrides.screen_mode {
@@ -578,6 +643,28 @@ fn apply_kv(
         "live_preview" | "preview" => {
             partial.live_preview = Some(parse_toml_bool(val, key, line_no)?);
         }
+        "emblem_mode" | "hydra_mode" | "emblem_spin" | "hydra_spin" | "rotate_emblem"
+        | "animate_emblem" => {
+            if val.starts_with('"') || val.starts_with('\'') {
+                let s = parse_toml_string(val, line_no)?;
+                let mode = EmblemMode::from_name(&s).ok_or_else(|| {
+                    ConfigError::at_line(
+                        line_no,
+                        format!(
+                            "invalid `{key}` value `{s}` (expected \"static\", \"spin\", or \"inverted-spin\")"
+                        ),
+                    )
+                })?;
+                partial.emblem_mode = Some(mode);
+            } else {
+                let enabled = parse_toml_bool(val, key, line_no)?;
+                partial.emblem_mode = Some(if enabled {
+                    EmblemMode::Spin
+                } else {
+                    EmblemMode::Static
+                });
+            }
+        }
         "mouse" => {
             partial.mouse = Some(parse_toml_bool(val, key, line_no)?);
         }
@@ -589,6 +676,15 @@ fn apply_kv(
         }
         "ascii" => {
             partial.ascii = Some(parse_toml_bool(val, key, line_no)?);
+        }
+        "language" | "lang" => {
+            let parsed_str = parse_toml_string(val, line_no)?;
+            partial.language = Some(Language::from_name(&parsed_str).ok_or_else(|| {
+                ConfigError::at_line(
+                    line_no,
+                    format!("invalid language `{parsed_str}` (expected en or zh)"),
+                )
+            })?);
         }
         _ => {
             return Err(ConfigError::at_line(
@@ -752,8 +848,10 @@ mod tests {
         let def = Config::default();
         assert_eq!(def.screen_mode, ScreenMode::Fullscreen);
         assert_eq!(def.theme, ThemePreset::AntigravityAurora);
+        assert_eq!(def.language, Language::En);
         assert_eq!(def.composer_mode, ComposerMode::CommandJump);
         assert!(def.live_preview);
+        assert_eq!(def.emblem_mode, EmblemMode::Spin);
         assert!(def.mouse);
         assert_eq!(def.inline_height, 16);
         assert!(!def.no_color);
@@ -764,21 +862,39 @@ mod tests {
         from_starter.apply(&starter_partial);
         assert_eq!(from_starter, def);
 
-        let custom = Config {
-            screen_mode: ScreenMode::Inline,
-            theme: ThemePreset::CodexEmerald,
-            composer_mode: ComposerMode::LiveRadar,
-            live_preview: false,
-            mouse: false,
-            inline_height: 24,
-            no_color: true,
-            ascii: true,
-        };
-        let toml = custom.to_toml();
-        let reparsed = parse_config_str(&toml).expect("reparse to_toml");
-        let mut round_tripped = Config::default();
-        round_tripped.apply(&reparsed);
-        assert_eq!(round_tripped, custom);
+        for (mode, language) in [
+            (EmblemMode::InvertedSpin, Language::Zh),
+            (EmblemMode::Static, Language::En),
+            (EmblemMode::Spin, Language::Zh),
+        ] {
+            let custom = Config {
+                screen_mode: ScreenMode::Inline,
+                theme: ThemePreset::CodexEmerald,
+                language,
+                composer_mode: ComposerMode::LiveRadar,
+                live_preview: false,
+                emblem_mode: mode,
+                mouse: false,
+                inline_height: 24,
+                no_color: true,
+                ascii: true,
+            };
+            let toml = custom.to_toml();
+            assert!(
+                toml.contains(&format!("emblem_mode = \"{}\"", mode.as_str())),
+                "to_toml missing emblem_mode = {:?}: {toml}",
+                mode.as_str()
+            );
+            assert!(
+                toml.contains(&format!("language = \"{}\"", language.as_str())),
+                "to_toml missing language = {:?}: {toml}",
+                language.as_str()
+            );
+            let reparsed = parse_config_str(&toml).expect("reparse to_toml");
+            let mut round_tripped = Config::default();
+            round_tripped.apply(&reparsed);
+            assert_eq!(round_tripped, custom);
+        }
     }
 
     #[test]
@@ -786,6 +902,7 @@ mod tests {
         let src = "\u{feff}# leading comment\n\
                    [ui]\n\
                    palette = 'claude' # inline comment with \"quotes\"\n\
+                   language = \"zh\"\n\
                    mode = \"radar\"\n\
                    preview = false\n\
                    no_color = true\n\
@@ -800,6 +917,7 @@ mod tests {
 
         let parsed = parse_config_str(src).expect("valid config");
         assert_eq!(parsed.theme, Some(ThemePreset::ClaudeWarmth));
+        assert_eq!(parsed.language, Some(Language::Zh));
         assert_eq!(parsed.composer_mode, Some(ComposerMode::LiveRadar));
         assert_eq!(parsed.live_preview, Some(false));
         assert_eq!(parsed.no_color, Some(true));
@@ -808,6 +926,11 @@ mod tests {
         assert_eq!(parsed.mouse, Some(false));
         assert_eq!(parsed.inline_height, Some(28));
 
+        let lang_alias = parse_config_str("lang = 'zh-CN'\n").expect("lang alias");
+        assert_eq!(lang_alias.language, Some(Language::Zh));
+        let lang_en = parse_config_str("lang = \"English\"\n").expect("lang en");
+        assert_eq!(lang_en.language, Some(Language::En));
+
         let quick = parse_config_str("mode = \"quick\"\n").expect("quick alias");
         assert_eq!(quick.composer_mode, Some(ComposerMode::QuickLaunch));
         let quick_full =
@@ -815,6 +938,33 @@ mod tests {
         assert_eq!(quick_full.composer_mode, Some(ComposerMode::QuickLaunch));
         let jump = parse_config_str("composer_mode = 'jump'\n").expect("jump alias");
         assert_eq!(jump.composer_mode, Some(ComposerMode::CommandJump));
+
+        let hydra_spin = parse_config_str("hydra_spin = false\n").expect("hydra_spin alias");
+        assert_eq!(hydra_spin.emblem_mode, Some(EmblemMode::Static));
+        let rotate_emblem =
+            parse_config_str("rotate_emblem = true\n").expect("rotate_emblem alias");
+        assert_eq!(rotate_emblem.emblem_mode, Some(EmblemMode::Spin));
+        let animate_emblem =
+            parse_config_str("animate_emblem = false\n").expect("animate_emblem alias");
+        assert_eq!(animate_emblem.emblem_mode, Some(EmblemMode::Static));
+        let legacy_true = parse_config_str("emblem_spin = true\n").expect("emblem_spin true");
+        assert_eq!(legacy_true.emblem_mode, Some(EmblemMode::Spin));
+        let legacy_false = parse_config_str("emblem_spin = false\n").expect("emblem_spin false");
+        assert_eq!(legacy_false.emblem_mode, Some(EmblemMode::Static));
+
+        for (raw, expected) in [
+            ("emblem_mode = \"spin\"\n", EmblemMode::Spin),
+            ("emblem_mode = 'inverted-spin'\n", EmblemMode::InvertedSpin),
+            ("emblem_mode = \"static\"\n", EmblemMode::Static),
+            ("hydra_mode = \"inverted\"\n", EmblemMode::InvertedSpin),
+            (
+                "emblem_spin = \"inverted-spin\"\n",
+                EmblemMode::InvertedSpin,
+            ),
+        ] {
+            let parsed_mode = parse_config_str(raw).expect(raw);
+            assert_eq!(parsed_mode.emblem_mode, Some(expected), "{raw}");
+        }
 
         let min_h = parse_config_str("inline_height = 8\n").expect("min inline_height");
         assert_eq!(min_h.inline_height, Some(8));
@@ -843,6 +993,10 @@ mod tests {
             ("theme = \"unknown\"\n", 1),
             ("screen_mode = \"tiled\"\n", 1),
             ("composer_mode = \"wizard\"\n", 1),
+            ("emblem_mode = \"wobble\"\n", 1),
+            ("emblem_mode = \"quad-hydra\"\n", 1),
+            ("emblem_mode = spin\n", 1),
+            ("pixel_glyphs = \"auto\"\n", 1),
             ("mouse = \"yes\"\n", 1),
             ("inline_height = 7\n", 1),
             ("inline_height = 41\n", 1),
@@ -860,6 +1014,19 @@ mod tests {
                 "Display missing line number: {err}"
             );
         }
+
+        let bad_emblem = parse_config_str("emblem_mode = \"wobble\"\n").expect_err("invalid mode");
+        let msg = bad_emblem.to_string();
+        assert!(msg.contains("static"));
+        assert!(msg.contains("spin"));
+        assert!(msg.contains("inverted-spin"));
+        assert!(!msg.contains("quad-hydra"));
+
+        let removed_qh = parse_config_str("emblem_mode = \"quad-hydra\"\n").expect_err("removed");
+        assert!(removed_qh.to_string().contains("inverted-spin"));
+
+        let removed_pg = parse_config_str("pixel_glyphs = \"auto\"\n").expect_err("removed key");
+        assert!(removed_pg.to_string().contains("unknown config key"));
     }
 
     #[test]
@@ -970,8 +1137,10 @@ mod tests {
         let file_cfg = Config {
             screen_mode: ScreenMode::Inline,
             theme: ThemePreset::ClaudeWarmth,
+            language: Language::Zh,
             composer_mode: ComposerMode::QuickLaunch,
             live_preview: false,
+            emblem_mode: EmblemMode::Static,
             mouse: false,
             inline_height: 22,
             no_color: false,
@@ -997,7 +1166,9 @@ mod tests {
             no_color_set: true,
             lc_all: Some("C".into()),
             justmux_theme: Some("codex".into()),
+            justmux_language: Some("en".into()),
             justmux_screen_mode: Some("fullscreen".into()),
+            justmux_emblem_spin: Some(" YES ".into()),
             ..EnvSnapshot::default()
         };
         let after_env = load_with_env(
@@ -1009,11 +1180,102 @@ mod tests {
         )
         .expect("env overrides file");
         assert_eq!(after_env.config.theme, ThemePreset::CodexEmerald);
+        assert_eq!(after_env.config.language, Language::En);
         assert_eq!(after_env.config.screen_mode, ScreenMode::Fullscreen);
+        assert_eq!(after_env.config.emblem_mode, EmblemMode::Spin);
         assert!(after_env.config.no_color);
         assert!(after_env.config.ascii);
         assert_eq!(after_env.config.inline_height, 22);
         assert!(!after_env.config.mouse);
+
+        // System $LANG alone must NOT auto-switch the app language away from English default:
+        let system_zh = load_with_env(
+            &CliOverrides::default(),
+            &EnvSnapshot {
+                lang: Some("zh_CN.UTF-8".into()),
+                ..EnvSnapshot::default()
+            },
+        )
+        .expect("system locale must keep English default");
+        assert_eq!(system_zh.config.language, Language::En);
+
+        // JUSTMUX_LANGUAGE takes precedence over JUSTMUX_LANG:
+        let lang_env = load_with_env(
+            &CliOverrides::default(),
+            &EnvSnapshot {
+                justmux_lang: Some("zh".into()),
+                justmux_language: Some("en".into()),
+                ..EnvSnapshot::default()
+            },
+        )
+        .expect("JUSTMUX_LANGUAGE overrides JUSTMUX_LANG");
+        assert_eq!(lang_env.config.language, Language::En);
+        let lang_fallback = load_with_env(
+            &CliOverrides::default(),
+            &EnvSnapshot {
+                justmux_lang: Some("zh-CN".into()),
+                ..EnvSnapshot::default()
+            },
+        )
+        .expect("JUSTMUX_LANG sets Zh");
+        assert_eq!(lang_fallback.config.language, Language::Zh);
+
+        // JUSTMUX_EMBLEM_MODE takes precedence over JUSTMUX_EMBLEM_SPIN, and both support aliases:
+        let both_env = load_with_env(
+            &CliOverrides::default(),
+            &EnvSnapshot {
+                justmux_emblem_spin: Some("0".into()),
+                justmux_emblem_mode: Some("inverted-spin".into()),
+                ..EnvSnapshot::default()
+            },
+        )
+        .expect("JUSTMUX_EMBLEM_MODE overrides JUSTMUX_EMBLEM_SPIN");
+        assert_eq!(both_env.config.emblem_mode, EmblemMode::InvertedSpin);
+
+        for (raw, expected) in [
+            ("0", EmblemMode::Static),
+            ("false", EmblemMode::Static),
+            ("static", EmblemMode::Static),
+            ("NO", EmblemMode::Static),
+            ("off", EmblemMode::Static),
+            ("1", EmblemMode::Spin),
+            ("True", EmblemMode::Spin),
+            ("spin", EmblemMode::Spin),
+            ("on", EmblemMode::Spin),
+            ("inverted", EmblemMode::InvertedSpin),
+            ("inverted-spin", EmblemMode::InvertedSpin),
+            ("quad-hydra", EmblemMode::Spin),
+            ("quad-cutout", EmblemMode::Spin),
+            ("quad-prism", EmblemMode::Spin),
+            ("invalid", EmblemMode::Spin),
+            ("", EmblemMode::Spin),
+        ] {
+            let spin_loaded = load_with_env(
+                &CliOverrides::default(),
+                &EnvSnapshot {
+                    justmux_emblem_spin: Some(raw.into()),
+                    ..EnvSnapshot::default()
+                },
+            )
+            .expect("JUSTMUX_EMBLEM_SPIN parsing");
+            assert_eq!(
+                spin_loaded.config.emblem_mode, expected,
+                "JUSTMUX_EMBLEM_SPIN={raw:?}"
+            );
+
+            let mode_loaded = load_with_env(
+                &CliOverrides::default(),
+                &EnvSnapshot {
+                    justmux_emblem_mode: Some(raw.into()),
+                    ..EnvSnapshot::default()
+                },
+            )
+            .expect("JUSTMUX_EMBLEM_MODE parsing");
+            assert_eq!(
+                mode_loaded.config.emblem_mode, expected,
+                "JUSTMUX_EMBLEM_MODE={raw:?}"
+            );
+        }
 
         // CLI overrides env + file:
         let after_cli = load_with_env(

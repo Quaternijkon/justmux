@@ -107,8 +107,11 @@ pub trait Tmux {
 
     fn kill_pane(&self, id: &PaneId) -> TmuxResult<()>;
 
-    /// Capture the visible lines of `target` (session's active pane, window's active pane, or pane)
-    /// as plain printable lines (ANSI escapes stripped), trimmed to the last `max_lines` non-empty block.
+    /// Capture scrollback history plus visible pane lines of `target`
+    /// (session's active pane, window's active pane, or pane) with SGR
+    /// color/attribute escapes (`\x1b[...m`) preserved and unsafe cursor,
+    /// OSC, and control sequences stripped, trimmed to the last `max_lines`
+    /// lines.
     fn capture_pane(&self, _target: &Target, _max_lines: usize) -> TmuxResult<Vec<String>> {
         Ok(Vec::new())
     }

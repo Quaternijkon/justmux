@@ -42,9 +42,12 @@ Install or update from [npm](https://www.npmjs.com/package/justmux):
 
 ```sh
 npm install -g justmux@latest
+jm        # or: justmux
 ```
 
-Both `jm` and `justmux` start the same program. npm selects the binary for
+Update anytime with `jm update` (or `justmux update`), or check first with
+`jm update --check`; you can also re-run `npm install -g justmux@latest`. Both
+`jm` and `justmux` start the same program. npm selects the binary for
 macOS ARM64 or Linux x64. The Linux package is a static musl build and works on
 both glibc and musl systems. Keep optional dependencies enabled.
 tmux must be installed separately; for example, `brew install tmux` on macOS

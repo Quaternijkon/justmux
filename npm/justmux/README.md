@@ -11,7 +11,9 @@ jm
 justmux
 ```
 
-Run the same npm install command to update to the latest release.
+Run `jm update` (or `justmux update`) to check npm and update a global
+installation directly, or `jm update --check` to check without installing. You
+can also re-run the `npm install` command above.
 
 Global installations also check npm at most once a day when launched
 interactively without a command, including `--fullscreen` and `--inline`. A newer version opens

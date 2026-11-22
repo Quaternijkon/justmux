@@ -171,6 +171,100 @@ globalThis.fetch = async () => {
             self.verify(terminal, run, cache, "skip")
         print("PASS yes-no-letters-ignored", flush=True)
 
+    def explicit_update_case(self, label, latest, expect_install):
+        run = self.directory / label
+        run.mkdir()
+        cache = run / "cache/justmux/update.json"
+        cache.parent.mkdir(parents=True)
+        cache.write_text(
+            json.dumps(
+                {
+                    "version": self.latest,
+                    "dismissedVersion": self.latest,
+                    "time": int(time.time() * 1000),
+                }
+            )
+        )
+        preload = run / "mock-fetch.cjs"
+        preload.write_text(
+            "'use strict';\n"
+            "globalThis.fetch = async (url) => {\n"
+            "  require('node:fs').writeFileSync(process.env.JUSTMUX_TEST_FETCH_LOG, String(url));\n"
+            "  const body = JSON.stringify({ name: process.env.JUSTMUX_TEST_PKG, version: process.env.JUSTMUX_TEST_LATEST });\n"
+            "  return new Response(body, {\n"
+            "    status: 200,\n"
+            "    headers: { 'content-type': 'application/json', 'content-length': String(Buffer.byteLength(body)) },\n"
+            "  });\n"
+            "};\n"
+        )
+        env = os.environ.copy()
+        for name in (
+            "TMUX",
+            "TMUX_PANE",
+            "JUSTMUX_CLIENT",
+            "JUSTMUX_PANE",
+            "JUSTMUX_POPUP",
+            "TMUX_POPUP",
+            "NODE_OPTIONS",
+        ):
+            env.pop(name, None)
+        env.update({
+            "TERM": "xterm-256color",
+            "CI": "1",
+            "JUSTMUX_NO_UPDATE_CHECK": "1",
+            "XDG_CACHE_HOME": str(run / "cache"),
+            "PATH": str(self.tools) + os.pathsep + env.get("PATH", ""),
+            "JUSTMUX_TEST_NATIVE_LOG": str(run / "native.json"),
+            "JUSTMUX_TEST_NPM_LOG": str(run / "npm.json"),
+            "JUSTMUX_TEST_FETCH_LOG": str(run / "fetch.txt"),
+            "JUSTMUX_TEST_PKG": self.name,
+            "JUSTMUX_TEST_LATEST": latest,
+            "JUSTMUX_TEST_NPM_STATUS": "0",
+        })
+        support.clean_env = lambda: env.copy()
+        with support.PTY([self.node, "--require", str(preload), str(self.entry), "update"]) as terminal:
+            terminal.wait_exit()
+            require(
+                os.waitstatus_to_exitcode(terminal.status) == 0,
+                f"unexpected explicit update status {terminal.status}: {bytes(terminal.out)!r}",
+            )
+            require(
+                support.termios.tcgetattr(terminal.fd) == terminal.baseline,
+                "terminal termios changed during explicit update",
+            )
+            terminal.assert_native_screen()
+            require(b"\x1b[?25l" not in terminal.out, "explicit update hid cursor")
+            out_text = bytes(terminal.out).decode("utf-8", errors="replace")
+            require(
+                "JustMux update available" not in out_text,
+                f"explicit update unexpectedly showed passive picker: {out_text!r}",
+            )
+            require((run / "fetch.txt").exists(), "explicit update bypassed fetch")
+            require(not (run / "native.json").exists(), "explicit update launched native binary")
+            if expect_install:
+                require(f"Updating JustMux {self.version} -> {latest}" in out_text, out_text)
+                require(f"JustMux updated to {latest}." in out_text, out_text)
+                npm_file = run / "npm.json"
+                require(npm_file.exists(), "explicit update did not run npm install")
+                npm = json.loads(npm_file.read_text())
+                require(
+                    npm["argv"] == [
+                        "install",
+                        "--global",
+                        "--prefix",
+                        str(self.prefix),
+                        f"{self.name}@{latest}",
+                        "--include=optional",
+                    ],
+                    f"unexpected npm argv: {npm['argv']!r}",
+                )
+                saved = json.loads(cache.read_text())
+                require("dismissedVersion" not in saved, f"explicit update kept dismissedVersion: {saved}")
+            else:
+                require(f"JustMux {self.version} is already up to date." in out_text, out_text)
+                require(not (run / "npm.json").exists(), "up-to-date check unexpectedly ran npm install")
+        print(f"PASS {label}", flush=True)
+
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
@@ -197,7 +291,9 @@ def main():
         fixture.case("narrow-resize-still-selects", b"\x1b[A\r", "skip-version", narrow=True)
         fixture.case("failed-update-continues", b"1", "failed", npm_status=7)
         fixture.letters_case()
-    print("All 16 offline npm update PTY scenarios passed.")
+        fixture.explicit_update_case("explicit-update-installs-without-picker", fixture.latest, True)
+        fixture.explicit_update_case("explicit-update-up-to-date", fixture.version, False)
+    print("All 18 offline npm update PTY scenarios passed.")
 
 
 if __name__ == "__main__":

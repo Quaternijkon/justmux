@@ -68,9 +68,10 @@ function defaultCachePath(runtime = process) {
   return path.join(home, runtime.platform === 'darwin' ? 'Library/Caches' : '.cache', 'justmux', 'update.json');
 }
 
-async function fetchLatest(name, { fetchImpl = globalThis.fetch, timeoutMs = 3000 } = {}) {
+async function fetchLatest(name, { fetchImpl = globalThis.fetch, timeoutMs = 3000, maxTimeoutMs = 3000 } = {}) {
   if (!PACKAGE.test(name ?? '') || typeof fetchImpl !== 'function') throw new Error('Invalid update request');
-  const timeout = Number.isFinite(timeoutMs) && timeoutMs > 0 ? Math.min(timeoutMs, 3000) : 3000;
+  const cap = Number.isFinite(maxTimeoutMs) && maxTimeoutMs > 0 ? maxTimeoutMs : 3000;
+  const timeout = Number.isFinite(timeoutMs) && timeoutMs > 0 ? Math.min(timeoutMs, cap) : cap;
   const controller = new AbortController();
   let timer;
   const deadline = new Promise((_, reject) => {
@@ -196,7 +197,7 @@ async function maybeUpdate(args, options = {}) {
       result = await (options.install ?? nativeInstall)('npm', installArgs, { stdio: 'inherit', shell: false });
     } catch { result = { status: 1 }; }
     if (result?.status === 0 && !result.signal) {
-      runtime.stdout.write('JustMux updated. Run jm again to start the new version.\n');
+      runtime.stdout.write('JustMux updated. Run jm (or justmux) again to start the new version.\n');
       return { action: 'exit', code: 0 };
     }
     runtime.stdout.write(`JustMux update failed. Continuing with the installed version.\nTo retry: npm ${installArgs.map(quote).join(' ')}\n`);
@@ -204,4 +205,158 @@ async function maybeUpdate(args, options = {}) {
   } catch { return CONTINUE; }
 }
 
-module.exports = { maybeUpdate, compareVersions, detectGlobalPrefix, defaultCachePath, fetchLatest, updatePrompt };
+function isUpdateCommand(args) {
+  return Array.isArray(args) && (args[0] === 'update' || args[0] === 'upgrade');
+}
+
+function readDismissedVersion(fs, cachePath) {
+  try {
+    const cache = JSON.parse(fs.readFileSync(cachePath, 'utf8'));
+    if (typeof cache?.dismissedVersion === 'string') {
+      versionParts(cache.dismissedVersion);
+      return cache.dismissedVersion;
+    }
+  } catch { /* Ignore invalid or missing cache state. */ }
+  return undefined;
+}
+
+function writeUpdateCache(fs, cachePath, entry) {
+  try {
+    fs.mkdirSync(path.dirname(cachePath), { recursive: true });
+    fs.writeFileSync(cachePath, `${JSON.stringify(entry)}\n`, { mode: 0o600 });
+  } catch { /* A read-only cache must not fail an explicit update. */ }
+}
+
+const UPDATE_USAGE = [
+  'Usage: jm update [--check]',
+  '',
+  'Check npm for a newer JustMux release and update the global installation.',
+  'Aliases: jm upgrade, justmux update, justmux upgrade',
+  '',
+  'Options:',
+  '  --check     Only check whether a newer release is available',
+  '  -h, --help  Print help',
+  '',
+].join('\n');
+
+/** Explicit `jm update` / `justmux update` workflow bypassing passive opt-outs and cache. */
+async function runUpdate(restArgs = [], options = {}) {
+  const runtime = options.runtime ?? process;
+  const out = runtime.stdout ?? process.stdout;
+  const err = runtime.stderr ?? runtime.stdout ?? process.stderr;
+  let checkOnly = false;
+  for (const arg of Array.isArray(restArgs) ? restArgs : []) {
+    if (arg === '-h' || arg === '--help') {
+      out.write(UPDATE_USAGE);
+      return { action: 'exit', code: 0 };
+    }
+    if (arg === '--check') {
+      checkOnly = true;
+      continue;
+    }
+    err.write(`justmux: unexpected argument '${arg}' for 'update' (try 'jm update --help')\n`);
+    return { action: 'exit', code: 2 };
+  }
+
+  const fs = options.fs ?? nativeFs;
+  const packageRoot = options.packageRoot ?? path.resolve(__dirname, '..');
+  let manifest;
+  try {
+    manifest = options.manifest ?? JSON.parse(fs.readFileSync(path.join(packageRoot, 'package.json'), 'utf8'));
+    if (!PACKAGE.test(manifest?.name ?? '')) throw new Error('Invalid package name');
+    versionParts(manifest.version);
+  } catch (error) {
+    err.write(`justmux: invalid package metadata (${error.message}).\n`);
+    return { action: 'exit', code: 1 };
+  }
+
+  const supported = (runtime.platform === 'darwin' && runtime.arch === 'arm64')
+    || (runtime.platform === 'linux' && runtime.arch === 'x64');
+  if (!checkOnly && !supported) {
+    err.write(
+      `justmux: unsupported platform ${runtime.platform}/${runtime.arch}. JustMux supports macOS arm64 and Linux x64.\n`
+      + `Run: npm install -g ${manifest.name}@latest\n`,
+    );
+    return { action: 'exit', code: 1 };
+  }
+
+  const prefix = detectGlobalPrefix(packageRoot, manifest.name, fs);
+  if (!prefix && !checkOnly) {
+    err.write(
+      'justmux: cannot self-update a non-global installation (such as npx, local node_modules, or npm link).\n'
+      + `Run: npm install -g ${manifest.name}@latest\n`,
+    );
+    return { action: 'exit', code: 1 };
+  }
+
+  let latest;
+  try {
+    latest = await fetchLatest(manifest.name, {
+      ...options,
+      timeoutMs: options.timeoutMs ?? 10000,
+      maxTimeoutMs: options.maxTimeoutMs ?? 15000,
+    });
+  } catch (error) {
+    err.write(
+      `justmux: failed to check npm for updates (${error.message}).\n`
+      + `To update manually: npm install -g ${manifest.name}@latest\n`,
+    );
+    return { action: 'exit', code: 1 };
+  }
+
+  if (!versionParts(manifest.version).prerelease.length && versionParts(latest).prerelease.length) {
+    out.write(`JustMux ${manifest.version} is already up to date.\n`);
+    return { action: 'exit', code: 0 };
+  }
+
+  const cachePath = options.cachePath ?? defaultCachePath(runtime);
+  const now = (options.now ?? Date.now)();
+  const validNow = Number.isFinite(now) && now >= 0;
+  const refreshCache = (dismissedVersion) => {
+    if (validNow) {
+      writeUpdateCache(fs, cachePath, { version: latest, time: now, ...(dismissedVersion && { dismissedVersion }) });
+    }
+  };
+
+  if (compareVersions(latest, manifest.version) <= 0) {
+    refreshCache(readDismissedVersion(fs, cachePath));
+    out.write(`JustMux ${manifest.version} is already up to date.\n`);
+    return { action: 'exit', code: 0 };
+  }
+
+  if (checkOnly) {
+    refreshCache(readDismissedVersion(fs, cachePath));
+    out.write(
+      `JustMux update available: ${manifest.version} -> ${latest}\n`
+      + "Run 'jm update' (or 'justmux update') to install.\n",
+    );
+    return { action: 'exit', code: 0 };
+  }
+
+  out.write(`Updating JustMux ${manifest.version} -> ${latest}...\n`);
+  const installArgs = ['install', '--global', '--prefix', prefix, `${manifest.name}@${latest}`, '--include=optional'];
+  let result;
+  try {
+    result = await (options.install ?? nativeInstall)('npm', installArgs, { stdio: 'inherit', shell: false });
+  } catch {
+    result = { status: 1 };
+  }
+  if (result?.status === 0 && !result.signal) {
+    refreshCache(undefined);
+    out.write(`JustMux updated to ${latest}. Run jm (or justmux) again to start the new version.\n`);
+    return { action: 'exit', code: 0 };
+  }
+  err.write(`JustMux update failed.\nTo retry: npm ${installArgs.map(quote).join(' ')}\n`);
+  return { action: 'exit', code: result?.status || 1 };
+}
+
+module.exports = {
+  maybeUpdate,
+  isUpdateCommand,
+  runUpdate,
+  compareVersions,
+  detectGlobalPrefix,
+  defaultCachePath,
+  fetchLatest,
+  updatePrompt,
+};

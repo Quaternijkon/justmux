@@ -3,7 +3,10 @@
 
 async function main() {
   const args = process.argv.slice(2);
-  const result = await require('../lib/update.cjs').maybeUpdate(args);
+  const updater = require('../lib/update.cjs');
+  const result = updater.isUpdateCommand(args)
+    ? await updater.runUpdate(args.slice(1))
+    : await updater.maybeUpdate(args);
   if (result.action === 'exit') {
     process.exitCode = result.code;
     return;

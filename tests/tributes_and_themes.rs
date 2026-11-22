@@ -16,9 +16,13 @@ use justmux::{
     terminal::ScreenMode,
     tmux::{SocketSpec, Target, Tmux, TmuxClient},
     tributes,
-    ui::{ComposerMode, Theme, ThemePreset},
+    ui::{ComposerMode, EmblemMode, Theme, ThemePreset},
 };
-use ratatui::{Terminal, backend::TestBackend, style::Color};
+use ratatui::{
+    Terminal,
+    backend::TestBackend,
+    style::{Color, Modifier},
+};
 use tempfile::TempDir;
 
 struct PrivateServer {
@@ -86,7 +90,7 @@ fn render_app(app: &mut App<'_>, width: u16, height: u16) -> Terminal<TestBacken
 
 #[test]
 fn inline_popup_at_100x16_keeps_quit_visible_after_10_down_presses() {
-    assert_eq!(commands::registry().len(), 12);
+    assert_eq!(commands::registry().len(), 9);
     assert_eq!(
         commands::registry().last().map(|cmd| cmd.kind),
         Some(CommandKind::Quit)
@@ -301,7 +305,7 @@ fn micro_tributes_execute_and_autocomplete_only_at_two_plus_letters() {
     let mut matcher = FuzzyMatcher::new();
 
     // Hidden on empty `/` and single letter.
-    assert_eq!(commands::filter_commands("", &mut matcher).len(), 12);
+    assert_eq!(commands::filter_commands("", &mut matcher).len(), 9);
     assert!(
         commands::filter_commands("c", &mut matcher)
             .iter()
@@ -316,7 +320,7 @@ fn micro_tributes_execute_and_autocomplete_only_at_two_plus_letters() {
         .into_iter()
         .map(|m| m.command.name)
         .collect();
-    assert_eq!(co_names.first().copied(), Some("theme"));
+    assert_eq!(co_names.first().copied(), Some("config"));
     assert!(co_names.contains(&"codex"), "{co_names:?}");
     assert!(co_names.contains(&"compact"), "{co_names:?}");
     assert!(co_names.contains(&"cost"), "{co_names:?}");
@@ -378,13 +382,24 @@ fn split_renders_visual_wireframe_preview_and_rich_picker_shows_badges() {
     assert!(home.contains("1s"), "{home}");
     assert!(home.contains("1w"), "{home}");
 
-    // `/list` uses render_rich_picker with session badge and detached pill.
+    // `/list` switches Home Matrix to INSPECT mode with live session and detached pill.
     type_text(&mut app, "/list");
     key(&mut app, KeyCode::Enter);
     let list_screen = render_app(&mut app, 90, 16).backend().to_string();
+    assert!(list_screen.contains("INSPECT"), "{list_screen}");
     assert!(list_screen.contains("codex-dev"), "{list_screen}");
     assert!(list_screen.contains("detached"), "{list_screen}");
-    assert!(list_screen.contains(">_"), "{list_screen}");
+    key(&mut app, KeyCode::Esc);
+
+    // `/pane` opens render_rich_picker with pane row and active/busy badge.
+    type_text(&mut app, "/pane");
+    key(&mut app, KeyCode::Enter);
+    let pane_screen = render_app(&mut app, 90, 16).backend().to_string();
+    assert!(pane_screen.contains("codex-dev"), "{pane_screen}");
+    assert!(
+        pane_screen.contains("active") || pane_screen.contains("busy"),
+        "{pane_screen}"
+    );
     key(&mut app, KeyCode::Esc);
 
     // `/split` -> Enter opens View::Split with live visual wireframe preview.
@@ -402,7 +417,12 @@ fn split_renders_visual_wireframe_preview_and_rich_picker_shows_badges() {
         ..app.theme()
     });
     let split_ascii = render_app(&mut app, 80, 16).backend().to_string();
-    assert!(split_ascii.is_ascii(), "{split_ascii}");
+    assert!(
+        split_ascii
+            .chars()
+            .all(|c| c.is_ascii() || matches!(c, '┌' | '┐' | '└' | '┘' | '─' | '│')),
+        "{split_ascii}"
+    );
     assert!(split_ascii.contains("+------+------+"), "{split_ascii}");
     assert!(split_ascii.contains("+-------------+"), "{split_ascii}");
 }
@@ -434,16 +454,19 @@ fn home_studio_two_column_card_mascot_and_72x16_compatibility() {
     let wide = render_app(&mut app, 100, 16).backend().to_string();
     assert!(wide.contains("╭"), "{wide}");
     assert!(wide.contains("◫ JustMux"), "{wide}");
-    assert!(wide.contains("▗▛▀▜▖"), "{wide}");
-    assert!(wide.contains("Live Workspaces (1-5)"), "{wide}");
-    assert!(wide.contains("[1]"), "{wide}");
-    assert!(wide.contains("Pro Tip"), "{wide}");
-    assert!(wide.contains("Shift+Tab Mode"), "{wide}");
+    assert!(wide.contains("claude-core"), "{wide}");
+    assert!(wide.contains("codex-api"), "{wide}");
+    assert!(wide.contains("Window Preview"), "{wide}");
+    assert!(wide.contains("Search: session or window"), "{wide}");
+    assert!(wide.contains("Shift+Tab"), "{wide}");
 
     let compact_studio = render_app(&mut app, 72, 16).backend().to_string();
     assert!(compact_studio.contains("◫ JustMux"), "{compact_studio}");
-    assert!(compact_studio.contains("Try a command"), "{compact_studio}");
-    assert!(compact_studio.contains("/help"), "{compact_studio}");
+    assert!(compact_studio.contains("claude-core"), "{compact_studio}");
+    assert!(
+        compact_studio.contains("Search: session or window"),
+        "{compact_studio}"
+    );
     assert!(
         compact_studio.contains("Type / for commands"),
         "{compact_studio}"
@@ -744,11 +767,14 @@ fn natural_language_zero_syntax_intent_and_fallback() {
     key(&mut app, KeyCode::Enter);
     assert!(app.status().contains("commands start with /"));
 
-    // Case-insensitive exact session name attaches directly.
+    // Case-insensitive exact session name filters the Home Matrix and attaches directly.
     let mut jump_app = App::new(&server.client, AppOptions::default());
     type_text(&mut jump_app, "MY-APP");
     key(&mut jump_app, KeyCode::Enter);
-    assert_eq!(jump_app.exit(), Some(&Exit::Attach(Target::Session(s.id))));
+    assert!(matches!(
+        jump_app.exit(),
+        Some(Exit::Attach(Target::Window(sid, _))) if sid == &s.id
+    ));
 }
 
 fn mouse_event(kind: MouseEventKind, column: u16, row: u16) -> Event {
@@ -855,7 +881,7 @@ fn config_command_and_theme_save_persist_to_tempfile() {
         commands::parse("/prefs").unwrap().command,
         CommandKind::Config
     );
-    assert!(!commands::registry().iter().any(|c| c.name == "config"));
+    assert!(commands::registry().iter().any(|c| c.name == "config"));
 
     let mut app = App::with_config(
         &tmux,
@@ -904,6 +930,30 @@ fn config_command_and_theme_save_persist_to_tempfile() {
     assert_eq!(saved.config.theme, ThemePreset::CodexEmerald);
     assert!(!saved.config.live_preview);
     assert!(!saved.config.mouse);
+    assert_eq!(saved.config.language, justmux::ui::Language::En);
+
+    // Move to Row 9 (language), toggle en -> zh live, verify Chinese copy & persistence.
+    for _ in 0..5 {
+        key(&mut app, KeyCode::Down);
+    }
+    key(&mut app, KeyCode::Char(' '));
+    assert_eq!(app.config().language, justmux::ui::Language::Zh);
+    assert_eq!(app.theme().language, justmux::ui::Language::Zh);
+    let zh_modal = render_app(&mut app, 110, 32).backend().to_string();
+    assert!(zh_modal.contains("JustMux 设置与参数"), "{zh_modal}");
+    assert!(zh_modal.contains("简体中文"), "{zh_modal}");
+    key(&mut app, KeyCode::Char('s'));
+    let saved_zh = config::load(&CliOverrides {
+        config_path: Some(cfg_path.clone()),
+        screen_mode: None,
+        theme: None,
+    })
+    .expect("reload saved zh config");
+    assert_eq!(saved_zh.config.language, justmux::ui::Language::Zh);
+    // Toggle back to English before exiting /config.
+    key(&mut app, KeyCode::Char(' '));
+    assert_eq!(app.config().language, justmux::ui::Language::En);
+    key(&mut app, KeyCode::Char('s'));
 
     // Close /config and save a different theme from /theme via 's'.
     key(&mut app, KeyCode::Esc);
@@ -976,9 +1026,9 @@ fn fullscreen_mouse_scroll_and_clicks_navigate_and_respect_mouse_flag() {
     app.handle_event(mouse_event(MouseEventKind::ScrollUp, 10, 5));
     // Click whichever row is second (currently unselected): 1st click selects, 2nd click attaches.
     let (second_col, second_row, expected_id) = if beta_row > alpha_row {
-        (beta_col, beta_row, _s2.id)
+        (beta_col, beta_row, _s2.id.clone())
     } else {
-        (alpha_col, alpha_row, s1.id)
+        (alpha_col, alpha_row, s1.id.clone())
     };
     app.handle_event(mouse_event(
         MouseEventKind::Down(MouseButton::Left),
@@ -996,25 +1046,140 @@ fn fullscreen_mouse_scroll_and_clicks_navigate_and_respect_mouse_flag() {
         Some(&Exit::Attach(Target::Session(expected_id)))
     );
 
-    // Picker click + wheel test.
+    // Unified Home Matrix (CommandJump): wheel inside Window Preview scrolls scrollback without
+    // changing selection; wheel in the lower matrix scrolls windows; clicks select/attach.
+    let s1_w0 = server
+        .client
+        .list_windows(Some(&s1.id))
+        .expect("alpha windows")
+        .into_iter()
+        .next()
+        .expect("alpha window 0");
+    let sent = Command::new("tmux")
+        .args([
+            "-L",
+            &server.socket,
+            "send-keys",
+            "-t",
+            &s1_w0.id.to_string(),
+            "seq -f 'MOUSE_PREV_%02g' 1 30",
+            "Enter",
+        ])
+        .env_remove("TMUX")
+        .env_remove("TMUX_PANE")
+        .output()
+        .expect("send-keys to alpha");
+    assert!(sent.status.success());
+    wait_for_pane_text(
+        &server.client,
+        &Target::Window(s1.id.clone(), s1_w0.id),
+        "MOUSE_PREV_30",
+    );
+    let _s1_win2 = server
+        .client
+        .new_window(&s1.id, Some("logs"), None)
+        .expect("logs window");
+    let mut matrix_app = App::with_config(
+        &server.client,
+        AppOptions::default(),
+        Config::default(),
+        None,
+    );
+    let matrix_term = render_app(&mut matrix_app, 100, 24);
+    // Wheel inside Window Preview (top band) scrolls preview without leaving alpha:0.
+    matrix_app.handle_event(mouse_event(MouseEventKind::ScrollUp, 10, 4));
+    let preview_scrolled = render_app(&mut matrix_app, 100, 24).backend().to_string();
+    assert!(preview_scrolled.contains("↑ +3/"), "{preview_scrolled}");
+    assert!(
+        preview_scrolled.contains("Window Preview · alpha"),
+        "{preview_scrolled}"
+    );
+    matrix_app.handle_event(mouse_event(MouseEventKind::ScrollDown, 10, 4));
+    let preview_bottom = render_app(&mut matrix_app, 100, 24).backend().to_string();
+    assert!(preview_bottom.contains("↕ "), "{preview_bottom}");
+
+    let (beta_col_m, beta_row_m) =
+        find_text_cell_in_cols(&matrix_term, "beta", 95).expect("beta column on Home Matrix");
+    // Wheel inside the lower matrix navigates alpha windows without exiting.
+    matrix_app.handle_event(mouse_event(
+        MouseEventKind::ScrollDown,
+        beta_col_m,
+        beta_row_m + 1,
+    ));
+    let scrolled_win = render_app(&mut matrix_app, 100, 24).backend().to_string();
+    assert!(scrolled_win.contains("1: logs"), "{scrolled_win}");
+    matrix_app.handle_event(mouse_event(
+        MouseEventKind::ScrollUp,
+        beta_col_m,
+        beta_row_m + 1,
+    ));
+    // Clicking Action Tab Bar entries switches matrix action mode in place.
+    let (rename_tab_col, rename_tab_row) =
+        find_buffer_text(matrix_term.backend().buffer(), "Rename").expect("Rename tab");
+    matrix_app.handle_event(mouse_event(
+        MouseEventKind::Down(MouseButton::Left),
+        rename_tab_col,
+        rename_tab_row,
+    ));
+    let rename_tab_screen = render_app(&mut matrix_app, 100, 24).backend().to_string();
+    assert!(rename_tab_screen.contains("RENAME"), "{rename_tab_screen}");
+    let (resume_tab_col, resume_tab_row) =
+        find_buffer_text(matrix_term.backend().buffer(), "Resume").expect("Resume tab");
+    matrix_app.handle_event(mouse_event(
+        MouseEventKind::Down(MouseButton::Left),
+        resume_tab_col,
+        resume_tab_row,
+    ));
+    assert!(
+        render_app(&mut matrix_app, 100, 24)
+            .backend()
+            .to_string()
+            .contains("▸ Resume")
+    );
+
+    // Clicking session header in Open mode selects that column without exiting.
+    matrix_app.handle_event(mouse_event(
+        MouseEventKind::Down(MouseButton::Left),
+        beta_col_m,
+        beta_row_m,
+    ));
+    assert!(matrix_app.exit().is_none());
+    // 1st click on beta's window row focuses it; 2nd click attaches to that window.
+    matrix_app.handle_event(mouse_event(
+        MouseEventKind::Down(MouseButton::Left),
+        beta_col_m,
+        beta_row_m + 2,
+    ));
+    assert!(matrix_app.exit().is_none());
+    matrix_app.handle_event(mouse_event(
+        MouseEventKind::Down(MouseButton::Left),
+        beta_col_m,
+        beta_row_m + 2,
+    ));
+    assert!(matches!(
+        matrix_app.exit(),
+        Some(Exit::Attach(Target::Window(..)))
+    ));
+
+    // Picker click + wheel test on `/pane`.
     let mut picker_app = App::with_config(
         &server.client,
         AppOptions::default(),
         Config::default(),
         None,
     );
-    type_text(&mut picker_app, "/list");
+    type_text(&mut picker_app, "/pane");
     key(&mut picker_app, KeyCode::Enter);
     let picker_term = render_app(&mut picker_app, 100, 24);
     let (p_col, p_row) =
-        find_text_cell_in_cols(&picker_term, "beta", 45).expect("beta row in /list");
+        find_text_cell_in_cols(&picker_term, "beta", 60).expect("beta row in /pane");
     picker_app.handle_event(mouse_event(
         MouseEventKind::Down(MouseButton::Left),
         p_col,
         p_row,
     ));
     let after_first = render_app(&mut picker_app, 100, 24).backend().to_string();
-    if !after_first.contains("Session actions") {
+    if !after_first.contains("Pane actions") {
         picker_app.handle_event(mouse_event(
             MouseEventKind::Down(MouseButton::Left),
             p_col,
@@ -1022,17 +1187,49 @@ fn fullscreen_mouse_scroll_and_clicks_navigate_and_respect_mouse_flag() {
         ));
     }
     let actions = render_app(&mut picker_app, 100, 24).backend().to_string();
-    assert!(actions.contains("Session actions"));
+    assert!(actions.contains("Pane actions"));
+}
+
+fn hydra_top_ring_row(max_width: u16, max_height: u16, theme: &Theme) -> String {
+    let (_, lines) =
+        justmux::ui::hydra_emblem_frame(max_width, max_height, 0, *theme).expect("hydra frame");
+    lines
+        .into_iter()
+        .map(|line| {
+            line.spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect::<String>()
+                .trim()
+                .to_owned()
+        })
+        .find(|row| !row.is_empty())
+        .expect("non-empty hydra outer ring row")
 }
 
 #[test]
 fn spacious_fullscreen_home_shows_active_preview_and_respects_live_preview_flag() {
     let server = PrivateServer::new();
+    // Create background sessions first with quiet `sleep 30` panes so delayed shell prompts cannot
+    // bump their recency ahead of `a-studio-one` across a 1-second boundary.
     for name in ["s2", "s3", "s4", "s5", "s6"] {
-        server
-            .client
-            .new_session(name, Path::new("/tmp"))
-            .expect("extra session");
+        let extra = Command::new("tmux")
+            .args([
+                "-L",
+                &server.socket,
+                "-f",
+                "/dev/null",
+                "new-session",
+                "-d",
+                "-s",
+                name,
+                "sleep 30",
+            ])
+            .env_remove("TMUX")
+            .env_remove("TMUX_PANE")
+            .output()
+            .expect("spawn extra session");
+        assert!(extra.status.success());
     }
 
     let out = Command::new("tmux")
@@ -1053,22 +1250,22 @@ fn spacious_fullscreen_home_shows_active_preview_and_respects_live_preview_flag(
         .expect("spawn a-studio-one");
     assert!(out.status.success());
 
+    let studio_id = server
+        .client
+        .list_sessions()
+        .expect("list sessions")
+        .into_iter()
+        .find(|s| s.name == "a-studio-one")
+        .expect("a-studio-one session")
+        .id;
+
     // Wait briefly for printf inside the pane so capture_pane sees it reliably.
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
     loop {
-        if let Ok(lines) = server.client.capture_pane(
-            &Target::Session(
-                server
-                    .client
-                    .list_sessions()
-                    .unwrap()
-                    .into_iter()
-                    .find(|s| s.name == "a-studio-one")
-                    .unwrap()
-                    .id,
-            ),
-            12,
-        ) && lines.iter().any(|l| l.contains("JM_V3_SPACIOUS_PREVIEW"))
+        if let Ok(lines) = server
+            .client
+            .capture_pane(&Target::Session(studio_id.clone()), 12)
+            && lines.iter().any(|l| l.contains("JM_V3_SPACIOUS_PREVIEW"))
         {
             break;
         }
@@ -1079,7 +1276,14 @@ fn spacious_fullscreen_home_shows_active_preview_and_respects_live_preview_flag(
         std::thread::sleep(std::time::Duration::from_millis(50));
     }
 
-    // With live_preview = true on 120x32: shows 8 commands, 6 Live Workspaces, and embedded preview.
+    // Add a second window inside a-studio-one after background sessions so its recency >= s2..s6.
+    server
+        .client
+        .new_window(&studio_id, Some("logs"), None)
+        .expect("second window");
+
+    // With live_preview = true on 120x32: Window Preview renders on top, and Unified Home Matrix
+    // (side-by-side sessions + window rows) renders in the lower band beside the 16x8 Hydra.
     let mut app_on = App::with_config(
         &server.client,
         AppOptions::default(),
@@ -1089,14 +1293,202 @@ fn spacious_fullscreen_home_shows_active_preview_and_respects_live_preview_flag(
         },
         None,
     );
+    let ring_row_on = hydra_top_ring_row(32, 10, &app_on.theme());
     let wide = render_app(&mut app_on, 120, 32).backend().to_string();
-    assert!(wide.contains("/theme"));
-    assert!(wide.contains("/help"));
-    assert!(wide.contains("[6]"));
-    assert!(wide.contains("Active Workspace Preview"));
-    assert!(wide.contains("JM_V3_SPACIOUS_PREVIEW"));
+    assert!(wide.contains("a-studio-one"), "{wide}");
+    assert!(
+        ["s2", "s3", "s4", "s5", "s6"]
+            .iter()
+            .any(|s| wide.contains(s)),
+        "{wide}"
+    );
+    assert!(wide.contains("logs"), "{wide}");
+    assert!(wide.contains("Window Preview"), "{wide}");
+    assert!(wide.contains("JM_V3_SPACIOUS_PREVIEW"), "{wide}");
+    // Preview sits above the matrix, and Hydra renders alongside the matrix in the lower band.
+    let wide_lines: Vec<&str> = wide.lines().collect();
+    let preview_line_idx = wide_lines
+        .iter()
+        .position(|line| line.contains("Window Preview"))
+        .expect("Window Preview line");
+    let matrix_line_idx = wide_lines
+        .iter()
+        .position(|line| {
+            line.contains("a-studio-one")
+                && ["s2", "s3", "s4", "s5", "s6"]
+                    .iter()
+                    .any(|s| line.contains(s))
+        })
+        .expect("session matrix header row");
+    let ring_line_idx = wide_lines
+        .iter()
+        .position(|line| line.contains(&ring_row_on))
+        .expect("lower-band hydra outer ring row");
+    assert!(
+        preview_line_idx < matrix_line_idx,
+        "preview should render above matrix: {wide}"
+    );
+    assert!(
+        ring_line_idx >= matrix_line_idx,
+        "hydra should render alongside matrix in lower band: {wide}"
+    );
 
-    // With live_preview = false: skips preview both on Home and inside /list & /resume.
+    // Navigating windows and sessions updates Window Preview dynamically.
+    key(&mut app_on, KeyCode::Down);
+    let win2_view = render_app(&mut app_on, 120, 32).backend().to_string();
+    assert!(win2_view.contains("Window Preview"), "{win2_view}");
+    assert!(!win2_view.contains("JM_V3_SPACIOUS_PREVIEW"), "{win2_view}");
+    key(&mut app_on, KeyCode::Up);
+    assert!(
+        render_app(&mut app_on, 120, 32)
+            .backend()
+            .to_string()
+            .contains("JM_V3_SPACIOUS_PREVIEW")
+    );
+    key(&mut app_on, KeyCode::Right);
+    let session2_view = render_app(&mut app_on, 120, 32).backend().to_string();
+    assert!(session2_view.contains("Window Preview"), "{session2_view}");
+    assert!(
+        !session2_view.contains("JM_V3_SPACIOUS_PREVIEW"),
+        "{session2_view}"
+    );
+    key(&mut app_on, KeyCode::Left);
+    assert!(
+        render_app(&mut app_on, 120, 32)
+            .backend()
+            .to_string()
+            .contains("JM_V3_SPACIOUS_PREVIEW")
+    );
+
+    // Action Tab Bar renders all 4 tabs; Tab cycles Resume -> Rename -> Kill -> Split -> Resume.
+    assert!(wide.contains("Resume"), "{wide}");
+    assert!(wide.contains("Rename"), "{wide}");
+    assert!(wide.contains("Kill"), "{wide}");
+    assert!(wide.contains("Split"), "{wide}");
+
+    key(&mut app_on, KeyCode::Tab);
+    let tab_rename = render_app(&mut app_on, 120, 32).backend().to_string();
+    assert!(tab_rename.contains("RENAME WINDOW"), "{tab_rename}");
+    key(&mut app_on, KeyCode::Up);
+    let rename_hdr = render_app(&mut app_on, 120, 32).backend().to_string();
+    assert!(rename_hdr.contains("RENAME SESSION"), "{rename_hdr}");
+    key(&mut app_on, KeyCode::Down);
+    let rename_win = render_app(&mut app_on, 120, 32).backend().to_string();
+    assert!(rename_win.contains("RENAME WINDOW"), "{rename_win}");
+
+    key(&mut app_on, KeyCode::Tab);
+    let tab_kill = render_app(&mut app_on, 120, 32).backend().to_string();
+    assert!(tab_kill.contains("KILL WINDOW"), "{tab_kill}");
+    key(&mut app_on, KeyCode::Up);
+    let kill_hdr = render_app(&mut app_on, 120, 32).backend().to_string();
+    assert!(kill_hdr.contains("KILL SESSION"), "{kill_hdr}");
+    key(&mut app_on, KeyCode::Down);
+    let kill_win = render_app(&mut app_on, 120, 32).backend().to_string();
+    assert!(kill_win.contains("KILL WINDOW"), "{kill_win}");
+
+    key(&mut app_on, KeyCode::Tab);
+    let tab_split = render_app(&mut app_on, 120, 32).backend().to_string();
+    assert!(tab_split.contains("SPLIT"), "{tab_split}");
+
+    key(&mut app_on, KeyCode::Tab);
+    assert!(
+        render_app(&mut app_on, 120, 32)
+            .backend()
+            .to_string()
+            .contains("▸ Resume")
+    );
+
+    // Command switching stays on Home Matrix and resets on Esc.
+    type_text(&mut app_on, "/rename");
+    key(&mut app_on, KeyCode::Enter);
+    let rename_cmd = render_app(&mut app_on, 120, 32).backend().to_string();
+    assert!(rename_cmd.contains("RENAME SESSION"), "{rename_cmd}");
+    key(&mut app_on, KeyCode::Down);
+    let rename_cmd_w = render_app(&mut app_on, 120, 32).backend().to_string();
+    assert!(rename_cmd_w.contains("RENAME WINDOW"), "{rename_cmd_w}");
+    key(&mut app_on, KeyCode::Esc);
+    assert!(
+        render_app(&mut app_on, 120, 32)
+            .backend()
+            .to_string()
+            .contains("▸ Resume")
+    );
+
+    for (cmd, expected_pill) in [
+        ("/kill", "KILL WINDOW"),
+        ("/split", "SPLIT"),
+        ("/window", "WINDOW"),
+        ("/list", "INSPECT"),
+    ] {
+        type_text(&mut app_on, cmd);
+        key(&mut app_on, KeyCode::Enter);
+        let screen = render_app(&mut app_on, 120, 32).backend().to_string();
+        assert!(screen.contains(expected_pill), "{cmd}: {screen}");
+        key(&mut app_on, KeyCode::Esc);
+        assert!(
+            render_app(&mut app_on, 120, 32)
+                .backend()
+                .to_string()
+                .contains("▸ Resume")
+        );
+    }
+
+    type_text(&mut app_on, "/resume");
+    key(&mut app_on, KeyCode::Enter);
+    assert!(
+        render_app(&mut app_on, 120, 32)
+            .backend()
+            .to_string()
+            .contains("▸ Resume")
+    );
+
+    // Navigating to `+ New window` and `+ New session` matrix cells opens creation forms.
+    key(&mut app_on, KeyCode::Down);
+    key(&mut app_on, KeyCode::Down);
+    key(&mut app_on, KeyCode::Enter);
+    let new_win_form = render_app(&mut app_on, 120, 32).backend().to_string();
+    assert!(new_win_form.contains("New window"), "{new_win_form}");
+    key(&mut app_on, KeyCode::Esc);
+
+    for _ in 0..6 {
+        key(&mut app_on, KeyCode::Right);
+    }
+    let new_sess_preview = render_app(&mut app_on, 120, 32).backend().to_string();
+    assert!(
+        new_sess_preview.contains("New Session"),
+        "{new_sess_preview}"
+    );
+    key(&mut app_on, KeyCode::Enter);
+    let new_sess_form = render_app(&mut app_on, 120, 32).backend().to_string();
+    assert!(new_sess_form.contains("Session name"), "{new_sess_form}");
+    key(&mut app_on, KeyCode::Esc);
+    for _ in 0..6 {
+        key(&mut app_on, KeyCode::Left);
+    }
+
+    // Unified subview chrome wraps overlay commands inside `◫ JustMux` with lower-right Hydra.
+    let ring_row_subview = hydra_top_ring_row(32, 13, &app_on.theme());
+    for (cmd, pill, needle) in [
+        ("/new", "NEW SESSION", "Session name"),
+        ("/theme", "THEME", "Aurora"),
+        ("/config", "CONFIG", "screen_mode"),
+        ("/help", "HELP", "/resume"),
+        ("/pane", "PANES", "Filter:"),
+        ("/vibe", "TRIBUTE VAULT", "TRIBUTE VAULT"),
+    ] {
+        type_text(&mut app_on, cmd);
+        key(&mut app_on, KeyCode::Enter);
+        let screen = render_app(&mut app_on, 120, 32).backend().to_string();
+        assert!(screen.contains("◫ JustMux"), "{cmd}: {screen}");
+        assert!(screen.contains(pill), "{cmd}: {screen}");
+        assert!(screen.contains(needle), "{cmd}: {screen}");
+        if cmd != "/vibe" {
+            assert!(screen.contains(&ring_row_subview), "{cmd}: {screen}");
+        }
+        key(&mut app_on, KeyCode::Esc);
+    }
+
+    // With live_preview = false: omits Window Preview on Home and inside /pane.
     let mut app_off = App::with_config(
         &server.client,
         AppOptions::default(),
@@ -1106,12 +1498,435 @@ fn spacious_fullscreen_home_shows_active_preview_and_respects_live_preview_flag(
         },
         None,
     );
+    let ring_row_off = hydra_top_ring_row(32, 21, &app_off.theme());
     let wide_off = render_app(&mut app_off, 120, 32).backend().to_string();
-    assert!(!wide_off.contains("Active Workspace Preview"));
-    assert!(!wide_off.contains("JM_V3_SPACIOUS_PREVIEW"));
+    assert!(wide_off.contains(&ring_row_off), "{wide_off}");
+    assert!(!wide_off.contains("Window Preview"), "{wide_off}");
+    assert!(!wide_off.contains("JM_V3_SPACIOUS_PREVIEW"), "{wide_off}");
 
-    type_text(&mut app_off, "/list");
+    type_text(&mut app_off, "/pane");
     key(&mut app_off, KeyCode::Enter);
-    let list_off = render_app(&mut app_off, 100, 24).backend().to_string();
-    assert!(!list_off.contains("JM_V3_SPACIOUS_PREVIEW"));
+    let pane_off = render_app(&mut app_off, 100, 24).backend().to_string();
+    assert!(!pane_off.contains("JM_V3_SPACIOUS_PREVIEW"), "{pane_off}");
+}
+
+#[test]
+fn startup_tip_renders_only_on_clean_home_screen() {
+    let tmux = offline_tmux();
+    let tip = "✦ Tip: You can also launch JustMux anytime with 'jm' · Type / for commands";
+
+    let mut home_app = App::new(&tmux, AppOptions::default());
+    home_app.set_startup_tip(tip);
+    assert_eq!(home_app.status(), tip);
+    let rendered = render_app(&mut home_app, 100, 24).backend().to_string();
+    assert!(
+        rendered.contains("launch JustMux anytime with 'jm'"),
+        "{rendered}"
+    );
+
+    // Existing status is not overwritten.
+    home_app.set_startup_tip("other tip");
+    assert_eq!(home_app.status(), tip);
+
+    // Subviews launched via initial_command do not show a startup home tip.
+    let mut subview_app = App::new(
+        &tmux,
+        AppOptions {
+            initial_command: Some("help".into()),
+        },
+    );
+    subview_app.set_startup_tip(tip);
+    assert!(subview_app.status().is_empty());
+}
+
+#[test]
+fn update_command_explains_terminal_update_flow() {
+    let tmux = offline_tmux();
+    let mut app = App::new(&tmux, AppOptions::default());
+
+    type_text(&mut app, "/update");
+    key(&mut app, KeyCode::Enter);
+    assert!(app.status().contains("jm update"), "{}", app.status());
+    assert!(app.status().contains("justmux update"), "{}", app.status());
+
+    let mut bare_app = App::new(&tmux, AppOptions::default());
+    type_text(&mut bare_app, "update");
+    key(&mut bare_app, KeyCode::Enter);
+    assert!(
+        bare_app.status().contains("jm update"),
+        "{}",
+        bare_app.status()
+    );
+}
+
+#[test]
+fn emblem_spin_rotates_hydra_and_toggles_via_config() {
+    let dir = TempDir::new().expect("tempdir");
+    let cfg_path = dir.path().join("config.toml");
+    let tmux = offline_tmux();
+    let cfg = Config::default();
+    assert_eq!(cfg.emblem_mode, EmblemMode::Spin);
+
+    let mut app = App::with_config(&tmux, AppOptions::default(), cfg, Some(cfg_path.clone()));
+    let ring_row_on = hydra_top_ring_row(32, 10, &app.theme());
+    let frame0 = render_app(&mut app, 120, 32).backend().to_string();
+    assert!(app.should_animate());
+    assert!(frame0.contains(&ring_row_on), "{frame0}");
+
+    // Advancing ticks rotates only the inner Hydra pattern while the outer ring stays motionless.
+    for _ in 0..9 {
+        app.tick_animation();
+    }
+    assert_eq!(app.emblem_step(), 9);
+    let rotated = render_app(&mut app, 120, 32).backend().to_string();
+    assert_ne!(rotated, frame0);
+    assert!(rotated.contains(&ring_row_on), "{rotated}");
+
+    // Verify full 48x24 scale preserves the canonical outer ring row verbatim across all animated modes.
+    let render_48 = |step, mode| {
+        let (_, lines) =
+            justmux::ui::hydra_emblem_mode_frame(48, 24, step, mode, app.theme()).expect("48x24");
+        lines
+            .into_iter()
+            .map(|l| l.spans.into_iter().map(|s| s.content).collect::<String>())
+            .collect::<Vec<String>>()
+    };
+    let text_48_0 = render_48(0, EmblemMode::Spin);
+    let text_48_9 = render_48(9, EmblemMode::Spin);
+    let inv_48_0 = render_48(0, EmblemMode::InvertedSpin);
+    let inv_48_9 = render_48(9, EmblemMode::InvertedSpin);
+    assert!(text_48_0[0].contains("⣀⣠⡤⠶⣖⣚⣛⣛⣿⣿⣛⣛⣓⣲⠶⢤⣄⣀"));
+    assert_eq!(text_48_9[0], text_48_0[0]);
+    assert_eq!(inv_48_0[0], text_48_0[0]);
+    assert_eq!(inv_48_9[0], text_48_0[0]);
+    assert_ne!(text_48_0, text_48_9);
+    assert_ne!(inv_48_0, text_48_0);
+    assert_ne!(inv_48_0, inv_48_9);
+
+    for _ in 9..justmux::ui::HYDRA_ROTATION_STEPS {
+        app.tick_animation();
+    }
+    let wrapped = render_app(&mut app, 120, 32).backend().to_string();
+    assert!(wrapped.contains(&ring_row_on), "{wrapped}");
+
+    // Advance away from frame 0, then verify compact/LiveRadar disable animation cleanly.
+    app.tick_animation();
+    assert_ne!(render_app(&mut app, 120, 32).backend().to_string(), wrapped);
+    let _ = render_app(&mut app, 100, 16);
+    assert!(!app.should_animate());
+
+    let _ = render_app(&mut app, 120, 32);
+    assert!(app.should_animate());
+    app.handle_event(Event::Key(KeyEvent::new(
+        KeyCode::BackTab,
+        KeyModifiers::SHIFT,
+    )));
+    let _ = render_app(&mut app, 120, 32);
+    assert!(!app.should_animate());
+
+    // Switch back from LiveRadar -> QuickLaunch where Hydra renders again.
+    app.handle_event(Event::Key(KeyEvent::new(
+        KeyCode::BackTab,
+        KeyModifiers::SHIFT,
+    )));
+    let _ = render_app(&mut app, 120, 32);
+    assert!(app.should_animate());
+
+    // Open /config and walk all 10 settings to verify every upper character-art + guide inspector.
+    type_text(&mut app, "/config");
+    key(&mut app, KeyCode::Enter);
+    let config_keys = [
+        "screen_mode",
+        "theme",
+        "composer_mode",
+        "live_preview",
+        "mouse",
+        "emblem_mode",
+        "inline_height",
+        "ascii",
+        "no_color",
+        "language",
+    ];
+    for (idx, cfg_key) in config_keys.iter().enumerate() {
+        let cfg_screen = render_app(&mut app, 120, 32).backend().to_string();
+        assert!(
+            cfg_screen.contains(&format!("JustMux Configuration · {cfg_key}")),
+            "missing inspector header on row {idx} ({cfg_key}):\n{cfg_screen}"
+        );
+        if idx + 1 < config_keys.len() {
+            key(&mut app, KeyCode::Down);
+        }
+    }
+
+    // Move up 4 rows from Row 9 (language) to Row 5 (emblem_mode) and cycle through all 3 modes:
+    // Spin -> InvertedSpin -> Static.
+    for _ in 0..4 {
+        key(&mut app, KeyCode::Up);
+    }
+    let row5_spin = render_app(&mut app, 120, 32).backend().to_string();
+    assert!(row5_spin.contains("static"), "{row5_spin}");
+    assert!(row5_spin.contains("spin"), "{row5_spin}");
+    assert!(row5_spin.contains("inverted-spin"), "{row5_spin}");
+    assert!(row5_spin.contains("(2/3)"), "{row5_spin}");
+
+    let ring_row_subview = hydra_top_ring_row(32, 13, &app.theme());
+    key(&mut app, KeyCode::Char(' '));
+    assert_eq!(app.config().emblem_mode, EmblemMode::InvertedSpin);
+    assert!(app.should_animate());
+    let inv_subview_a = render_app(&mut app, 120, 32).backend().to_string();
+    assert!(inv_subview_a.contains(&ring_row_subview), "{inv_subview_a}");
+    assert!(inv_subview_a.contains("(3/3)"), "{inv_subview_a}");
+    for _ in 0..9 {
+        app.tick_animation();
+    }
+    let inv_subview_b = render_app(&mut app, 120, 32).backend().to_string();
+    assert!(inv_subview_b.contains(&ring_row_subview), "{inv_subview_b}");
+    assert_ne!(inv_subview_a, inv_subview_b);
+
+    // Cycle from InvertedSpin -> Static: stops animation and resets emblem_step to 0, then save.
+    key(&mut app, KeyCode::Char(' '));
+    assert_eq!(app.config().emblem_mode, EmblemMode::Static);
+    assert!(!app.should_animate());
+    assert_eq!(app.emblem_step(), 0);
+    key(&mut app, KeyCode::Char('s'));
+    assert!(app.status().contains("Saved config to"));
+    let saved = config::load(&CliOverrides {
+        config_path: Some(cfg_path),
+        screen_mode: None,
+        theme: None,
+    })
+    .expect("reload saved config");
+    assert_eq!(saved.config.emblem_mode, EmblemMode::Static);
+
+    key(&mut app, KeyCode::Esc);
+    let static_home = render_app(&mut app, 120, 32).backend().to_string();
+    assert!(static_home.contains(&ring_row_on), "{static_home}");
+    assert!(!app.should_animate());
+}
+
+#[test]
+fn window_preview_scrolls_and_pages_through_tmux_scrollback_and_resets_on_switch() {
+    let server = PrivateServer::new();
+    let out = Command::new("tmux")
+        .args([
+            "-L",
+            &server.socket,
+            "-f",
+            "/dev/null",
+            "new-session",
+            "-d",
+            "-x",
+            "80",
+            "-y",
+            "12",
+            "-s",
+            "scroll-test",
+            "sh -c 'i=1; while [ $i -le 60 ]; do printf \"HIST_%02d\\n\" \"$i\"; i=$((i+1)); done; sleep 30'",
+        ])
+        .env_remove("TMUX")
+        .env_remove("TMUX_PANE")
+        .output()
+        .expect("spawn scroll-test session");
+    assert!(out.status.success());
+
+    let sid = server
+        .client
+        .list_sessions()
+        .expect("list sessions")
+        .into_iter()
+        .find(|s| s.name == "scroll-test")
+        .expect("scroll-test session")
+        .id;
+    wait_for_pane_text(&server.client, &Target::Session(sid.clone()), "HIST_60");
+
+    let _other_win = server
+        .client
+        .new_window(&sid, Some("other"), None)
+        .expect("second window");
+
+    let mut app = App::with_config(
+        &server.client,
+        AppOptions::default(),
+        Config::default(),
+        None,
+    );
+
+    // Initial Home render shows bottom of scrollback (HIST_60) and full line count badge (↕ 60L).
+    let init = render_app(&mut app, 120, 32).backend().to_string();
+    assert!(init.contains("HIST_60"), "{init}");
+    assert!(init.contains("↕ 60L"), "{init}");
+    assert!(!init.contains("HIST_01"), "{init}");
+
+    // PageUp pages backward into scrollback history; PageDown returns toward the bottom.
+    key(&mut app, KeyCode::PageUp);
+    let after_pgup = render_app(&mut app, 120, 32).backend().to_string();
+    assert!(after_pgup.contains("↑ +"), "{after_pgup}");
+    assert!(!after_pgup.contains("HIST_60"), "{after_pgup}");
+
+    key(&mut app, KeyCode::PageDown);
+    let after_pgdn = render_app(&mut app, 120, 32).backend().to_string();
+    assert!(after_pgdn.contains("HIST_60"), "{after_pgdn}");
+    assert!(after_pgdn.contains("↕ 60L"), "{after_pgdn}");
+
+    // Empty-bar Home/End jump to the top (HIST_01) and back to the bottom (HIST_60).
+    key(&mut app, KeyCode::Home);
+    let at_top = render_app(&mut app, 120, 32).backend().to_string();
+    assert!(at_top.contains("HIST_01"), "{at_top}");
+    assert!(!at_top.contains("HIST_60"), "{at_top}");
+
+    key(&mut app, KeyCode::End);
+    let at_bottom = render_app(&mut app, 120, 32).backend().to_string();
+    assert!(at_bottom.contains("HIST_60"), "{at_bottom}");
+    assert!(at_bottom.contains("↕ 60L"), "{at_bottom}");
+
+    // Empty-bar Ctrl+U / Ctrl+D half-page up and down through scrollback.
+    key_mod(&mut app, KeyCode::Char('u'), KeyModifiers::CONTROL);
+    let after_ctrl_u = render_app(&mut app, 120, 32).backend().to_string();
+    assert!(after_ctrl_u.contains("↑ +"), "{after_ctrl_u}");
+    assert!(!after_ctrl_u.contains("HIST_60"), "{after_ctrl_u}");
+
+    key_mod(&mut app, KeyCode::Char('d'), KeyModifiers::CONTROL);
+    let after_ctrl_d = render_app(&mut app, 120, 32).backend().to_string();
+    assert!(after_ctrl_d.contains("HIST_60"), "{after_ctrl_d}");
+    assert!(after_ctrl_d.contains("↕ 60L"), "{after_ctrl_d}");
+
+    // Non-empty Ctrl+U clears the composer instead of scrolling Window Preview.
+    type_text(&mut app, "scrollquery");
+    key_mod(&mut app, KeyCode::Char('u'), KeyModifiers::CONTROL);
+    let after_clear = render_app(&mut app, 120, 32).backend().to_string();
+    assert!(!after_clear.contains("scrollquery"), "{after_clear}");
+    assert!(after_clear.contains("HIST_60"), "{after_clear}");
+    assert!(after_clear.contains("↕ 60L"), "{after_clear}");
+
+    // Mouse wheel inside Window Preview scrolls scrollback in 3-line steps.
+    app.handle_event(mouse_event(MouseEventKind::ScrollUp, 10, 4));
+    let wheel_up = render_app(&mut app, 120, 32).backend().to_string();
+    assert!(wheel_up.contains("↑ +3/"), "{wheel_up}");
+    app.handle_event(mouse_event(MouseEventKind::ScrollDown, 10, 4));
+    let wheel_down = render_app(&mut app, 120, 32).backend().to_string();
+    assert!(wheel_down.contains("↕ 60L"), "{wheel_down}");
+
+    // Switching windows resets preview scroll to 0 (bottom of the newly selected window).
+    key(&mut app, KeyCode::Home);
+    assert!(
+        render_app(&mut app, 120, 32)
+            .backend()
+            .to_string()
+            .contains("HIST_01")
+    );
+    key(&mut app, KeyCode::Down);
+    let on_other = render_app(&mut app, 120, 32).backend().to_string();
+    assert!(on_other.contains("1: other"), "{on_other}");
+    assert!(!on_other.contains("HIST_01"), "{on_other}");
+    assert!(!on_other.contains("↑ +"), "{on_other}");
+
+    key(&mut app, KeyCode::Up);
+    let back_to_hist = render_app(&mut app, 120, 32).backend().to_string();
+    assert!(back_to_hist.contains("HIST_60"), "{back_to_hist}");
+    assert!(back_to_hist.contains("↕ 60L"), "{back_to_hist}");
+    assert!(!back_to_hist.contains("HIST_01"), "{back_to_hist}");
+}
+
+fn find_buffer_text(buf: &ratatui::buffer::Buffer, needle: &str) -> Option<(u16, u16)> {
+    let chars: Vec<String> = needle.chars().map(|ch| ch.to_string()).collect();
+    if chars.is_empty() || buf.area.width < chars.len() as u16 {
+        return None;
+    }
+    for y in 0..buf.area.height {
+        let max_x = buf.area.width - chars.len() as u16;
+        for x in 0..=max_x {
+            if chars
+                .iter()
+                .enumerate()
+                .all(|(i, expected)| buf[(x + i as u16, y)].symbol() == expected)
+            {
+                return Some((x, y));
+            }
+        }
+    }
+    None
+}
+
+#[test]
+fn window_preview_renders_ansi_256_and_truecolor_pane_output() {
+    let server = PrivateServer::new();
+    let out = Command::new("tmux")
+        .args([
+            "-L",
+            &server.socket,
+            "-f",
+            "/dev/null",
+            "new-session",
+            "-d",
+            "-x",
+            "100",
+            "-y",
+            "12",
+            "-s",
+            "sgr-preview",
+            "sh -c 'printf \"\\033[1;32mANSI_GREEN\\033[0m \\033[38;5;208mIDX_ORANGE\\033[0m \\033[38;2;120;180;255mRGB_SKY\\033[0m\\n\"; sleep 30'",
+        ])
+        .env_remove("TMUX")
+        .env_remove("TMUX_PANE")
+        .output()
+        .expect("spawn sgr-preview session");
+    assert!(out.status.success());
+
+    let sid = server
+        .client
+        .list_sessions()
+        .expect("list sessions")
+        .into_iter()
+        .find(|s| s.name == "sgr-preview")
+        .expect("sgr-preview session")
+        .id;
+    wait_for_pane_text(&server.client, &Target::Session(sid), "RGB_SKY");
+
+    let mut app = App::with_config(
+        &server.client,
+        AppOptions::default(),
+        Config::default(),
+        None,
+    );
+    let term = render_app(&mut app, 120, 32);
+    let buf = term.backend().buffer();
+
+    let (green_col, green_row) = find_buffer_text(buf, "ANSI_GREEN").expect("ANSI_GREEN cell");
+    for offset in 0.."ANSI_GREEN".len() {
+        let cell = &buf[(green_col + offset as u16, green_row)];
+        assert_eq!(cell.fg, Color::Green, "green offset {offset}");
+        assert!(
+            cell.modifier.contains(Modifier::BOLD),
+            "bold offset {offset}"
+        );
+    }
+
+    let (orange_col, orange_row) = find_buffer_text(buf, "IDX_ORANGE").expect("IDX_ORANGE cell");
+    for offset in 0.."IDX_ORANGE".len() {
+        let cell = &buf[(orange_col + offset as u16, orange_row)];
+        assert_eq!(cell.fg, Color::Indexed(208), "orange offset {offset}");
+    }
+
+    let (rgb_col, rgb_row) = find_buffer_text(buf, "RGB_SKY").expect("RGB_SKY cell");
+    for offset in 0.."RGB_SKY".len() {
+        let cell = &buf[(rgb_col + offset as u16, rgb_row)];
+        assert_eq!(cell.fg, Color::Rgb(120, 180, 255), "rgb offset {offset}");
+    }
+
+    let mut no_color_app = App::with_config(
+        &server.client,
+        AppOptions::default(),
+        Config {
+            no_color: true,
+            ..Config::default()
+        },
+        None,
+    );
+    let no_color_term = render_app(&mut no_color_app, 120, 32);
+    let rendered = no_color_term.backend().to_string();
+    assert!(rendered.contains("RGB_SKY"), "{rendered}");
+    for cell in no_color_term.backend().buffer().content() {
+        assert_eq!(cell.fg, Color::Reset, "fg reset on {cell:?}");
+        assert_eq!(cell.bg, Color::Reset, "bg reset on {cell:?}");
+    }
 }
