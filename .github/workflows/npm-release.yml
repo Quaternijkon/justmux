@@ -98,8 +98,26 @@ jobs:
         env:
           DEBIAN_FRONTEND: noninteractive
         run: |
-          sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 update
-          sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 install --yes --no-install-recommends tmux musl-tools binutils
+          set -euo pipefail
+          pkgs=()
+          command -v tmux >/dev/null || pkgs+=(tmux)
+          command -v musl-gcc >/dev/null || pkgs+=(musl-tools)
+          command -v readelf >/dev/null || pkgs+=(binutils)
+          if (( ${#pkgs[@]} > 0 )); then
+            apt_opts=(-o Acquire::ForceIPv4=true -o Acquire::Retries=1 -o Acquire::http::Timeout=15 -o Acquire::https::Timeout=15)
+            apt_dir="$(mktemp -d)"
+            trap 'rm -rf "$apt_dir"' EXIT
+            if [[ -f /etc/apt/sources.list.d/ubuntu.sources ]]; then
+              cp /etc/apt/sources.list.d/ubuntu.sources "$apt_dir/"
+              apt_opts+=(-o "Dir::Etc::sourceparts=$apt_dir" -o "Dir::Etc::sourcelist=/dev/null")
+            fi
+            if ! timeout 45 sudo apt-get "${apt_opts[@]}" update; then
+              echo "Default Ubuntu mirror stalled; switching to mirrors.edge.kernel.org"
+              sed -i 's|https\?://[^ ]*ubuntu\.com/ubuntu|https://mirrors.edge.kernel.org/ubuntu|g' "$apt_dir/ubuntu.sources" 2>/dev/null || true
+              timeout 60 sudo apt-get "${apt_opts[@]}" update
+            fi
+            sudo apt-get "${apt_opts[@]}" install --yes --no-install-recommends "${pkgs[@]}"
+          fi
       - name: Install macOS test dependency
         if: runner.os == 'macOS'
         run: |

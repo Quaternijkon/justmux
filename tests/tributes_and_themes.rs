@@ -1166,7 +1166,33 @@ fn fullscreen_mouse_scroll_and_clicks_navigate_and_respect_mouse_flag() {
         Config::default(),
         None,
     );
-    let matrix_term = render_app(&mut matrix_app, 100, 24);
+    let mut matrix_term = render_app(&mut matrix_app, 100, 24);
+    // Session columns are ordered by 1-second tmux activity timestamps, so
+    // ensure `alpha:0` is selected before testing its 30-line preview scroll.
+    if !matrix_term
+        .backend()
+        .to_string()
+        .contains("Window Preview · alpha")
+    {
+        key(&mut matrix_app, KeyCode::Right);
+        matrix_term = render_app(&mut matrix_app, 100, 24);
+    }
+    if matrix_term
+        .backend()
+        .to_string()
+        .contains("Window Preview · alpha · 1:")
+    {
+        key(&mut matrix_app, KeyCode::Up);
+        matrix_term = render_app(&mut matrix_app, 100, 24);
+    }
+    assert!(
+        matrix_term
+            .backend()
+            .to_string()
+            .contains("Window Preview · alpha"),
+        "{}",
+        matrix_term.backend()
+    );
     // Wheel inside Window Preview (top band) scrolls preview without leaving alpha:0.
     matrix_app.handle_event(mouse_event(MouseEventKind::ScrollUp, 10, 4));
     let preview_scrolled = render_app(&mut matrix_app, 100, 24).backend().to_string();
