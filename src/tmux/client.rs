@@ -121,6 +121,8 @@ impl TmuxClient {
         if low.contains("no server running")
             || low.contains("error connecting")
             || low.contains("can't find socket")
+            || low.contains("server exited unexpectedly")
+            || low.contains("lost server")
         {
             TmuxError::NoServer
         } else if low.contains("duplicate") || low.contains("already exists") {
@@ -2100,10 +2102,46 @@ mod tests {
 
         // kill_server shuts down the private server cleanly.
         server.client.kill_server().expect("kill_server");
-        assert!(!server.client.server_running().expect("server_running"));
+        let shutdown_deadline = Instant::now() + Duration::from_secs(2);
+        while server.client.server_running().expect("server_running") {
+            assert!(
+                Instant::now() < shutdown_deadline,
+                "private tmux server stayed running after kill_server"
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
         assert!(matches!(
             server.client.kill_server(),
             Err(TmuxError::NoServer)
+        ));
+    }
+
+    #[test]
+    fn map_error_treats_server_teardown_messages_as_no_server() {
+        use std::os::unix::process::ExitStatusExt;
+
+        let client = TmuxClient::new(SocketSpec::Default);
+        let mk_output = |stderr: &str| Output {
+            status: std::process::ExitStatus::from_raw(1 << 8),
+            stdout: Vec::new(),
+            stderr: stderr.as_bytes().to_vec(),
+        };
+
+        assert!(matches!(
+            client.map_error("has-session", &mk_output("no server running on /tmp/x")),
+            TmuxError::NoServer
+        ));
+        assert!(matches!(
+            client.map_error("has-session", &mk_output("server exited unexpectedly")),
+            TmuxError::NoServer
+        ));
+        assert!(matches!(
+            client.map_error("has-session", &mk_output("lost server")),
+            TmuxError::NoServer
+        ));
+        assert!(matches!(
+            client.map_error("has-session", &mk_output("unknown command")),
+            TmuxError::CommandFailed { .. }
         ));
     }
 
