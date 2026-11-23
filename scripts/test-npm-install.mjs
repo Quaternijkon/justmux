@@ -195,13 +195,12 @@ spec = importlib.util.spec_from_file_location('justmux_installed_pty', sys.argv[
 smoke = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(smoke)
 smoke.JM = Path(sys.argv[2])
-socket = smoke.Socket()
-try:
-    smoke.external(socket)
-    socket.cleanup()
-    smoke.popup(socket)
-finally:
-    socket.cleanup()
+for scenario in (smoke.external, smoke.popup):
+    socket = smoke.Socket()
+    try:
+        scenario(socket)
+    finally:
+        socket.cleanup()
 `, path.join(root, 'scripts', 'pty_smoke.py'), path.join(prefix, 'bin', 'jm')], { timeout: 60_000 });
     process.stdout.write(pty.stdout);
     console.log('PASS installed npm launcher PTY: exec handoff to native tmux and two-client Popup switch');

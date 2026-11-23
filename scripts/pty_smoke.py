@@ -285,6 +285,14 @@ class Socket:
 
     def cleanup(self):
         self.run("kill-server", check=False)
+        deadline = time.monotonic() + 2.0
+        while time.monotonic() < deadline:
+            probe = subprocess.run(self.argv("has-session"), env=clean_env(), text=True,
+                                   capture_output=True, timeout=5)
+            err = probe.stderr.lower()
+            if probe.returncode != 0 and "server exited unexpectedly" not in err and "lost server" not in err:
+                break
+            time.sleep(0.02)
 
     def clients(self):
         output = self.run("list-clients", "-F", "#{client_pid}\t#{client_name}\t#{client_session}")
