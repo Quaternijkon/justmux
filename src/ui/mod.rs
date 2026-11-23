@@ -1,5 +1,9 @@
 //! Small, tmux-agnostic Ratatui widgets used by JustMux.
 
+mod controller;
+pub use controller::*;
+mod desktop;
+pub use desktop::*;
 mod palette;
 pub use palette::*;
 mod split;
@@ -266,6 +270,7 @@ pub struct HomeTelemetry<'a> {
     pub sessions: Option<usize>,
     pub windows: Option<usize>,
     pub attached: Option<usize>,
+    pub clients: Option<usize>,
     pub hint_badge: Option<&'a str>,
 }
 
@@ -287,6 +292,40 @@ pub struct PanePreview<'a> {
     pub subtitle: &'a str,
     pub lines: &'a [String],
     pub scroll: usize,
+    /// Optional search query highlighted across visible preview lines.
+    pub search_query: Option<&'a str>,
+    /// True while the user is actively editing the inline preview search bar.
+    pub search_active: bool,
+    /// Total matched occurrences across the captured buffer.
+    pub match_count: usize,
+    /// 1-based index of the currently focused match (`0` if none).
+    pub current_match: usize,
+    /// Multi-pane indicator `(current_1based, total_panes)` when window has > 1 pane.
+    pub pane_index: Option<(usize, usize)>,
+    /// True when the active pane is zoomed (`resize-pane -Z`).
+    pub zoomed: bool,
+    /// True when `synchronize-panes` is enabled on the window.
+    pub synchronized: bool,
+    /// True when `pipe-pane` live logging is active on the pane.
+    pub piping: bool,
+    /// Render clickable `[f Search]`, `[y Copy]`, `[Log]`, `[Pipe]` pills & window controls on card chrome.
+    pub show_actions: bool,
+    /// True while Live Interactive Preview (PIP direct keystroke forwarding) is active.
+    pub pip_active: bool,
+    /// Currently hovered preview action pill / window control button.
+    pub hovered_action: Option<PreviewAction>,
+    /// True when mouse hovers the right-edge VS Code scrollbar.
+    pub scrollbar_hovered: bool,
+    /// True while mouse drags the right-edge VS Code scrollbar thumb.
+    pub scrollbar_dragging: bool,
+    /// 0-based line indices into `lines` containing search matches (rendered as amber scrollbar ticks).
+    pub search_match_lines: &'a [usize],
+    /// 0-based line indices into `lines` containing errors/warnings (rendered as red scrollbar ticks).
+    pub error_lines: &'a [usize],
+    /// 0-indexed `(visible_row, char_col)` drag-selection range relative to `content_rect`.
+    pub selection_range: Option<((usize, usize), (usize, usize))>,
+    /// Optional VS Code edge dock drop-zone overlay highlighted over the preview card.
+    pub dock_highlight: Option<DockZone>,
 }
 
 /// `@target` completion candidate rendered by the mention popup drawer.
@@ -499,19 +538,30 @@ pub struct WorkspaceHomeSpec<'a> {
     pub radar_selected: usize,
     pub preview: Option<PanePreview<'a>>,
     pub live_preview: bool,
+    pub inside_tmux: bool,
     pub emblem_step: usize,
     pub emblem_mode: EmblemMode,
     pub popup: &'a [CommandItem<'a>],
     pub popup_selected: usize,
+    pub menubar: DesktopMenubarState<'a>,
+    /// Adjustable upper-preview split percentage (`25..=75`; `0` uses responsive default).
+    pub home_split_ratio: u16,
+    pub home_sash_hovered: bool,
+    pub home_sash_dragging: bool,
 }
 
 /// Computed sub-regions produced by [`render_workspace_home`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct WorkspaceHomeLayout {
     pub matrix_body: Rect,
     pub preview_area: Option<Rect>,
     pub tab_hits: [(Rect, MatrixAction); 4],
+    pub quick_action_hits: Vec<(Rect, HomeQuickAction)>,
+    pub preview_action_hits: Vec<(Rect, PreviewAction)>,
     pub hydra_rendered: bool,
+    pub menubar_hits: Vec<(Rect, MenubarItem)>,
+    pub sash_hits: Vec<(Rect, SashId)>,
+    pub preview_layout: PreviewCardLayout,
 }
 
 /// Report whether [`render_home_studio`] renders the Hydra emblem for `area` and `mode`.
@@ -570,12 +620,18 @@ fn workspace_card_inner_area(area: Rect) -> Option<Rect> {
     if area.width < 36 || area.height < 12 {
         return None;
     }
+    let body = if area.height >= 17 {
+        let [_, rest] = Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(area);
+        rest
+    } else {
+        area
+    };
     let [card_area, _, _] = Layout::vertical([
         Constraint::Min(0),
         Constraint::Length(3),
         Constraint::Length(1),
     ])
-    .areas(area);
+    .areas(body);
     let raw_inner = Block::default().borders(Borders::ALL).inner(card_area);
     if raw_inner.width == 0 || raw_inner.height == 0 {
         return None;
@@ -635,19 +691,36 @@ fn plan_workspace_card_body(
     composer_mode: ComposerMode,
     live_preview: bool,
     has_preview: bool,
+    home_split_ratio: u16,
 ) -> WorkspaceBodyPlan {
     if composer_mode == ComposerMode::LiveRadar {
         return WorkspaceBodyPlan::LiveRadar;
     }
-    if card_inner.height >= 16 {
+    if card_inner.height >= 15 {
         let [upper_band, rule_area, lower_band] = if live_preview {
-            let lower_h = ((card_inner.height * 2) / 5).clamp(8, 16);
-            Layout::vertical([
-                Constraint::Min(7),
-                Constraint::Length(1),
-                Constraint::Length(lower_h),
-            ])
-            .areas(card_inner)
+            if home_split_ratio != 0 {
+                let avail = card_inner.height.saturating_sub(1);
+                let pct = home_split_ratio.clamp(25, 75);
+                let min_upper = 5_u16.min(avail.saturating_sub(5));
+                let max_upper = avail.saturating_sub(5).max(min_upper);
+                let upper_h = (((u32::from(avail) * u32::from(pct) + 50) / 100) as u16)
+                    .clamp(min_upper, max_upper);
+                let lower_h = avail.saturating_sub(upper_h);
+                Layout::vertical([
+                    Constraint::Length(upper_h),
+                    Constraint::Length(1),
+                    Constraint::Length(lower_h),
+                ])
+                .areas(card_inner)
+            } else {
+                let lower_h = ((card_inner.height * 2) / 5).clamp(8, 16);
+                Layout::vertical([
+                    Constraint::Min(6),
+                    Constraint::Length(1),
+                    Constraint::Length(lower_h),
+                ])
+                .areas(card_inner)
+            }
         } else {
             Layout::vertical([
                 Constraint::Length(4),
@@ -664,9 +737,9 @@ fn plan_workspace_card_body(
             hydra_box,
         };
     }
-    if live_preview && has_preview && card_inner.height >= 10 && card_inner.width >= 60 {
+    if live_preview && has_preview && card_inner.height >= 9 && card_inner.width >= 60 {
         let [preview_box, matrix_body] =
-            Layout::vertical([Constraint::Min(5), Constraint::Length(5)]).areas(card_inner);
+            Layout::vertical([Constraint::Min(4), Constraint::Length(5)]).areas(card_inner);
         return WorkspaceBodyPlan::CompactWithPreview {
             preview_box,
             matrix_body,
@@ -684,7 +757,7 @@ pub fn workspace_home_renders_hydra(area: Rect, composer_mode: ComposerMode) -> 
         return false;
     };
     matches!(
-        plan_workspace_card_body(card_inner, composer_mode, false, false),
+        plan_workspace_card_body(card_inner, composer_mode, false, false, 0),
         WorkspaceBodyPlan::SplitUpperLower {
             hydra_box: Some(_),
             ..
@@ -697,12 +770,14 @@ struct WorkspaceOuterSpec<'a> {
     telemetry: HomeTelemetry<'a>,
     border_color: Color,
     mode_pill: Option<(&'a str, Color)>,
+    menubar: DesktopMenubarState<'a>,
 }
 
 struct WorkspaceOuterAreas {
     card_inner: Option<Rect>,
     composer: Rect,
     footer: Rect,
+    menubar_hits: Vec<(Rect, MenubarItem)>,
 }
 
 fn render_workspace_outer_frame(
@@ -711,12 +786,20 @@ fn render_workspace_outer_frame(
     spec: WorkspaceOuterSpec<'_>,
     theme: Theme,
 ) -> WorkspaceOuterAreas {
+    let (menubar_hits, body_area) = if area.height >= 17 {
+        let [bar_area, rest] =
+            Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(area);
+        let hits = render_desktop_menubar(frame, bar_area, spec.menubar, theme);
+        (hits, rest)
+    } else {
+        (Vec::new(), area)
+    };
     let [card_area, composer, footer] = Layout::vertical([
         Constraint::Min(0),
         Constraint::Length(3),
         Constraint::Length(1),
     ])
-    .areas(area);
+    .areas(body_area);
 
     let max_title_width = usize::from(card_area.width.saturating_sub(3));
     let mut title_spans = build_home_card_title_prefix(
@@ -764,18 +847,28 @@ fn render_workspace_outer_frame(
         card_inner,
         composer,
         footer,
+        menubar_hits,
     }
 }
+
+type ActionTabsLayout = ([(Rect, MatrixAction); 4], Vec<(Rect, HomeQuickAction)>);
+type MatrixWithTabsLayout = (
+    Rect,
+    [(Rect, MatrixAction); 4],
+    Vec<(Rect, HomeQuickAction)>,
+);
 
 fn render_workspace_action_tabs(
     frame: &mut Frame<'_>,
     tabs_area: Rect,
     active_action: MatrixAction,
+    inside_tmux: bool,
     theme: Theme,
-) -> [(Rect, MatrixAction); 4] {
+) -> ActionTabsLayout {
     let mut tab_hits = [(Rect::default(), MatrixAction::Open); 4];
+    let mut quick_hits = Vec::new();
     if tabs_area.width == 0 || tabs_area.height == 0 {
-        return tab_hits;
+        return (tab_hits, quick_hits);
     }
     let scope = match active_action {
         MatrixAction::Rename(s) | MatrixAction::Kill(s) => s,
@@ -872,9 +965,94 @@ fn render_workspace_action_tabs(
     let hint = if theme.ascii { "  Tab" } else { "  Tab ⇄" };
     if x + (hint.width() as u16) <= max_x {
         spans.extend(styled_key_hint_spans(hint, theme.style(theme.muted), theme));
+        x = x.saturating_add(hint.width() as u16);
     }
+
+    // Right-aligned zero-memorization quick pills (prioritizing `[ ⏏ Detach ]` when inside tmux).
+    let rem = usize::from(max_x.saturating_sub(x));
+    if rem >= 10 {
+        let bg = theme.pill_bg();
+        let detach_full = if theme.ascii {
+            "[Detach]"
+        } else if zh {
+            "[ ⏏ 分离 ]"
+        } else {
+            "[ ⏏ Detach ]"
+        };
+        let detach_short = if theme.ascii {
+            "[Det]"
+        } else if zh {
+            "[⏏ 分离]"
+        } else {
+            "[⏏ Det]"
+        };
+        let panes_lbl = if theme.ascii {
+            "[Panes]"
+        } else if zh {
+            "[ ⊞ 窗格 ]"
+        } else {
+            "[ ⊞ Panes ]"
+        };
+        let layout_lbl = if theme.ascii {
+            "[Layout]"
+        } else if zh {
+            "[ ▦ 布局 ]"
+        } else {
+            "[ ▦ Layout ]"
+        };
+
+        let mut chosen: Vec<(HomeQuickAction, &str, Color, bool)> = Vec::new();
+        let mut used_right = 0_usize;
+        let max_right = rem.saturating_sub(2);
+        if inside_tmux {
+            if detach_full.width() <= max_right {
+                chosen.push((HomeQuickAction::Detach, detach_full, theme.warning, true));
+                used_right += detach_full.width();
+            } else if detach_short.width() <= max_right {
+                chosen.push((HomeQuickAction::Detach, detach_short, theme.warning, true));
+                used_right += detach_short.width();
+            }
+        }
+        for (act, lbl) in [
+            (HomeQuickAction::Layout, layout_lbl),
+            (HomeQuickAction::Panes, panes_lbl),
+        ] {
+            let need = lbl.width() + usize::from(!chosen.is_empty());
+            if used_right + need <= max_right {
+                chosen.insert(0, (act, lbl, theme.secondary, false));
+                used_right += need;
+            }
+        }
+
+        if !chosen.is_empty() {
+            let pad = rem.saturating_sub(used_right);
+            if pad > 0 {
+                spans.push(Span::raw(" ".repeat(pad)));
+                x = x.saturating_add(u16::try_from(pad).unwrap_or(0));
+            }
+            for (idx, (act, lbl, color, bold)) in chosen.into_iter().enumerate() {
+                if idx > 0 {
+                    spans.push(Span::raw(" "));
+                    x = x.saturating_add(1);
+                }
+                let w = u16::try_from(lbl.width()).unwrap_or(0);
+                spans.push(pill_span(lbl, color, bg, theme, bold));
+                quick_hits.push((
+                    Rect {
+                        x,
+                        y: tabs_area.y,
+                        width: w,
+                        height: 1,
+                    },
+                    act,
+                ));
+                x = x.saturating_add(w);
+            }
+        }
+    }
+
     frame.render_widget(Paragraph::new(Line::from(spans)), tabs_area);
-    tab_hits
+    (tab_hits, quick_hits)
 }
 
 fn render_matrix_with_tabs(
@@ -882,18 +1060,24 @@ fn render_matrix_with_tabs(
     matrix_body: Rect,
     mode: ComposerMode,
     action: MatrixAction,
+    inside_tmux: bool,
     theme: Theme,
     mut render_matrix: impl FnMut(&mut Frame<'_>, Rect),
-) -> (Rect, [(Rect, MatrixAction); 4]) {
+) -> MatrixWithTabsLayout {
     if mode == ComposerMode::CommandJump && matrix_body.height >= 4 {
         let [tabs_area, inner_matrix_body] =
             Layout::vertical([Constraint::Length(1), Constraint::Min(1)]).areas(matrix_body);
-        let tab_hits = render_workspace_action_tabs(frame, tabs_area, action, theme);
+        let (tab_hits, quick_hits) =
+            render_workspace_action_tabs(frame, tabs_area, action, inside_tmux, theme);
         render_matrix(frame, inner_matrix_body);
-        (inner_matrix_body, tab_hits)
+        (inner_matrix_body, tab_hits, quick_hits)
     } else {
         render_matrix(frame, matrix_body);
-        (matrix_body, [(Rect::default(), MatrixAction::Open); 4])
+        (
+            matrix_body,
+            [(Rect::default(), MatrixAction::Open); 4],
+            Vec::new(),
+        )
     }
 }
 
@@ -946,11 +1130,12 @@ pub fn render_workspace_home(
             }
             frame.render_widget(Paragraph::new(Line::from(title_spans)), header_area);
         }
-        let (matrix_body, tab_hits) = render_matrix_with_tabs(
+        let (matrix_body, tab_hits, quick_action_hits) = render_matrix_with_tabs(
             frame,
             raw_matrix_body,
             spec.composer_mode,
             spec.action,
+            spec.inside_tmux,
             theme,
             &mut render_matrix,
         );
@@ -979,10 +1164,19 @@ pub fn render_workspace_home(
             matrix_body,
             preview_area: None,
             tab_hits,
+            quick_action_hits,
+            preview_action_hits: Vec::new(),
             hydra_rendered: false,
+            menubar_hits: Vec::new(),
+            sash_hits: Vec::new(),
+            preview_layout: PreviewCardLayout::default(),
         };
     }
 
+    let menubar_state = DesktopMenubarState {
+        inside_tmux: spec.menubar.inside_tmux || spec.inside_tmux,
+        ..spec.menubar
+    };
     let outer = render_workspace_outer_frame(
         frame,
         area,
@@ -994,9 +1188,11 @@ pub fn render_workspace_home(
                 .action
                 .mode_pill_for(theme.language)
                 .map(|label| (label, spec.action.border_color(theme))),
+            menubar: menubar_state,
         },
         theme,
     );
+    let menubar_hits = outer.menubar_hits;
 
     let layout = if let Some(card_inner) = outer.card_inner {
         match plan_workspace_card_body(
@@ -1004,9 +1200,10 @@ pub fn render_workspace_home(
             spec.composer_mode,
             spec.live_preview,
             spec.preview.is_some(),
+            spec.home_split_ratio,
         ) {
             WorkspaceBodyPlan::LiveRadar => {
-                render_live_radar(
+                let radar_preview = render_live_radar(
                     frame,
                     card_inner,
                     HomeDashboardState {
@@ -1018,14 +1215,21 @@ pub fn render_workspace_home(
                     },
                     theme,
                 );
+                let preview_action_hits = radar_preview.action_hits.clone();
                 WorkspaceHomeLayout {
                     matrix_body: Rect::default(),
-                    preview_area: (card_inner.width >= 54 && spec.live_preview).then(|| {
-                        Layout::horizontal([Constraint::Percentage(46), Constraint::Percentage(54)])
-                            .areas::<2>(card_inner)[1]
-                    }),
+                    preview_area: if spec.live_preview {
+                        radar_preview.area
+                    } else {
+                        None
+                    },
                     tab_hits: [(Rect::default(), MatrixAction::Open); 4],
+                    quick_action_hits: Vec::new(),
+                    preview_action_hits,
                     hydra_rendered: false,
+                    menubar_hits,
+                    sash_hits: Vec::new(),
+                    preview_layout: radar_preview,
                 }
             }
             WorkspaceBodyPlan::SplitUpperLower {
@@ -1034,17 +1238,43 @@ pub fn render_workspace_home(
                 matrix_body: raw_matrix_body,
                 hydra_box,
             } => {
-                if spec.live_preview {
-                    render_workspace_preview_card(frame, upper_band, spec.preview, theme);
+                let preview_layout = if spec.live_preview {
+                    render_workspace_preview_card(frame, upper_band, spec.preview, theme)
                 } else {
                     render_workspace_action_hints(frame, upper_band, spec.action, theme);
+                    PreviewCardLayout::default()
+                };
+                let mut sash_hits = Vec::new();
+                if spec.live_preview {
+                    let total_h = upper_band
+                        .height
+                        .saturating_add(raw_matrix_body.height)
+                        .max(1);
+                    let ratio_pct = if spec.home_split_ratio != 0 {
+                        spec.home_split_ratio.clamp(25, 75)
+                    } else {
+                        ((u32::from(upper_band.height) * 100 + u32::from(total_h) / 2)
+                            / u32::from(total_h)) as u16
+                    };
+                    render_sash_divider(
+                        frame,
+                        rule_area,
+                        false,
+                        ratio_pct,
+                        spec.home_sash_hovered,
+                        spec.home_sash_dragging,
+                        theme,
+                    );
+                    sash_hits.push((rule_area, SashId::HomePreviewMatrix));
+                } else {
+                    render_horizontal_divider_line(frame, rule_area, theme);
                 }
-                render_horizontal_divider_line(frame, rule_area, theme);
-                let (matrix_body, tab_hits) = render_matrix_with_tabs(
+                let (matrix_body, tab_hits, quick_action_hits) = render_matrix_with_tabs(
                     frame,
                     raw_matrix_body,
                     spec.composer_mode,
                     spec.action,
+                    spec.inside_tmux,
                     theme,
                     &mut render_matrix,
                 );
@@ -1055,41 +1285,56 @@ pub fn render_workspace_home(
                     spec.emblem_mode,
                     theme,
                 );
+                let preview_action_hits = preview_layout.action_hits.clone();
                 WorkspaceHomeLayout {
                     matrix_body,
                     preview_area: spec.live_preview.then_some(upper_band),
                     tab_hits,
+                    quick_action_hits,
+                    preview_action_hits,
                     hydra_rendered,
+                    menubar_hits,
+                    sash_hits,
+                    preview_layout,
                 }
             }
             WorkspaceBodyPlan::CompactWithPreview {
                 preview_box,
                 matrix_body: raw_matrix_body,
             } => {
-                render_workspace_preview_card(frame, preview_box, spec.preview, theme);
-                let (matrix_body, tab_hits) = render_matrix_with_tabs(
+                let preview_layout =
+                    render_workspace_preview_card(frame, preview_box, spec.preview, theme);
+                let (matrix_body, tab_hits, quick_action_hits) = render_matrix_with_tabs(
                     frame,
                     raw_matrix_body,
                     spec.composer_mode,
                     spec.action,
+                    spec.inside_tmux,
                     theme,
                     &mut render_matrix,
                 );
+                let preview_action_hits = preview_layout.action_hits.clone();
                 WorkspaceHomeLayout {
                     matrix_body,
                     preview_area: Some(preview_box),
                     tab_hits,
+                    quick_action_hits,
+                    preview_action_hits,
                     hydra_rendered: false,
+                    menubar_hits,
+                    sash_hits: Vec::new(),
+                    preview_layout,
                 }
             }
             WorkspaceBodyPlan::MatrixOnly {
                 matrix_body: raw_matrix_body,
             } => {
-                let (matrix_body, tab_hits) = render_matrix_with_tabs(
+                let (matrix_body, tab_hits, quick_action_hits) = render_matrix_with_tabs(
                     frame,
                     raw_matrix_body,
                     spec.composer_mode,
                     spec.action,
+                    spec.inside_tmux,
                     theme,
                     &mut render_matrix,
                 );
@@ -1097,12 +1342,20 @@ pub fn render_workspace_home(
                     matrix_body,
                     preview_area: None,
                     tab_hits,
+                    quick_action_hits,
+                    preview_action_hits: Vec::new(),
                     hydra_rendered: false,
+                    menubar_hits,
+                    sash_hits: Vec::new(),
+                    preview_layout: PreviewCardLayout::default(),
                 }
             }
         }
     } else {
-        WorkspaceHomeLayout::default()
+        WorkspaceHomeLayout {
+            menubar_hits,
+            ..WorkspaceHomeLayout::default()
+        }
     };
 
     let zh = theme.language.is_zh() && !theme.ascii;
@@ -1287,6 +1540,12 @@ pub struct WorkspaceSubviewLayout {
     pub confirm_scroll: u16,
     pub split_slot_hits: Vec<(Rect, usize)>,
     pub split_toolbar_hits: Vec<(Rect, SplitToolbarButton)>,
+    pub preview_action_hits: Vec<(Rect, PreviewAction)>,
+    pub controller_hits: Vec<(Rect, ControllerAction)>,
+    pub menubar_hits: Vec<(Rect, MenubarItem)>,
+    pub sash_hits: Vec<(Rect, SashId)>,
+    pub expose_tile_hits: Vec<ExposeTileHit>,
+    pub preview_layout: PreviewCardLayout,
 }
 
 /// Interactive view payload rendered inside the unified [`render_workspace_subview`] chrome.
@@ -1313,11 +1572,33 @@ pub enum SubviewContent<'a> {
         empty: &'a str,
         preview: Option<PanePreview<'a>>,
     },
+    TargetPicker {
+        title: &'a str,
+        action_banner: &'a str,
+        query: &'a TextInput,
+        rows: &'a [RichPickerRow],
+        selected: usize,
+        empty: &'a str,
+        preview: Option<PanePreview<'a>>,
+    },
     Split(SplitStudioView<'a>),
+    LayoutStudio(LayoutStudioView<'a>),
+    Expose(ExposeView<'a>),
+    Clients(ClientsView<'a>),
+    Buffers(BuffersView<'a>),
+    Snapshots(SnapshotsView<'a>),
     Form {
         title: &'a str,
         label: &'a str,
         input: &'a TextInput,
+    },
+    DualForm {
+        title: &'a str,
+        first_label: &'a str,
+        first_input: &'a TextInput,
+        second_label: &'a str,
+        second_input: &'a TextInput,
+        active_field: usize,
     },
     Confirm {
         title: &'a str,
@@ -1347,6 +1628,7 @@ pub struct WorkspaceSubviewSpec<'a> {
     pub emblem_mode: EmblemMode,
     pub footer_hint: &'a str,
     pub content: SubviewContent<'a>,
+    pub menubar: DesktopMenubarState<'a>,
 }
 
 impl SubviewContent<'_> {
@@ -1363,8 +1645,14 @@ impl SubviewContent<'_> {
                 };
                 (badge, theme.accent)
             }
+            Self::TargetPicker { .. } => (theme.tr("TARGET", "选择目标"), theme.warning),
             Self::Split { .. } => (theme.tr("SPLIT", "分屏"), theme.secondary),
-            Self::Form { title, .. } => {
+            Self::LayoutStudio(_) => (theme.tr("LAYOUT", "布局"), theme.secondary),
+            Self::Expose(_) => (theme.tr("EXPOSE", "全景墙"), theme.accent),
+            Self::Clients(_) => (theme.tr("CLIENTS", "客户端"), theme.accent),
+            Self::Buffers(_) => (theme.tr("BUFFERS", "缓冲区"), theme.secondary),
+            Self::Snapshots(_) => (theme.tr("SNAPSHOTS", "快照"), theme.accent),
+            Self::Form { title, .. } | Self::DualForm { title, .. } => {
                 if *title == "Rename" || *title == "重命名" {
                     (theme.tr("RENAME", "重命名"), theme.warning)
                 } else if *title == "New window" || *title == "新建窗口" {
@@ -1413,6 +1701,13 @@ impl SubviewContent<'_> {
                     "↑↓ Select · Enter Actions · PgUp/PgDn Scroll Preview · Esc Back"
                 }
             }
+            Self::TargetPicker { .. } => {
+                if zh {
+                    "输入过滤 · ↑↓ 选择目标 · Enter 确认执行 · Esc 取消"
+                } else {
+                    "Type to filter · ↑↓ Select Target · Enter Confirm · Esc Cancel"
+                }
+            }
             Self::Split(..) => {
                 if zh {
                     "1-4/Tab 选窗格 · h/v 分屏 · t 翻转 · x 移除 · r 重置 · ↑↓ 选窗口 · Space 交换 · Enter 进入 · Esc 返回"
@@ -1420,11 +1715,53 @@ impl SubviewContent<'_> {
                     "1-4/Tab Pane · h/v Split · t Flip · x Del · r Reset · ↑↓ Window · Space Swap · Enter Launch · Esc Back"
                 }
             }
+            Self::LayoutStudio(_) => {
+                if zh {
+                    "1-5 应用布局 · ←→ ↑↓ 调节尺寸 · z 放大 · s 同步输入 · Esc 返回"
+                } else {
+                    "1-5 Preset · ←→ ↑↓ Resize · z Zoom · s Sync Panes · Esc Back"
+                }
+            }
+            Self::Expose(_) => {
+                if zh {
+                    "↑↓←→ 选择窗口 · Enter 附着 · i 直控输入 · n/p 翻页 · 拖拽边缘分屏 · Esc 返回"
+                } else {
+                    "↑↓←→ Select · Enter Attach · i Live Input · n/p Page · Drag Edge to Dock · Esc Back"
+                }
+            }
+            Self::Clients(_) => {
+                if zh {
+                    "↑↓ 选择客户端 · d 踢出其他端恢复全屏 · x 分离选中 · K 关闭服务 · Esc 返回"
+                } else {
+                    "↑↓ Select · d Detach Others · x Detach Selected · K Kill Server · Esc Back"
+                }
+            }
+            Self::Buffers(_) => {
+                if zh {
+                    "↑↓ 选择缓冲区 · Enter 粘贴 · y 复制 · n 新建 · x 删除 · PgUp/PgDn 预览 · Esc 返回"
+                } else {
+                    "↑↓ Select · Enter Paste · y Copy · n New · x Delete · PgUp/PgDn Preview · Esc Back"
+                }
+            }
+            Self::Snapshots(_) => {
+                if zh {
+                    "↑↓ 选择快照 · n 保存当前工作区 · Enter 恢复 · x 删除 · Esc 返回"
+                } else {
+                    "↑↓ Select · n Save Workspace · Enter Restore · x Delete · Esc Back"
+                }
+            }
             Self::Form { .. } => {
                 if zh {
                     "输入内容 · Enter 提交 · Esc 返回"
                 } else {
                     "Type value · Enter Submit · Esc Back"
+                }
+            }
+            Self::DualForm { .. } => {
+                if zh {
+                    "Tab 切换名称/目录 · Enter 一步创建 · Esc 返回"
+                } else {
+                    "Tab Switch Name/Directory · Enter Submit · Esc Back"
                 }
             }
             Self::Confirm { .. } => {
@@ -1478,15 +1815,17 @@ pub fn render_workspace_subview(
             telemetry: spec.telemetry,
             border_color,
             mode_pill: Some((pill_label, border_color)),
+            menubar: spec.menubar,
         },
         theme,
     );
 
-    let layout = if let Some(card_inner) = outer.card_inner {
+    let mut layout = if let Some(card_inner) = outer.card_inner {
         render_subview_card_body(frame, card_inner, spec, border_color, theme)
     } else {
         WorkspaceSubviewLayout::default()
     };
+    layout.menubar_hits = outer.menubar_hits;
 
     render_subview_bottom_composer(
         frame,
@@ -1546,14 +1885,70 @@ fn render_compact_subview_fallback(
             *preview,
             theme,
         ),
+        SubviewContent::TargetPicker {
+            title,
+            action_banner,
+            query,
+            rows,
+            selected,
+            empty,
+            preview,
+        } => {
+            layout = render_compact_target_picker(
+                frame,
+                area,
+                title,
+                action_banner,
+                query,
+                rows,
+                *selected,
+                empty,
+                spec.footer_hint,
+                *preview,
+                theme,
+            );
+        }
         SubviewContent::Split(studio) => {
             layout = render_compact_split_studio(frame, area, studio, theme)
+        }
+        SubviewContent::LayoutStudio(view) => {
+            layout = render_compact_layout_studio(frame, area, view, theme);
+        }
+        SubviewContent::Expose(view) => {
+            layout = render_compact_expose(frame, area, view, theme);
+        }
+        SubviewContent::Clients(view) => {
+            layout = render_compact_clients(frame, area, view, theme);
+        }
+        SubviewContent::Buffers(view) => {
+            layout = render_compact_buffers(frame, area, view, theme);
+        }
+        SubviewContent::Snapshots(view) => {
+            layout = render_compact_snapshots(frame, area, view, theme);
         }
         SubviewContent::Form {
             title,
             label,
             input,
         } => render_form(frame, area, title, label, input, spec.footer_hint, theme),
+        SubviewContent::DualForm {
+            title,
+            first_label,
+            first_input,
+            second_label,
+            second_input,
+            active_field,
+        } => render_compact_dual_form(
+            frame,
+            area,
+            title,
+            first_label,
+            first_input,
+            second_label,
+            second_input,
+            *active_field,
+            theme,
+        ),
         SubviewContent::Confirm {
             title,
             target_summary,
@@ -1611,7 +2006,11 @@ fn render_compact_subview_fallback(
     layout
 }
 
-fn split_subview_bands(card_inner: Rect, upper_min: u16, balanced: bool) -> (Rect, Rect, Rect) {
+pub(super) fn split_subview_bands(
+    card_inner: Rect,
+    upper_min: u16,
+    balanced: bool,
+) -> (Rect, Rect, Rect) {
     let lower_h = if card_inner.height >= 20 {
         (card_inner.height / 2).clamp(10, 16)
     } else if balanced {
@@ -1688,6 +2087,27 @@ fn render_subview_card_body(
             spec.emblem_mode,
             theme,
         ),
+        SubviewContent::TargetPicker {
+            title,
+            action_banner,
+            rows,
+            selected,
+            empty,
+            preview,
+            ..
+        } => render_subview_target_picker(
+            frame,
+            card_inner,
+            title,
+            action_banner,
+            rows,
+            *selected,
+            empty,
+            *preview,
+            spec.emblem_step,
+            spec.emblem_mode,
+            theme,
+        ),
         SubviewContent::Split(studio) => render_subview_split(
             frame,
             card_inner,
@@ -1696,6 +2116,32 @@ fn render_subview_card_body(
             spec.emblem_mode,
             theme,
         ),
+        SubviewContent::LayoutStudio(view) => render_subview_layout_studio(
+            frame,
+            card_inner,
+            view,
+            spec.emblem_step,
+            spec.emblem_mode,
+            theme,
+        ),
+        SubviewContent::Expose(view) => render_subview_expose(
+            frame,
+            card_inner,
+            view,
+            spec.emblem_step,
+            spec.emblem_mode,
+            theme,
+        ),
+        SubviewContent::Clients(view) => render_subview_clients(
+            frame,
+            card_inner,
+            view,
+            spec.emblem_step,
+            spec.emblem_mode,
+            theme,
+        ),
+        SubviewContent::Buffers(view) => render_subview_buffers(frame, card_inner, view, theme),
+        SubviewContent::Snapshots(view) => render_subview_snapshots(frame, card_inner, view, theme),
         SubviewContent::Form {
             title,
             label,
@@ -1706,6 +2152,27 @@ fn render_subview_card_body(
             title,
             label,
             input,
+            border_color,
+            spec.emblem_step,
+            spec.emblem_mode,
+            theme,
+        ),
+        SubviewContent::DualForm {
+            title,
+            first_label,
+            first_input,
+            second_label,
+            second_input,
+            active_field,
+        } => render_subview_dual_form(
+            frame,
+            card_inner,
+            title,
+            first_label,
+            first_input,
+            second_label,
+            second_input,
+            *active_field,
             border_color,
             spec.emblem_step,
             spec.emblem_mode,
@@ -1862,11 +2329,8 @@ fn render_subview_config(
             render_hydra_emblem_if_some(frame, hydra_box, emblem_step, emblem_mode, theme);
         return WorkspaceSubviewLayout {
             list_rect: Some(left_band),
-            preview_area: None,
             hydra_rendered,
-            confirm_scroll: 0,
-            split_slot_hits: Vec::new(),
-            split_toolbar_hits: Vec::new(),
+            ..WorkspaceSubviewLayout::default()
         };
     }
 
@@ -1876,21 +2340,17 @@ fn render_subview_config(
     render_list(frame, list_area);
     WorkspaceSubviewLayout {
         list_rect: Some(list_area),
-        preview_area: None,
-        hydra_rendered: false,
-        confirm_scroll: 0,
-        split_slot_hits: Vec::new(),
-        split_toolbar_hits: Vec::new(),
+        ..WorkspaceSubviewLayout::default()
     }
 }
 
-struct ConfigGuideSpec {
-    title: &'static str,
-    summary: String,
-    traits: [String; 2],
-    keys_hint: &'static str,
-    art: Vec<Line<'static>>,
-    compact_art: Vec<Line<'static>>,
+pub(super) struct ConfigGuideSpec {
+    pub(super) title: &'static str,
+    pub(super) summary: String,
+    pub(super) traits: [String; 2],
+    pub(super) keys_hint: &'static str,
+    pub(super) art: Vec<Line<'static>>,
+    pub(super) compact_art: Vec<Line<'static>>,
 }
 
 fn render_config_inspector_card(
@@ -2599,7 +3059,51 @@ fn build_config_guide(
                 compact_art,
             }
         }
+        "tmux_popup" | "tmux_keybind" | "popup_keybind" => {
+            let enabled = matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "true" | "1" | "yes" | "on"
+            );
+            let art = config_art_tmux_popup(enabled, art_w, art_h, theme);
+            let compact = config_art_tmux_popup(enabled, 38, 5, theme);
+            let compact_art = vec![compact[1].clone(), compact[2].clone()];
+            ConfigGuideSpec {
+                title: if zh {
+                    "tmux 全局浮窗唤出快捷键"
+                } else {
+                    "tmux Global Popup Shortcut"
+                },
+                summary: fallback_summary(if zh {
+                    "开启后自动写入 ~/.tmux.conf 托管块并热加载 Prefix+j，在终端或 agy 内都能随时唤出 jm"
+                } else {
+                    "Writes a managed Ctrl+b j popup binding to ~/.tmux.conf and reloads tmux for shell & agy"
+                }),
+                traits: if zh {
+                    [
+                        "true: 自动写入 ~/.tmux.conf 托管块并热加载生效".into(),
+                        "false: 无痕移除托管块，保留你的全部自有配置".into(),
+                    ]
+                } else {
+                    [
+                        "true: Writes ~/.tmux.conf managed block + live bind".into(),
+                        "false: Cleanly removes managed block, keeps your file".into(),
+                    ]
+                },
+                keys_hint: if zh {
+                    "←→ / Space 立即生效 · s 保存 · Esc 返回"
+                } else {
+                    "←→ / Space apply now · s Save · Esc Back"
+                },
+                art,
+                compact_art,
+            }
+        }
         _ => {
+            if let Some(guide) =
+                build_tmux_comfort_config_guide(key, value, description, art_w, art_h, theme)
+            {
+                return guide;
+            }
             let art = config_art_generic(key, value, theme);
             ConfigGuideSpec {
                 title: if zh {
@@ -2643,7 +3147,7 @@ fn pad_line_to_width(mut line: Line<'static>, width: usize) -> Line<'static> {
     line
 }
 
-fn build_art_box(
+pub(super) fn build_art_box(
     total_w: usize,
     title: Line<'static>,
     body: Vec<Line<'static>>,
@@ -5670,6 +6174,227 @@ fn config_art_language(
     zip_art_columns(left_box, 18, 2, right_box)
 }
 
+fn config_art_tmux_popup(
+    enabled: bool,
+    art_w: u16,
+    art_h: u16,
+    theme: Theme,
+) -> Vec<Line<'static>> {
+    let active_st = theme.style(theme.accent).add_modifier(Modifier::BOLD);
+    let ok_st = theme.style(theme.success).add_modifier(Modifier::BOLD);
+    let dim = theme.style(theme.muted);
+    let text_st = theme.style(theme.text);
+    let zh = theme.language.is_zh() && !theme.ascii;
+
+    if art_h >= 8 && art_w >= 48 {
+        let popup_border = if enabled { active_st } else { dim };
+        let popup_title = if enabled {
+            if zh {
+                " * JustMux 浮窗 (Ctrl+b j) * "
+            } else {
+                " * JustMux Popup (Ctrl+b j) * "
+            }
+        } else if zh {
+            " o 按 Space 绑定 Ctrl+b j "
+        } else {
+            " o Press Space to bind Ctrl+b j "
+        };
+        let popup_line_0 = if enabled {
+            if zh {
+                "  ● ~/.tmux.conf 已绑定 [Ctrl+b j]"
+            } else if theme.ascii {
+                "  * ~/.tmux.conf  [Ctrl+b j]"
+            } else {
+                "  ● ~/.tmux.conf  [Ctrl+b j]"
+            }
+        } else if zh {
+            "  ○ ~/.tmux.conf 尚未写入绑定"
+        } else if theme.ascii {
+            "  o ~/.tmux.conf  (not bound)"
+        } else {
+            "  ○ ~/.tmux.conf  (not bound)"
+        };
+        let popup_line_1 = if enabled {
+            if zh {
+                "  ▸ 终端与 agy 内直接浮窗切换"
+            } else if theme.ascii {
+                "  > Works in shell & agy"
+            } else {
+                "  ▸ Works in shell & agy"
+            }
+        } else if zh {
+            "  ▸ 开启前不会改动 ~/.tmux.conf"
+        } else if theme.ascii {
+            "  > Keeps ~/.tmux.conf untouched"
+        } else {
+            "  ▸ Keeps ~/.tmux.conf untouched"
+        };
+        let inner_popup = build_art_box(
+            40,
+            Line::from(styled_key_hint_spans(popup_title, popup_border, theme)),
+            vec![
+                Line::from(styled_key_hint_spans(
+                    popup_line_0,
+                    if enabled { text_st } else { dim },
+                    theme,
+                )),
+                Line::from(Span::styled(
+                    theme.adapt(popup_line_1),
+                    if enabled { ok_st } else { dim },
+                )),
+            ],
+            None,
+            popup_border,
+            theme.ascii,
+        );
+
+        let mut outer_body = Vec::with_capacity(6);
+        outer_body.push(Line::from(Span::styled(
+            if zh {
+                " $ agy / 终端  (当前位于 tmux 窗格)"
+            } else {
+                " $ agy / zsh  (inside tmux pane)"
+            },
+            dim,
+        )));
+        for mut row in inner_popup {
+            row.spans.insert(0, Span::raw("   "));
+            outer_body.push(row);
+        }
+        outer_body.push(Line::from(Span::styled(
+            theme.adapt(if enabled {
+                if zh {
+                    " [0] agy*  1:zsh       ✓ 已热加载生效"
+                } else if theme.ascii {
+                    " [0] agy*  1:zsh      * live reloaded"
+                } else {
+                    " [0] agy*  1:zsh      ✓ live reloaded"
+                }
+            } else if zh {
+                " [0] agy*  1:zsh         未绑定快捷键"
+            } else {
+                " [0] agy*  1:zsh      Prefix+j inactive"
+            }),
+            if enabled { ok_st } else { dim },
+        )));
+
+        let outer_title = if enabled {
+            if zh {
+                " * tmux 全局唤出已开启 * "
+            } else {
+                " * tmux + Ctrl+b j ON * "
+            }
+        } else if zh {
+            " o tmux 浮窗未开启 "
+        } else {
+            " o tmux Popup OFF "
+        };
+        let outer_bottom = if enabled {
+            if zh {
+                " ~/.tmux.conf 已同步 "
+            } else {
+                " ~/.tmux.conf synced "
+            }
+        } else if zh {
+            " ~/.tmux.conf 未修改 "
+        } else {
+            " ~/.tmux.conf clean "
+        };
+        return build_art_box(
+            48,
+            Line::from(styled_key_hint_spans(
+                outer_title,
+                if enabled { active_st } else { dim },
+                theme,
+            )),
+            outer_body,
+            Some(Line::from(Span::styled(outer_bottom, dim))),
+            if enabled {
+                theme.style(theme.secondary)
+            } else {
+                dim
+            },
+            theme.ascii,
+        );
+    }
+
+    let head = if enabled {
+        if zh {
+            " [* Ctrl+b j 已开启] ~/.tmux.conf"
+        } else {
+            " [* Ctrl+b j ON ] ~/.tmux.conf"
+        }
+    } else if zh {
+        " [o Ctrl+b j 未开启] ~/.tmux.conf"
+    } else {
+        " [o Ctrl+b j OFF] ~/.tmux.conf"
+    };
+    let box_title = if enabled {
+        if zh {
+            " JustMux 浮窗 "
+        } else {
+            " JustMux Popup "
+        }
+    } else if zh {
+        " 尚未绑定快捷键 "
+    } else {
+        " Not Bound Yet "
+    };
+    let box_mid = if enabled {
+        if zh {
+            " ▸ 终端 / agy 按 Ctrl+b j"
+        } else {
+            " > shell & agy -> Ctrl+b j"
+        }
+    } else if zh {
+        " ○ 按 Space 写入 .tmux.conf"
+    } else {
+        " o Space -> write .tmux.conf"
+    };
+    let boxed = build_art_box(
+        34,
+        Line::from(Span::styled(
+            box_title,
+            if enabled { active_st } else { dim },
+        )),
+        vec![Line::from(styled_key_hint_spans(
+            box_mid,
+            if enabled { text_st } else { dim },
+            theme,
+        ))],
+        None,
+        if enabled { active_st } else { dim },
+        theme.ascii,
+    );
+    let foot = if enabled {
+        if zh {
+            " * 热加载生效 (终端 / agy 均可)"
+        } else {
+            " * live reload active (shell & agy)"
+        }
+    } else if zh {
+        " o 按 Space 启用全局浮窗快捷键"
+    } else {
+        " o toggle with Space to enable"
+    };
+
+    let mut lines = Vec::with_capacity(5);
+    lines.push(Line::from(styled_key_hint_spans(
+        head,
+        if enabled { active_st } else { dim },
+        theme,
+    )));
+    for mut row in boxed {
+        row.spans.insert(0, Span::raw(" "));
+        lines.push(row);
+    }
+    lines.push(Line::from(Span::styled(
+        foot,
+        if enabled { ok_st } else { dim },
+    )));
+    lines
+}
+
 fn config_art_generic(key: &str, value: &str, theme: Theme) -> Vec<Line<'static>> {
     let b = theme.style(theme.secondary);
     let (tl, tr, bl, br, hz, vt) = if theme.ascii {
@@ -5763,11 +6488,8 @@ fn render_subview_theme(
             render_hydra_emblem_if_some(frame, hydra_box, emblem_step, emblem_mode, theme);
         return WorkspaceSubviewLayout {
             list_rect: Some(left_band),
-            preview_area: None,
             hydra_rendered,
-            confirm_scroll: 0,
-            split_slot_hits: Vec::new(),
-            split_toolbar_hits: Vec::new(),
+            ..WorkspaceSubviewLayout::default()
         };
     }
 
@@ -5782,11 +6504,7 @@ fn render_subview_theme(
     render_list(frame, list_area);
     WorkspaceSubviewLayout {
         list_rect: Some(list_area),
-        preview_area: None,
-        hydra_rendered: false,
-        confirm_scroll: 0,
-        split_slot_hits: Vec::new(),
-        split_toolbar_hits: Vec::new(),
+        ..WorkspaceSubviewLayout::default()
     }
 }
 
@@ -5810,38 +6528,57 @@ fn render_subview_help(
                 "/resume",
                 "打开工作区矩阵连接会话",
                 "/pane",
-                "检查、切换并关闭窗格",
-            ),
-            (
-                "/rename",
-                "重命名当前会话或窗口",
-                "/config",
-                "设置与保存 config.toml",
-            ),
-            (
-                "/kill",
-                "关闭指定会话或窗口",
-                "/theme",
-                "实时预览并切换主题配色",
-            ),
-            (
-                "/split",
-                "2x2 可视化分屏工作台",
-                "/help",
-                "命令与快捷键速查指南",
+                "检查、缩放、拆出并关闭窗格",
             ),
             (
                 "/new",
                 "新建并启动 tmux 会话",
-                "/quit",
-                "退出 (/exit 为仅分离)",
+                "/split",
+                "2x2 可视化分屏工作台",
             ),
             (
                 "/window",
-                "管理会话内全部窗口",
+                "管理、移动与链接窗口",
+                "/layout",
+                "视觉布局预设与实时调大小",
+            ),
+            (
+                "/rename",
+                "重命名当前会话或窗口",
+                "/expose",
+                "实时多窗格全景任务墙",
+            ),
+            (
+                "/kill",
+                "关闭指定会话或窗口",
+                "/buffers",
+                "浏览、复制与粘贴缓冲区",
+            ),
+            (
+                "/snapshot",
+                "保存与恢复工作区快照模板",
+                "/popup",
+                "弹出临时浮动终端 (3.2+)",
+            ),
+            (
                 "/list",
                 "会话与窗口全局概览",
+                "/clients",
+                "管理客户端与修复虚线框",
             ),
+            (
+                "/exit",
+                "仅分离当前 tmux 客户端",
+                "/theme",
+                "实时预览并切换主题配色",
+            ),
+            (
+                "/kill-server",
+                "停止整个 tmux 服务",
+                "/config",
+                "设置与保存 config.toml",
+            ),
+            ("/quit", "退出 JustMux", "/help", "命令与快捷键速查指南"),
         ]
     } else {
         [
@@ -5849,37 +6586,61 @@ fn render_subview_help(
                 "/resume",
                 "open window in matrix",
                 "/pane",
-                "inspect, switch, close panes",
-            ),
-            (
-                "/rename",
-                "rename session or window",
-                "/config",
-                "settings & save config.toml",
-            ),
-            (
-                "/kill",
-                "kill session or window",
-                "/theme",
-                "live-preview color palettes",
-            ),
-            (
-                "/split",
-                "2x2 visual Split Studio",
-                "/help",
-                "commands & shortcuts guide",
+                "inspect, zoom, break, close",
             ),
             (
                 "/new",
                 "create tmux session",
-                "/quit",
-                "exit JustMux (/exit detaches)",
+                "/split",
+                "2x2 visual Split Studio",
             ),
             (
                 "/window",
-                "manage session windows",
+                "manage, move & link windows",
+                "/layout",
+                "layout presets & pane resize",
+            ),
+            (
+                "/rename",
+                "rename session or window",
+                "/expose",
+                "live Mission Control wall",
+            ),
+            (
+                "/kill",
+                "kill session or window",
+                "/buffers",
+                "browse, copy & paste buffers",
+            ),
+            (
+                "/snapshot",
+                "save & restore workspaces",
+                "/popup",
+                "floating scratchpad (3.2+)",
+            ),
+            (
                 "/list",
                 "session & window overview",
+                "/clients",
+                "clients & fix dotted border",
+            ),
+            (
+                "/exit",
+                "detach current tmux client",
+                "/theme",
+                "live-preview color palettes",
+            ),
+            (
+                "/kill-server",
+                "stop entire tmux server",
+                "/config",
+                "settings & save config.toml",
+            ),
+            (
+                "/quit",
+                "quit JustMux",
+                "/help",
+                "commands & shortcuts guide",
             ),
         ]
     };
@@ -5905,22 +6666,29 @@ fn render_subview_help(
             muted,
         ));
         let mut lines = vec![Line::from(header)];
-        if width >= 68 {
-            let ws_label = if zh { "工作区" } else { "Workspace" };
+        if width >= 72 {
+            let ws_label = if zh {
+                "工作区与退出"
+            } else {
+                "Workspace & Exit"
+            };
             let st_label = if zh {
                 "工作台与系统"
             } else {
                 "Studio & System"
             };
-            let ws_pad = 35_usize.saturating_sub(ws_label.width());
+            let left_col_w = 39_usize;
+            let ws_pad = left_col_w.saturating_sub(ws_label.width());
             lines.push(Line::from(vec![
                 Span::styled(format!("{ws_label}{}", " ".repeat(ws_pad)), sec_style),
                 Span::styled(st_label, sec_style),
             ]));
             for (lc, ld, rc, rd) in command_rows {
-                let lpad = 9_usize.saturating_sub(lc.width());
-                let mid = 35_usize.saturating_sub(lc.width() + lpad + ld.width());
-                let rpad = 8_usize.saturating_sub(rc.width());
+                let lpad = 10_usize.saturating_sub(lc.width()).max(1);
+                let mid = left_col_w
+                    .saturating_sub(lc.width() + lpad + ld.width())
+                    .max(2);
+                let rpad = 10_usize.saturating_sub(rc.width()).max(1);
                 lines.push(Line::from(vec![
                     Span::styled(lc, cmd_style),
                     Span::raw(" ".repeat(lpad)),
@@ -5933,14 +6701,14 @@ fn render_subview_help(
             }
         } else {
             for (lc, ld, rc, _) in command_rows {
-                let pad = 9_usize.saturating_sub(lc.width());
+                let pad = 10_usize.saturating_sub(lc.width()).max(1);
                 lines.push(Line::from(vec![
                     Span::styled(lc, cmd_style),
                     Span::raw(" ".repeat(pad)),
                     Span::styled(
                         truncate_to_width(
                             &format!("{ld} · {rc}"),
-                            usize::from(width).saturating_sub(9),
+                            usize::from(width).saturating_sub(10),
                         ),
                         text_style,
                     ),
@@ -5958,7 +6726,18 @@ fn render_subview_help(
     };
 
     if card_inner.height >= 14 {
-        let (upper_band, rule_area, lower_band) = split_subview_bands(card_inner, 8, true);
+        let (upper_band, rule_area, lower_band) = if card_inner.height >= 22 {
+            let lower_h = card_inner.height.saturating_sub(14).clamp(8, 12);
+            let [u, r, l] = Layout::vertical([
+                Constraint::Min(13),
+                Constraint::Length(1),
+                Constraint::Length(lower_h),
+            ])
+            .areas(card_inner);
+            (u, r, l)
+        } else {
+            split_subview_bands(card_inner, 10, true)
+        };
         frame.render_widget(
             Paragraph::new(build_command_lines(upper_band.width)),
             upper_band,
@@ -5972,6 +6751,7 @@ fn render_subview_help(
                     "切换 恢复/改名/关闭/分屏 标签 (或 会话/窗口)",
                 ),
                 ("PgUp / PgDn", "滚动右侧窗格预览历史 (或使用鼠标滚轮)"),
+                ("f / y / [] ", "预览搜索 · 复制输出 · 切换同窗口多窗格"),
                 ("↑↓ / ←→    ", "在会话列与窗口行之间上下左右导航"),
                 ("1-9        ", "快速附着或跳转到对应编号的工作区"),
                 ("Shift+Tab  ", "切换 命令跳转 · 实时雷达 · 快速启动 模式"),
@@ -5986,6 +6766,10 @@ fn render_subview_help(
                 (
                     "PgUp / PgDn",
                     "scroll Window Preview history (or Mouse Wheel)",
+                ),
+                (
+                    "f / y / [] ",
+                    "search preview · copy preview · switch panes in window",
                 ),
                 ("↑↓ / ←→    ", "navigate windows & session columns"),
                 ("1-9        ", "quick-attach or jump to numbered workspace"),
@@ -6027,12 +6811,8 @@ fn render_subview_help(
         let hydra_rendered =
             render_hydra_emblem_if_some(frame, hydra_box, emblem_step, emblem_mode, theme);
         return WorkspaceSubviewLayout {
-            list_rect: None,
-            preview_area: None,
             hydra_rendered,
-            confirm_scroll: 0,
-            split_slot_hits: Vec::new(),
-            split_toolbar_hits: Vec::new(),
+            ..WorkspaceSubviewLayout::default()
         };
     }
 
@@ -6045,9 +6825,9 @@ fn render_subview_help(
         key_spans.extend(styled_key_hint_spans(
             &truncate_to_width(
                 &theme.adapt(if zh {
-                    "Tab 切换操作 · PgUp / PgDn 滚动预览 · Esc 返回"
+                    "Tab 切换操作 · f 搜索 · y 复制 · PgUp / PgDn 滚动预览 · Esc 返回"
                 } else {
-                    "Tab switch actions · PgUp / PgDn preview scroll · Esc back"
+                    "Tab actions · f search · y copy · PgUp / PgDn preview scroll · Esc back"
                 }),
                 usize::from(card_inner.width).saturating_sub(10),
             ),
@@ -6108,9 +6888,8 @@ fn render_subview_picker(
 
     if card_inner.height >= 14 {
         let (upper_band, rule_area, lower_band) = split_subview_bands(card_inner, 5, true);
-        let preview_area = if let Some(card) = preview {
-            render_pane_preview_card(frame, upper_band, card, theme);
-            Some(upper_band)
+        let preview_layout = if let Some(card) = preview {
+            render_pane_preview_card_interactive(frame, upper_band, card, theme)
         } else {
             let [h_area, hint_area] =
                 Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(upper_band);
@@ -6125,8 +6904,10 @@ fn render_subview_picker(
                     hint_area,
                 );
             }
-            None
+            PreviewCardLayout::default()
         };
+        let preview_area = preview_layout.area;
+        let preview_action_hits = preview_layout.action_hits.clone();
         render_horizontal_divider_line(frame, rule_area, theme);
         let (left_band, hydra_box) = split_lower_band_for_hydra(lower_band);
         let [count_area, list_area] =
@@ -6139,9 +6920,9 @@ fn render_subview_picker(
             list_rect: Some(list_area),
             preview_area,
             hydra_rendered,
-            confirm_scroll: 0,
-            split_slot_hits: Vec::new(),
-            split_toolbar_hits: Vec::new(),
+            preview_action_hits,
+            preview_layout,
+            ..WorkspaceSubviewLayout::default()
         };
     }
 
@@ -6151,15 +6932,15 @@ fn render_subview_picker(
     {
         let [preview_box, list_area] =
             Layout::vertical([Constraint::Min(5), Constraint::Length(5)]).areas(card_inner);
-        render_pane_preview_card(frame, preview_box, card, theme);
+        let pl = render_pane_preview_card_interactive(frame, preview_box, card, theme);
         render_list(frame, list_area);
+        let preview_action_hits = pl.action_hits.clone();
         return WorkspaceSubviewLayout {
             list_rect: Some(list_area),
-            preview_area: Some(preview_box),
-            hydra_rendered: false,
-            confirm_scroll: 0,
-            split_slot_hits: Vec::new(),
-            split_toolbar_hits: Vec::new(),
+            preview_area: pl.area,
+            preview_action_hits,
+            preview_layout: pl,
+            ..WorkspaceSubviewLayout::default()
         };
     }
 
@@ -6169,11 +6950,7 @@ fn render_subview_picker(
     render_list(frame, list_area);
     WorkspaceSubviewLayout {
         list_rect: Some(list_area),
-        preview_area: None,
-        hydra_rendered: false,
-        confirm_scroll: 0,
-        split_slot_hits: Vec::new(),
-        split_toolbar_hits: Vec::new(),
+        ..WorkspaceSubviewLayout::default()
     }
 }
 
@@ -6254,12 +7031,8 @@ fn render_subview_form(
         let hydra_rendered =
             render_hydra_emblem_if_some(frame, hydra_box, emblem_step, emblem_mode, theme);
         return WorkspaceSubviewLayout {
-            list_rect: None,
-            preview_area: None,
             hydra_rendered,
-            confirm_scroll: 0,
-            split_slot_hits: Vec::new(),
-            split_toolbar_hits: Vec::new(),
+            ..WorkspaceSubviewLayout::default()
         };
     }
 
@@ -6377,23 +7150,16 @@ fn render_subview_confirm(
         let hydra_rendered =
             render_hydra_emblem_if_some(frame, hydra_box, emblem_step, emblem_mode, theme);
         return WorkspaceSubviewLayout {
-            list_rect: None,
-            preview_area: None,
             hydra_rendered,
             confirm_scroll,
-            split_slot_hits: Vec::new(),
-            split_toolbar_hits: Vec::new(),
+            ..WorkspaceSubviewLayout::default()
         };
     }
 
     let confirm_scroll = render_upper(frame, card_inner);
     WorkspaceSubviewLayout {
-        list_rect: None,
-        preview_area: None,
-        hydra_rendered: false,
         confirm_scroll,
-        split_slot_hits: Vec::new(),
-        split_toolbar_hits: Vec::new(),
+        ..WorkspaceSubviewLayout::default()
     }
 }
 
@@ -6516,11 +7282,8 @@ fn render_subview_actions(
             render_hydra_emblem_if_some(frame, hydra_box, emblem_step, emblem_mode, theme);
         return WorkspaceSubviewLayout {
             list_rect: Some(left_band),
-            preview_area: None,
             hydra_rendered,
-            confirm_scroll: 0,
-            split_slot_hits: Vec::new(),
-            split_toolbar_hits: Vec::new(),
+            ..WorkspaceSubviewLayout::default()
         };
     }
 
@@ -6535,11 +7298,7 @@ fn render_subview_actions(
     );
     WorkspaceSubviewLayout {
         list_rect,
-        preview_area: None,
-        hydra_rendered: false,
-        confirm_scroll: 0,
-        split_slot_hits: Vec::new(),
-        split_toolbar_hits: Vec::new(),
+        ..WorkspaceSubviewLayout::default()
     }
 }
 
@@ -6609,12 +7368,8 @@ fn render_subview_created(
         let hydra_rendered =
             render_hydra_emblem_if_some(frame, hydra_box, emblem_step, emblem_mode, theme);
         return WorkspaceSubviewLayout {
-            list_rect: None,
-            preview_area: None,
             hydra_rendered,
-            confirm_scroll: 0,
-            split_slot_hits: Vec::new(),
-            split_toolbar_hits: Vec::new(),
+            ..WorkspaceSubviewLayout::default()
         };
     }
     frame.render_widget(Paragraph::new(lines), card_inner);
@@ -6715,12 +7470,8 @@ fn render_subview_tribute(
         let hydra_rendered =
             render_hydra_emblem_if_some(frame, hydra_box, emblem_step, emblem_mode, theme);
         return WorkspaceSubviewLayout {
-            list_rect: None,
-            preview_area: None,
             hydra_rendered,
-            confirm_scroll: 0,
-            split_slot_hits: Vec::new(),
-            split_toolbar_hits: Vec::new(),
+            ..WorkspaceSubviewLayout::default()
         };
     }
 
@@ -6747,7 +7498,8 @@ fn render_subview_bottom_composer(
     };
 
     match &spec.content {
-        SubviewContent::Picker { title, query, .. } => {
+        SubviewContent::Picker { title, query, .. }
+        | SubviewContent::TargetPicker { title, query, .. } => {
             let filter_suffix = if zh { "过滤" } else { "Filter" };
             let left_title = format!(
                 "{} {} · {filter_suffix}",
@@ -6819,6 +7571,50 @@ fn render_subview_bottom_composer(
                 frame,
                 input_area,
                 input,
+                ComposerMode::CommandJump,
+                border_color,
+                false,
+                theme,
+            );
+        }
+        SubviewContent::DualForm {
+            title,
+            first_label,
+            first_input,
+            second_label,
+            second_input,
+            active_field,
+        } => {
+            let (field_label, active_input) = if *active_field == 0 {
+                (*first_label, *first_input)
+            } else {
+                (*second_label, *second_input)
+            };
+            let left_title = format!(
+                "{} {} · {}",
+                if theme.ascii { ">" } else { "▸" },
+                theme.adapt(title),
+                theme.adapt(field_label)
+            );
+            let form_right = (composer.width >= 56).then_some(if theme.ascii {
+                " Tab Next | Enter Submit | Esc Back "
+            } else if zh {
+                " Tab 切换栏位 · Enter 提交 · Esc 返回 "
+            } else {
+                " Tab Next · Enter Submit · Esc Back "
+            });
+            let input_area = render_bordered_composer_box(
+                frame,
+                composer,
+                border_color,
+                &left_title,
+                form_right,
+                theme,
+            );
+            render_composer_line(
+                frame,
+                input_area,
+                active_input,
                 ComposerMode::CommandJump,
                 border_color,
                 false,
@@ -7048,7 +7844,7 @@ fn render_workspace_preview_card(
     area: Rect,
     preview: Option<PanePreview<'_>>,
     theme: Theme,
-) {
+) -> PreviewCardLayout {
     let zh = theme.language.is_zh() && !theme.ascii;
     let subtitle = preview.map_or_else(
         || {
@@ -7069,9 +7865,8 @@ fn render_workspace_preview_card(
             }
         },
     );
-    let lines = preview.map_or(&[][..], |p| p.lines);
-    let scroll = preview.map_or(0, |p| p.scroll);
-    render_pane_preview_card(
+    let base = preview.unwrap_or_default();
+    render_pane_preview_card_interactive(
         frame,
         area,
         PanePreview {
@@ -7081,11 +7876,11 @@ fn render_workspace_preview_card(
                 "📺 Window Preview"
             },
             subtitle: &subtitle,
-            lines,
-            scroll,
+            show_actions: preview.is_some() && base.show_actions,
+            ..base
         },
         theme,
-    );
+    )
 }
 
 fn wrap_tokens(text: &str, max_width: usize) -> Vec<String> {
@@ -7149,8 +7944,8 @@ fn render_workspace_action_hints(
                 text,
             ),
             (
-                "其他工作台视图: ",
-                theme.adapt("/new · /pane · /theme · /config · /help"),
+                "控制器与工作台: ",
+                theme.adapt("/layout · /clients · /buffers · /snapshot · /config · /help"),
                 muted,
             ),
             (
@@ -7167,8 +7962,8 @@ fn render_workspace_action_hints(
                 text,
             ),
             (
-                "Other studio views:   ",
-                theme.adapt("/new · /pane · /theme · /config · /help"),
+                "Controller & studio:  ",
+                theme.adapt("/layout · /clients · /buffers · /snapshot · /config · /help"),
                 muted,
             ),
             (
@@ -8047,8 +8842,7 @@ fn render_studio_right(
                     "📺 Active Workspace Preview"
                 },
                 subtitle: &subtitle,
-                lines: preview.lines,
-                scroll: preview.scroll,
+                ..preview
             },
             theme,
         );
@@ -8126,9 +8920,9 @@ fn render_live_radar(
     area: Rect,
     studio: HomeDashboardState<'_>,
     theme: Theme,
-) {
+) -> PreviewCardLayout {
     if area.width == 0 || area.height == 0 {
-        return;
+        return PreviewCardLayout::default();
     }
     let zh = theme.language.is_zh() && !theme.ascii;
     let (left, right) = if area.width >= 54 {
@@ -8224,6 +9018,7 @@ fn render_live_radar(
     frame.render_widget(Paragraph::new(left_lines), left);
 
     if let Some(right_area) = right {
+        let has_preview = studio.preview.is_some();
         let preview = studio.preview.unwrap_or(PanePreview {
             title: if zh {
                 "实时终端预览"
@@ -8234,8 +9029,17 @@ fn render_live_radar(
             lines: &[],
             ..PanePreview::default()
         });
-        render_pane_preview_card(frame, right_area, preview, theme);
+        return render_pane_preview_card_interactive(
+            frame,
+            right_area,
+            PanePreview {
+                show_actions: has_preview && preview.show_actions,
+                ..preview
+            },
+            theme,
+        );
     }
+    PreviewCardLayout::default()
 }
 
 fn compact_welcome_lines(
@@ -8527,7 +9331,11 @@ pub(super) fn truncate_to_width(text: &str, max_width: usize) -> String {
 
 fn format_telemetry(telemetry: HomeTelemetry<'_>, theme: Theme) -> Option<String> {
     let (sessions, windows) = (telemetry.sessions, telemetry.windows);
-    if sessions.is_none() && windows.is_none() && telemetry.attached.is_none() {
+    if sessions.is_none()
+        && windows.is_none()
+        && telemetry.attached.is_none()
+        && telemetry.clients.is_none()
+    {
         return None;
     }
     let sep = if theme.ascii { " | " } else { " · " };
@@ -8541,6 +9349,13 @@ fn format_telemetry(telemetry: HomeTelemetry<'_>, theme: Theme) -> Option<String
     if let Some(a) = telemetry.attached.filter(|&a| a > 0) {
         let dot = if theme.ascii { "a" } else { "●" };
         parts.push(format!("{a}{dot}"));
+    }
+    if let Some(c) = telemetry.clients.filter(|&c| c > 1) {
+        if theme.ascii {
+            parts.push(format!("{c}c"));
+        } else {
+            parts.push(format!("👥 {c}"));
+        }
     }
     (!parts.is_empty()).then(|| parts.join(sep))
 }
@@ -8571,11 +9386,14 @@ fn directory_tail(path: &str, width: usize, marker: &str) -> String {
 
 fn command_group_badge(name: &str, theme: Theme) -> (&'static str, Color) {
     match name {
-        "resume" | "rename" | "kill" | "split" | "new" | "window" | "list" => {
+        "resume" | "new" | "window" | "rename" | "kill" | "snapshot" | "list" => {
             (theme.tr("workspace", "工作区"), theme.secondary)
         }
-        "pane" | "config" | "theme" => (theme.tr("studio", "工作台"), theme.tertiary),
-        "help" | "quit" | "exit" => (theme.tr("system", "系统"), theme.muted),
+        "pane" | "split" | "layout" | "expose" | "buffers" | "popup" | "theme" | "config" => {
+            (theme.tr("studio", "工作台"), theme.tertiary)
+        }
+        "kill-server" => (theme.tr("danger", "危险"), theme.error),
+        "clients" | "help" | "exit" | "quit" => (theme.tr("system", "系统"), theme.muted),
         _ => (theme.tr("studio", "工作台"), theme.tertiary),
     }
 }
@@ -9123,117 +9941,18 @@ pub fn render_pane_preview_card(
     preview: PanePreview<'_>,
     theme: Theme,
 ) {
-    if area.width < 6 || area.height < 3 {
-        return;
-    }
-    let muted = theme.style(theme.muted);
-    let adapted_title = theme.adapt(preview.title);
-    let has_leading_icon = preview.title.starts_with('📺')
-        || preview.title.starts_with('◈')
-        || preview.title.starts_with("[]");
-    let title_label = if has_leading_icon {
-        format!(" {adapted_title}")
-    } else if theme.ascii {
-        format!(" [] {adapted_title}")
-    } else {
-        format!(" ◈ {adapted_title}")
-    };
-    let mut title_spans = vec![Span::styled(
-        title_label,
-        theme.style(theme.accent).add_modifier(Modifier::BOLD),
-    )];
-    if !preview.subtitle.is_empty() {
-        let sep = if theme.ascii { " | " } else { " · " };
-        let sub = format!("{sep}{}", theme.adapt(preview.subtitle));
-        let used: usize = title_spans.iter().map(Span::width).sum();
-        if used + sub.width() < usize::from(area.width.saturating_sub(2)) {
-            title_spans.push(Span::styled(sub, muted));
-        }
-    }
-    title_spans.push(Span::raw(" "));
-    let left_used: usize = title_spans.iter().map(Span::width).sum();
-    let inner_h = usize::from(area.height.saturating_sub(2));
-    let total = preview.lines.len();
-    let max_scroll = total.saturating_sub(inner_h);
-    let actual_scroll = preview.scroll.min(max_scroll);
-    let mut block = Block::default()
-        .borders(Borders::ALL)
-        .border_type(if theme.ascii {
-            BorderType::Plain
-        } else {
-            BorderType::Rounded
-        })
-        .border_style(theme.style(theme.secondary))
-        .title(Line::from(title_spans));
-    if inner_h > 0 && max_scroll > 0 {
-        let (full, compact, style) = if actual_scroll > 0 {
-            let style = theme.style(theme.accent).add_modifier(Modifier::BOLD);
-            if theme.ascii {
-                (
-                    format!(" [+{actual_scroll}/{max_scroll} PgUp/PgDn] "),
-                    format!(" [+{actual_scroll}] "),
-                    style,
-                )
-            } else {
-                (
-                    format!(" ↑ +{actual_scroll}/{max_scroll} · PgUp/PgDn "),
-                    format!(" ↑ +{actual_scroll} "),
-                    style,
-                )
-            }
-        } else {
-            let style = theme.style(theme.muted);
-            if theme.ascii {
-                (
-                    format!(" [{total}L PgUp/Wheel] "),
-                    format!(" [{total}L] "),
-                    style,
-                )
-            } else {
-                let lines_unit = theme.tr("L", "行");
-                let wheel = theme.tr("Wheel", "滚轮");
-                (
-                    format!(" ↕ {total}{lines_unit} · PgUp/{wheel} "),
-                    format!(" ↕ {total}{lines_unit} "),
-                    style,
-                )
-            }
-        };
-        let avail = usize::from(area.width);
-        if left_used + full.width() + 2 <= avail {
-            block = block.title_top(styled_key_hint_line(&full, style, theme).right_aligned());
-        } else if left_used + compact.width() + 2 <= avail {
-            block = block.title_top(styled_key_hint_line(&compact, style, theme).right_aligned());
-        }
-    }
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
-    if inner.width == 0 || inner.height == 0 {
-        return;
-    }
+    let _ = render_pane_preview_card_inner(frame, area, preview, theme);
+}
 
-    if preview.lines.is_empty() {
-        frame.render_widget(
-            Paragraph::new(Line::from(Span::styled(
-                truncate_to_width(
-                    theme.tr(" (empty terminal buffer)", " (空终端缓冲区)"),
-                    usize::from(inner.width),
-                ),
-                muted,
-            ))),
-            inner,
-        );
-        return;
-    }
-    let max_rows = usize::from(inner.height);
-    let end = total.saturating_sub(actual_scroll);
-    let start = end.saturating_sub(max_rows);
-    let max_width = usize::from(inner.width);
-    let lines: Vec<Line<'static>> = preview.lines[start..end]
-        .iter()
-        .map(|raw| parse_ansi_preview_line(raw, max_width, theme))
-        .collect();
-    frame.render_widget(Paragraph::new(lines), inner);
+/// Interactive preview card returning geometry and clickable hit-boxes for pane cycling,
+/// search, copy, log export, and live `pipe-pane` toggle.
+pub fn render_pane_preview_card_interactive(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    preview: PanePreview<'_>,
+    theme: Theme,
+) -> PreviewCardLayout {
+    render_pane_preview_card_inner(frame, area, preview, theme)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -9328,7 +10047,7 @@ pub fn render_rich_picker(
     );
 }
 
-fn build_rich_picker_list_items(
+pub(super) fn build_rich_picker_list_items(
     rows: &[RichPickerRow],
     selected: usize,
     list_width: u16,
@@ -10202,7 +10921,7 @@ pub fn render_confirm_card(
     scroll
 }
 
-fn wrap_description(text: &str, width: u16) -> Vec<String> {
+pub(super) fn wrap_description(text: &str, width: u16) -> Vec<String> {
     let width = usize::from(width);
     if width == 0 {
         return Vec::new();
@@ -10320,61 +11039,106 @@ pub fn render_help(frame: &mut Frame<'_>, area: Rect, theme: Theme) {
             muted,
         ));
         lines.push(Line::from(header));
-        if area.height >= 14 {
+        if area.height >= 17 {
             lines.push(Line::default());
         }
-        let left_head = theme.tr("Sessions", "会话操作");
-        let left_head_pad = " ".repeat(35_usize.saturating_sub(left_head.width()));
+        let left_head = theme.tr("Workspace & Exit", "工作区与会话操作");
+        let left_col_w = 37_usize;
+        let left_head_pad = " ".repeat(left_col_w.saturating_sub(left_head.width()));
         lines.push(Line::from(vec![
             Span::styled(format!("{left_head}{left_head_pad}"), sec_style),
-            Span::styled(
-                theme.tr("Windows, Panes & App", "窗口、窗格与应用"),
-                sec_style,
-            ),
+            Span::styled(theme.tr("Studio & System", "工作台与系统"), sec_style),
         ]));
-        let pairs = [
+        let wide_pairs_full: [(&str, &str, &str, &str); 10] = [
             (
                 "/resume",
                 theme.tr("session & window grid", "会话与窗口网格"),
-                "/window",
-                theme.tr("open, create, rename, close", "打开、新建、重命名、关闭"),
+                "/pane",
+                theme.tr("zoom, break, swap & close", "缩放、拆出、互换与关闭"),
             ),
             (
                 "/new",
                 theme.tr("create a tmux session", "新建 tmux 会话"),
-                "/pane",
-                theme.tr("open or close panes", "打开或关闭窗格"),
-            ),
-            (
-                "/list",
-                theme.tr("browse sessions & actions", "浏览会话与操作"),
                 "/split",
                 theme.tr("2x2 visual Split Studio", "2x2 可视化分屏工作台"),
             ),
             (
+                "/window",
+                theme.tr("move, link & manage windows", "移动、链接与管理窗口"),
+                "/layout",
+                theme.tr("presets & live pane resize", "布局预设与实时调大小"),
+            ),
+            (
                 "/rename",
-                theme.tr("rename a session", "重命名会话"),
+                theme.tr("rename session or window", "重命名会话或窗口"),
+                "/expose",
+                theme.tr("live Mission Control wall", "实时多窗格全景任务墙"),
+            ),
+            (
+                "/kill",
+                theme.tr("kill session or window", "关闭会话或窗口"),
+                "/buffers",
+                theme.tr("browse, copy & paste buffers", "浏览复制粘贴缓冲区"),
+            ),
+            (
+                "/snapshot",
+                theme.tr("save & restore workspaces", "保存与恢复工作区快照"),
+                "/popup",
+                theme.tr("floating scratchpad (3.2+)", "浮动临时终端 (3.2+)"),
+            ),
+            (
+                "/list",
+                theme.tr("browse sessions & actions", "浏览会话与操作"),
+                "/clients",
+                theme.tr("clients & fix dotted border", "客户端与修复虚线框"),
+            ),
+            (
+                "/exit",
+                theme.tr("detach tmux client", "分离 tmux 客户端"),
                 "/theme",
                 theme.tr("switch TrueColor palettes", "切换真彩色主题"),
             ),
             (
-                "/kill",
-                theme.tr("terminate a session", "终止会话"),
+                "/kill-server",
+                theme.tr("stop entire tmux server", "停止整个 tmux 服务"),
                 "/config",
-                theme.tr("settings & save config.toml", "设置并保存 config.toml"),
+                theme.tr("settings & save config.toml", "设置与保存 config.toml"),
             ),
             (
+                "/quit",
+                theme.tr("quit JustMux", "退出 JustMux"),
                 "/help",
                 theme.tr("show this guide", "显示此帮助指南"),
-                "/exit",
-                theme.tr("detach tmux client", "分离 tmux 客户端"),
             ),
-            ("", "", "/quit", theme.tr("quit JustMux", "退出 JustMux")),
         ];
-        for (l_cmd, l_desc, r_cmd, r_desc) in pairs {
-            let left_pad = 9_usize.saturating_sub(l_cmd.width());
-            let right_col_pad = 35_usize.saturating_sub(l_cmd.width() + left_pad + l_desc.width());
-            let right_pad = 9_usize.saturating_sub(r_cmd.width());
+        let wide_pairs_tight: [(&str, &str, &str, &str); 8] = [
+            wide_pairs_full[0],
+            wide_pairs_full[1],
+            wide_pairs_full[2],
+            wide_pairs_full[3],
+            wide_pairs_full[4],
+            wide_pairs_full[5],
+            (
+                "/list",
+                theme.tr("browse sessions (/exit)", "浏览会话 (/exit 分离)"),
+                "/clients",
+                theme.tr("clients · /theme · /config", "客户端 · /theme · /config"),
+            ),
+            wide_pairs_full[9],
+        ];
+        let pairs: &[(&str, &str, &str, &str)] = if area.height >= 15 {
+            &wide_pairs_full
+        } else {
+            &wide_pairs_tight
+        };
+        for &(l_cmd, l_desc, r_cmd, r_desc) in pairs {
+            let l_desc = theme.adapt(l_desc);
+            let r_desc = theme.adapt(r_desc);
+            let left_pad = 10_usize.saturating_sub(l_cmd.width()).max(1);
+            let right_col_pad = left_col_w
+                .saturating_sub(l_cmd.width() + left_pad + l_desc.width())
+                .max(2);
+            let right_pad = 10_usize.saturating_sub(r_cmd.width()).max(1);
             lines.push(Line::from(vec![
                 Span::styled(l_cmd, cmd_style),
                 Span::raw(" ".repeat(left_pad)),
@@ -10385,7 +11149,7 @@ pub fn render_help(frame: &mut Frame<'_>, area: Rect, theme: Theme) {
                 Span::styled(r_desc, text_style),
             ]));
         }
-        if area.height >= 12 {
+        if area.height >= 16 {
             lines.push(Line::default());
         }
         lines.push(Line::from(vec![
@@ -10399,8 +11163,8 @@ pub fn render_help(frame: &mut Frame<'_>, area: Rect, theme: Theme) {
             let mut preview_spans = vec![Span::styled(theme.tr("Preview   ", "实时预览  "), muted)];
             preview_spans.extend(styled_key_hint_spans(
                 theme.tr(
-                    "PgUp / PgDn · Wheel on preview to scroll preview history",
-                    "PgUp / PgDn · 预览区滚轮可滚动历史输出",
+                    "PgUp / PgDn · f search · y copy · [/] panes · Wheel scroll",
+                    "PgUp / PgDn · f 搜索 · y 复制 · [/] 切窗格 · 滚轮滚动",
                 ),
                 muted,
                 theme,
@@ -10423,38 +11187,63 @@ pub fn render_help(frame: &mut Frame<'_>, area: Rect, theme: Theme) {
             true,
         ))];
         let entries = [
+            // Workspace
             (
                 "/resume",
                 theme.tr("session & window grid", "会话与窗口网格"),
             ),
             ("/new", theme.tr("create a session", "新建会话")),
+            ("/window", theme.tr("manage windows", "管理窗口")),
+            ("/rename", theme.tr("rename a session", "重命名会话")),
+            ("/kill", theme.tr("terminate a session", "终止会话")),
+            (
+                "/snapshot",
+                theme.tr("save/restore workspace", "工作区快照"),
+            ),
             (
                 "/list",
                 theme.tr("browse sessions & actions", "浏览会话与操作"),
             ),
-            ("/rename", theme.tr("rename a session", "重命名会话")),
-            ("/kill", theme.tr("terminate a session", "终止会话")),
-            ("/window", theme.tr("manage windows", "管理窗口")),
+            // Studio
             ("/pane", theme.tr("manage panes", "管理窗格")),
             (
                 "/split",
                 theme.tr("2x2 visual Split Studio", "2x2 可视化分屏工作台"),
             ),
+            ("/layout", theme.tr("layout & pane resize", "布局与调大小")),
+            (
+                "/expose",
+                theme.tr("live Mission Control wall", "实时全景任务墙"),
+            ),
+            (
+                "/buffers",
+                theme.tr("paste buffer manager", "粘贴缓冲区管理"),
+            ),
+            ("/popup", theme.tr("floating scratchpad", "浮动临时终端")),
             ("/theme", theme.tr("switch theme palette", "切换主题调色板")),
             (
                 "/config",
                 theme.tr("settings & save config.toml", "设置并保存 config.toml"),
             ),
-            ("/exit", theme.tr("detach from tmux", "分离 tmux")),
+            // System
+            (
+                "/clients",
+                theme.tr("clients & dotted border", "客户端与虚线框"),
+            ),
             ("/help", theme.tr("show this help", "显示此帮助")),
+            ("/exit", theme.tr("detach from tmux", "分离 tmux")),
+            (
+                "/kill-server",
+                theme.tr("stop entire tmux server", "停止整个 tmux 服务"),
+            ),
             ("/quit", theme.tr("quit JustMux", "退出 JustMux")),
         ];
         for (cmd, desc) in entries {
-            let pad = 9_usize.saturating_sub(cmd.width());
+            let pad = 13_usize.saturating_sub(cmd.width()).max(1);
             lines.push(Line::from(vec![
                 Span::styled(cmd, cmd_style),
                 Span::raw(" ".repeat(pad)),
-                Span::styled(desc, text_style),
+                Span::styled(theme.adapt(desc), text_style),
             ]));
         }
         lines.push(Line::from(vec![
@@ -10467,8 +11256,8 @@ pub fn render_help(frame: &mut Frame<'_>, area: Rect, theme: Theme) {
         let mut preview_spans = vec![Span::styled(theme.tr("Preview: ", "预览: "), muted)];
         preview_spans.extend(styled_key_hint_spans(
             theme.tr(
-                "PgUp / PgDn · Wheel scroll history",
-                "PgUp / PgDn · 滚轮滚动历史",
+                "PgUp / PgDn · f search · y copy · [/] panes",
+                "PgUp / PgDn · f 搜索 · y 复制 · [/] 切窗格",
             ),
             muted,
             theme,
@@ -10684,6 +11473,7 @@ pub(super) mod tests {
                         sessions: Some(3),
                         windows: Some(8),
                         attached: Some(1),
+                        clients: None,
                         hint_badge: Some("✦ aurora"),
                     },
                     aurora,
@@ -11073,6 +11863,7 @@ pub(super) mod tests {
                         sessions: Some(2),
                         windows: Some(5),
                         attached: Some(1),
+                        clients: None,
                         hint_badge: Some("✻ claude"),
                     },
                     HomeDashboardState {
@@ -11331,6 +12122,7 @@ pub(super) mod tests {
                         sessions: Some(6),
                         windows: Some(21),
                         attached: Some(3),
+                        clients: None,
                         hint_badge: Some("✦ aurora"),
                     },
                     HomeDashboardState {
@@ -11856,6 +12648,7 @@ pub(super) mod tests {
             sessions: Some(3),
             windows: Some(8),
             attached: Some(1),
+            clients: None,
             hint_badge: None,
         };
         let preview = Some(PanePreview {
@@ -12208,6 +13001,7 @@ pub(super) mod tests {
                     subtitle: "main · 1:zsh",
                     lines: &lines,
                     scroll: 0,
+                    ..PanePreview::default()
                 },
                 theme,
             );
@@ -12228,6 +13022,7 @@ pub(super) mod tests {
                     subtitle: "main · 1:zsh",
                     lines: &lines,
                     scroll: 8,
+                    ..PanePreview::default()
                 },
                 theme,
             );
@@ -12248,6 +13043,7 @@ pub(super) mod tests {
                     subtitle: "main · 1:zsh",
                     lines: &lines,
                     scroll: 999,
+                    ..PanePreview::default()
                 },
                 theme,
             );
@@ -12274,6 +13070,7 @@ pub(super) mod tests {
                         subtitle: "main",
                         lines: &lines,
                         scroll,
+                        ..PanePreview::default()
                     },
                     ascii_nc,
                 );
@@ -12308,6 +13105,7 @@ pub(super) mod tests {
                         subtitle: "work",
                         lines: &lines,
                         scroll: 8,
+                        ..PanePreview::default()
                     },
                     theme,
                 );
@@ -12344,6 +13142,7 @@ pub(super) mod tests {
                     subtitle: "main · 1:zsh",
                     lines: &lines,
                     scroll: 0,
+                    ..PanePreview::default()
                 },
                 theme,
             );
@@ -12398,6 +13197,7 @@ pub(super) mod tests {
                         subtitle: "",
                         lines: &cjk_lines,
                         scroll: 0,
+                        ..PanePreview::default()
                     },
                     theme,
                 );
@@ -12426,6 +13226,7 @@ pub(super) mod tests {
                     subtitle: "main · 1:zsh",
                     lines: &ascii_src,
                     scroll: 0,
+                    ..PanePreview::default()
                 },
                 ascii_nc,
             );
@@ -12526,6 +13327,7 @@ pub(super) mod tests {
             sessions: Some(3),
             windows: Some(8),
             attached: Some(1),
+            clients: None,
             hint_badge: None,
         };
 
@@ -12595,6 +13397,7 @@ pub(super) mod tests {
                             selected: 4,
                             status_note: Some("Saved config to config.toml"),
                         },
+                        menubar: DesktopMenubarState::default(),
                     },
                     theme,
                 );
@@ -12628,6 +13431,7 @@ pub(super) mod tests {
                         selected: 1,
                         active: ThemePreset::AntigravityAurora,
                     },
+                    menubar: DesktopMenubarState::default(),
                 },
                 theme,
             );
@@ -12655,6 +13459,7 @@ pub(super) mod tests {
                     emblem_mode: EmblemMode::Spin,
                     footer_hint: "",
                     content: SubviewContent::Help,
+                    menubar: DesktopMenubarState::default(),
                 },
                 theme,
             );
@@ -12700,6 +13505,7 @@ pub(super) mod tests {
                         input: &confirm_input,
                         scroll: 0,
                     },
+                    menubar: DesktopMenubarState::default(),
                 },
                 theme,
             );
@@ -12740,8 +13546,10 @@ pub(super) mod tests {
                             subtitle: "1:zsh",
                             lines: &preview_lines,
                             scroll: 0,
+                            ..PanePreview::default()
                         }),
                     },
+                    menubar: DesktopMenubarState::default(),
                 },
                 theme,
             );
@@ -12791,6 +13599,7 @@ pub(super) mod tests {
                         emblem_mode: EmblemMode::Spin,
                         footer_hint: tribute.footer_hint,
                         content: SubviewContent::Tribute(tribute.clone()),
+                        menubar: DesktopMenubarState::default(),
                     },
                     ascii_nc,
                 );
@@ -12880,9 +13689,14 @@ pub(super) mod tests {
                 value: "en".into(),
                 description: "Interface language (en = English, zh = Chinese)",
             },
+            ConfigItemView {
+                key: "tmux_popup",
+                value: "true".into(),
+                description: "Bind Ctrl+b j in ~/.tmux.conf to pop up jm in shell or agy",
+            },
         ];
 
-        let expected_specs: [(&str, &str, &str, &[&str]); 10] = [
+        let expected_specs: [(&str, &str, &str, &[&str]); 11] = [
             (
                 "screen_mode",
                 "Viewport Presentation",
@@ -12933,6 +13747,12 @@ pub(super) mod tests {
                 "English (en)",
                 &["中文 (zh)"],
             ),
+            (
+                "tmux_popup",
+                "tmux Global Popup Shortcut",
+                "JustMux Popup",
+                &["Ctrl+b", "~/.tmux.conf"],
+            ),
         ];
 
         let find_cell_col = |buf: &ratatui::buffer::Buffer, needle: &str| -> Option<u16> {
@@ -12963,6 +13783,7 @@ pub(super) mod tests {
                             selected: idx,
                             status_note: Some("Takes effect on next jm launch (press s to save)"),
                         },
+                        menubar: DesktopMenubarState::default(),
                     },
                     theme,
                 );
@@ -13031,6 +13852,7 @@ pub(super) mod tests {
                         selected: 9,
                         status_note: None,
                     },
+                    menubar: DesktopMenubarState::default(),
                 },
                 theme_zh,
             );
@@ -13078,6 +13900,7 @@ pub(super) mod tests {
                             selected: 5,
                             status_note: None,
                         },
+                        menubar: DesktopMenubarState::default(),
                     },
                     theme,
                 );
@@ -13112,6 +13935,7 @@ pub(super) mod tests {
                             selected: 5,
                             status_note: None,
                         },
+                        menubar: DesktopMenubarState::default(),
                     },
                     theme,
                 );
@@ -13152,6 +13976,7 @@ pub(super) mod tests {
                                 selected: 5,
                                 status_note: None,
                             },
+                            menubar: DesktopMenubarState::default(),
                         },
                         theme,
                     );
@@ -13184,6 +14009,7 @@ pub(super) mod tests {
                             selected: 5,
                             status_note: None,
                         },
+                        menubar: DesktopMenubarState::default(),
                     },
                     ascii_nc,
                 );
@@ -13233,6 +14059,7 @@ pub(super) mod tests {
                             selected: 0,
                             status_note: None,
                         },
+                        menubar: DesktopMenubarState::default(),
                     },
                     theme,
                 );
@@ -13270,6 +14097,7 @@ pub(super) mod tests {
                             selected: idx,
                             status_note: Some("Saved config to config.toml"),
                         },
+                        menubar: DesktopMenubarState::default(),
                     },
                     ascii_nc,
                 );
@@ -13356,6 +14184,7 @@ pub(super) mod tests {
                         emblem_mode: mode,
                         footer_hint: "",
                         content: SubviewContent::Help,
+                        menubar: DesktopMenubarState::default(),
                     },
                     theme,
                 );
@@ -13513,6 +14342,7 @@ pub(super) mod tests {
                     emblem_mode: EmblemMode::Spin,
                     footer_hint: "",
                     content: SubviewContent::Help,
+                    menubar: DesktopMenubarState::default(),
                 },
                 aurora,
             );
@@ -13546,6 +14376,7 @@ pub(super) mod tests {
                         selected: 0,
                         status_note: None,
                     },
+                    menubar: DesktopMenubarState::default(),
                 },
                 aurora,
             );
@@ -13615,6 +14446,7 @@ pub(super) mod tests {
                         emblem_mode: EmblemMode::Spin,
                         footer_hint: "",
                         content: SubviewContent::Help,
+                        menubar: DesktopMenubarState::default(),
                     },
                     aurora_zh,
                 );
@@ -13663,6 +14495,7 @@ pub(super) mod tests {
                             selected: 0,
                             status_note: None,
                         },
+                        menubar: DesktopMenubarState::default(),
                     },
                     aurora_zh,
                 );
@@ -13736,6 +14569,7 @@ pub(super) mod tests {
                         emblem_mode: EmblemMode::Spin,
                         footer_hint: "",
                         content: SubviewContent::Help,
+                        menubar: DesktopMenubarState::default(),
                     },
                     no_color_ascii,
                 );
@@ -13760,5 +14594,148 @@ pub(super) mod tests {
                 .iter()
                 .all(|c| c.modifier.contains(Modifier::BOLD))
         );
+    }
+
+    #[test]
+    fn command_group_badges_and_help_views_follow_contiguous_grouped_order() {
+        let aurora = Theme::default().with_preset(ThemePreset::AntigravityAurora);
+        let zh = Theme {
+            language: Language::Zh,
+            ..aurora
+        };
+        let ascii_nc = Theme {
+            ascii: true,
+            no_color: true,
+            truecolor: false,
+            ..aurora
+        };
+
+        for name in [
+            "resume", "new", "window", "rename", "kill", "snapshot", "list",
+        ] {
+            assert_eq!(command_group_badge(name, aurora).0, "workspace");
+            assert_eq!(command_group_badge(name, zh).0, "工作区");
+        }
+        for name in [
+            "pane", "split", "layout", "expose", "buffers", "popup", "theme", "config",
+        ] {
+            assert_eq!(command_group_badge(name, aurora).0, "studio");
+            assert_eq!(command_group_badge(name, zh).0, "工作台");
+        }
+        assert_eq!(command_group_badge("kill-server", aurora).0, "danger");
+        assert_eq!(command_group_badge("kill-server", zh).0, "危险");
+        for name in ["clients", "help", "exit", "quit"] {
+            assert_eq!(command_group_badge(name, aurora).0, "system");
+            assert_eq!(command_group_badge(name, zh).0, "系统");
+        }
+
+        // Verify contiguous grouped left/right columns in render_subview_help.
+        let mut sub_term = Terminal::new(TestBackend::new(120, 32)).expect("subview help term");
+        sub_term
+            .draw(|frame| {
+                render_workspace_subview(
+                    frame,
+                    frame.area(),
+                    &WorkspaceSubviewSpec {
+                        details: HomeDetails::default(),
+                        telemetry: HomeTelemetry::default(),
+                        emblem_step: 0,
+                        emblem_mode: EmblemMode::Spin,
+                        footer_hint: "",
+                        content: SubviewContent::Help,
+                        ..WorkspaceSubviewSpec::default()
+                    },
+                    aurora,
+                );
+            })
+            .expect("draw subview help");
+        let sub_text = buffer_logical_text(sub_term.backend().buffer());
+        let expected_left = [
+            "/resume",
+            "/new",
+            "/window",
+            "/rename",
+            "/kill",
+            "/snapshot",
+            "/list",
+            "/exit",
+            "/kill-server",
+            "/quit",
+        ];
+        let expected_right = [
+            "/pane", "/split", "/layout", "/expose", "/buffers", "/popup", "/clients", "/theme",
+            "/config", "/help",
+        ];
+        for pair in expected_left.windows(2) {
+            let a = sub_text.find(pair[0]).expect(pair[0]);
+            let b = sub_text.find(pair[1]).expect(pair[1]);
+            assert!(
+                a < b,
+                "expected {} before {} in:\n{sub_text}",
+                pair[0],
+                pair[1]
+            );
+        }
+        for pair in expected_right.windows(2) {
+            let a = sub_text.find(pair[0]).expect(pair[0]);
+            let b = sub_text.find(pair[1]).expect(pair[1]);
+            assert!(
+                a < b,
+                "expected {} before {} in:\n{sub_text}",
+                pair[0],
+                pair[1]
+            );
+        }
+
+        // Verify compact render_help follows exact palette grouping + ASCII/NO_COLOR invariants.
+        let mut compact = Terminal::new(TestBackend::new(60, 26)).expect("compact help");
+        compact
+            .draw(|frame| render_help(frame, frame.area(), ascii_nc))
+            .expect("draw compact ascii help");
+        let compact_text = compact.backend().to_string();
+        assert!(
+            compact_text.is_ascii(),
+            "non-ASCII compact help:\n{compact_text}"
+        );
+        assert!(
+            compact
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .all(|c| c.fg == Color::Reset && c.bg == Color::Reset)
+        );
+        let compact_order = [
+            "/resume",
+            "/new",
+            "/window",
+            "/rename",
+            "/kill",
+            "/snapshot",
+            "/list",
+            "/pane",
+            "/split",
+            "/layout",
+            "/expose",
+            "/buffers",
+            "/popup",
+            "/theme",
+            "/config",
+            "/clients",
+            "/help",
+            "/exit",
+            "/kill-server",
+            "/quit",
+        ];
+        for pair in compact_order.windows(2) {
+            let a = compact_text.find(pair[0]).expect(pair[0]);
+            let b = compact_text.find(pair[1]).expect(pair[1]);
+            assert!(
+                a < b,
+                "expected {} before {} in compact help:\n{compact_text}",
+                pair[0],
+                pair[1]
+            );
+        }
     }
 }

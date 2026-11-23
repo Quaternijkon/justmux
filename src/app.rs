@@ -1,5 +1,7 @@
 //! Application state and keyboard focus. Views never handle keys below the top
 //! of the stack; all tmux mutations happen here, outside the rendering layer.
+mod controller;
+mod desktop;
 mod resume;
 mod split;
 
@@ -9,9 +11,12 @@ use std::{
     path::PathBuf,
 };
 
-use crossterm::event::{
-    Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+use controller::{
+    BuffersViewState, ClientsViewState, ConfirmTarget, DualForm, LayoutStudioState,
+    PreviewSearchState, SnapshotsViewState, TargetPickState, build_resource_actions,
 };
+use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use desktop::{DesktopState, ExposeState, HoverTarget};
 use ratatui::{
     Frame,
     layout::{Constraint, Layout, Rect},
@@ -25,23 +30,38 @@ use crate::{
     commands::{self, CommandKind, CommandMatch, ParsedCommand},
     config::{self, Config},
     fuzzy::{FuzzyMatcher, MatchKind},
+    snapshot::WorkspaceSnapshot,
     terminal::ScreenMode,
     tmux::{
-        Context, InsideContext, Pane, PaneId, Session, SessionId, SplitDirection, Target, Tmux,
-        TmuxResult, Window, WindowId,
+        Context, InsideContext, LayoutPreset, Pane, PaneId, Session, SessionId, SplitDirection,
+        Target, Tmux, TmuxResult, Window, WindowId,
     },
+    tmux_conf::{HISTORY_LIMIT_PRESETS, TmuxComfortOptions},
     tributes::{self, MicroTributeKind, TributeId},
     ui::{
-        self, CommandItem, ComposerMode, ConfigItemView, EmblemMode, HomeDetails, HomeSessionEntry,
-        HomeTelemetry, MatrixAction, SplitCanvasNode, SplitCanvasPaneView, SplitStudioView,
-        SplitToolbarButton, SplitWindowRowView, SubviewContent, TargetScope, TextInput, Theme,
-        ThemePreset, WorkspaceHomeSpec, WorkspaceSubviewSpec, render_workspace_home,
-        render_workspace_subview,
+        self, BufferRowView, BuffersView, ClientRowView, ClientsView, CommandItem, ComposerMode,
+        ConfigItemView, ControllerAction, DesktopMenubarState, EmblemMode, HomeDetails,
+        HomeQuickAction, HomeSessionEntry, HomeTelemetry, LayoutStudioView, MatrixAction,
+        PreviewAction, SashId, SnapshotRowView, SnapshotsView, SplitCanvasNode,
+        SplitCanvasPaneView, SplitStudioView, SplitToolbarButton, SplitWindowRowView,
+        SubviewContent, TargetScope, TextInput, Theme, ThemePreset, ToastKind, WorkspaceHomeSpec,
+        WorkspaceSubviewSpec, render_workspace_home, render_workspace_subview,
     },
 };
 
 const PREVIEW_CAPTURE_LINES: usize = 400;
 const PREVIEW_WHEEL_STEP: usize = 3;
+
+/// Advance an index within `0..len` by `delta` with circular wrap-around.
+/// Returns `0` when `len == 0`.
+pub(crate) fn wrap_step(current: usize, len: usize, delta: isize) -> usize {
+    if len == 0 {
+        return 0;
+    }
+    let cur = current.min(len - 1);
+    let step = delta.rem_euclid(len as isize) as usize;
+    (cur + step) % len
+}
 
 #[derive(Debug, Clone, Default)]
 pub struct AppOptions {
@@ -66,6 +86,7 @@ fn working_directory_label() -> Option<String> {
 pub enum Exit {
     Quit,
     Attach(Target),
+    AttachReadOnly(Target),
     Detach(String),
     Switched,
 }
@@ -119,36 +140,12 @@ impl Resource {
             Self::Pane(p) => &p.session_id,
         }
     }
-    fn actions_for(&self, lang: ui::Language) -> &'static [(&'static str, ResourceAction)] {
-        use ResourceAction::{Close, Open, Rename};
-        if lang.is_zh() {
-            return match self {
-                Self::Session(_) => &[
-                    ("恢复附着会话", Open),
-                    ("重命名会话", Rename),
-                    ("关闭会话", Close),
-                ],
-                Self::Window(_) => &[
-                    ("打开窗口", Open),
-                    ("重命名窗口", Rename),
-                    ("关闭窗口", Close),
-                ],
-                Self::Pane(_) => &[("跳转到窗格", Open), ("关闭窗格", Close)],
-            };
-        }
-        match self {
-            Self::Session(_) => &[
-                ("Resume session", Open),
-                ("Rename session", Rename),
-                ("Close session", Close),
-            ],
-            Self::Window(_) => &[
-                ("Open window", Open),
-                ("Rename window", Rename),
-                ("Close window", Close),
-            ],
-            Self::Pane(_) => &[("Open pane", Open), ("Close pane", Close)],
-        }
+    fn actions_for(
+        &self,
+        piping: &HashSet<PaneId>,
+        lang: ui::Language,
+    ) -> Vec<(String, ResourceAction)> {
+        build_resource_actions(self, piping, lang)
     }
     fn rich_row(
         &self,
@@ -224,8 +221,25 @@ impl Resource {
                 }
             }
             Self::Window(w) => {
-                let badge = w.active.then(|| {
-                    (
+                let badge = if w.synchronized {
+                    Some((
+                        if ascii {
+                            "[!SYNC]"
+                        } else if zh {
+                            "⚡同步"
+                        } else {
+                            "⚡SYNC"
+                        }
+                        .to_owned(),
+                        theme.warning,
+                    ))
+                } else if w.zoomed {
+                    Some((
+                        if ascii { "[Z]" } else { "⛶ zoom" }.to_owned(),
+                        theme.accent,
+                    ))
+                } else if w.active {
+                    Some((
                         if ascii {
                             "* active"
                         } else if zh {
@@ -235,8 +249,10 @@ impl Resource {
                         }
                         .to_owned(),
                         theme.accent,
-                    )
-                });
+                    ))
+                } else {
+                    None
+                };
                 ui::RichPickerRow {
                     primary: self.label(),
                     primary_indices,
@@ -255,7 +271,43 @@ impl Resource {
                 }
             }
             Self::Pane(p) => {
-                let badge = if p.busy {
+                let badge = if p.dead {
+                    Some((
+                        if ascii {
+                            "[X] dead"
+                        } else if zh {
+                            "✕ 已退出"
+                        } else {
+                            "✕ dead"
+                        }
+                        .to_owned(),
+                        theme.error,
+                    ))
+                } else if p.zoomed {
+                    Some((
+                        if ascii {
+                            "[Z] zoom"
+                        } else if zh {
+                            "⛶ 缩放"
+                        } else {
+                            "⛶ zoom"
+                        }
+                        .to_owned(),
+                        theme.accent,
+                    ))
+                } else if p.synchronized {
+                    Some((
+                        if ascii {
+                            "[!SYNC]"
+                        } else if zh {
+                            "⚡同步"
+                        } else {
+                            "⚡SYNC"
+                        }
+                        .to_owned(),
+                        theme.warning,
+                    ))
+                } else if p.busy {
                     Some((
                         if ascii {
                             "! busy"
@@ -277,10 +329,18 @@ impl Resource {
                 } else {
                     None
                 };
+                let title_part = if !p.title.trim().is_empty() && p.title != p.current_command {
+                    format!(" · {}", p.title)
+                } else {
+                    String::new()
+                };
                 ui::RichPickerRow {
                     primary: self.label(),
                     primary_indices,
-                    secondary: format!("{} · {}", p.id, p.current_path),
+                    secondary: format!(
+                        "{} ({}x{}){} · {}",
+                        p.id, p.width, p.height, title_part, p.current_path
+                    ),
                     badge,
                     is_action: false,
                 }
@@ -363,7 +423,10 @@ enum FormAction {
     NewSessionName,
     NewSessionDirectory { name: String },
     Rename(Resource),
-    NewWindow(SessionId),
+    RenamePaneTitle(Pane),
+    SendCommandToPane(Pane),
+    NewBufferContent,
+    SaveSnapshotName { session_filter: Option<SessionId> },
 }
 #[derive(Debug, Clone)]
 struct Form {
@@ -372,27 +435,60 @@ struct Form {
 }
 #[derive(Debug, Clone)]
 struct Confirm {
-    resource: Resource,
+    target: ConfirmTarget,
     input: TextInput,
     message: String,
     scroll: u16,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ResourceAction {
     Open,
+    AttachReadOnly,
+    NewWindow,
     Rename,
+    DetachOthers,
+    SaveSnapshot,
     Close,
+    EditInSplitStudio,
+    LayoutAndResize,
+    ToggleSyncPanes,
+    CycleMonitor,
+    MoveWindowToSession,
+    LinkWindowToSession,
+    ReorderWindowLeft,
+    ReorderWindowRight,
+    ToggleZoomPane,
+    SplitPaneRight,
+    SplitPaneDown,
+    BreakPaneOut,
+    SwapPaneWith,
+    JoinPaneInto,
+    CopyPaneOutput,
+    ExportPaneLog,
+    TogglePipePane,
+    SendCtrlC,
+    SendCommand,
+    ClearPaneHistory,
+    RespawnPane,
+    RenamePaneTitle,
 }
 
 #[derive(Debug, Clone)]
 enum View {
     Picker(Picker),
+    TargetPick(TargetPickState),
     Actions(Resource, usize),
     Form(Form),
+    DualForm(DualForm),
     Confirm(Confirm),
     Created(Resource),
     Split(SplitStudio),
+    LayoutStudio(LayoutStudioState),
+    Expose(ExposeState),
+    Clients(ClientsViewState),
+    Buffers(BuffersViewState),
+    Snapshots(SnapshotsViewState),
     ThemePicker {
         initial: ThemePreset,
         selected: usize,
@@ -441,7 +537,7 @@ struct MentionCandidate {
     resource: Resource,
 }
 
-const CONFIG_ITEM_COUNT: usize = 10;
+const CONFIG_ITEM_COUNT: usize = 18;
 
 fn theme_toast(preset: ThemePreset, lang: ui::Language) -> String {
     if lang.is_zh() {
@@ -493,8 +589,11 @@ pub struct App<'a> {
     config: Config,
     config_path: Option<PathBuf>,
     config_note: Option<String>,
+    tmux_conf_path: Option<PathBuf>,
+    popup_fallback_exe: Option<PathBuf>,
     context: Context,
     telemetry: CachedTelemetry,
+    client_count: Option<usize>,
     home_sessions: Vec<Session>,
     home_windows: Vec<Window>,
     home_panes: Vec<Pane>,
@@ -502,6 +601,9 @@ pub struct App<'a> {
     matrix_action: MatrixAction,
     matrix_hits: Vec<resume::MatrixHit>,
     tab_hits: [(Rect, MatrixAction); 4],
+    quick_action_hits: Vec<(Rect, HomeQuickAction)>,
+    preview_action_hits: Vec<(Rect, PreviewAction)>,
+    controller_hits: Vec<(Rect, ControllerAction)>,
     subview_list_rect: Option<Rect>,
     composer_mode: ComposerMode,
     radar_selected: usize,
@@ -511,6 +613,11 @@ pub struct App<'a> {
     preview_scroll: usize,
     preview_rect: Option<Rect>,
     preview_target: Option<Target>,
+    home_preview_pane_idx: usize,
+    home_preview_pane_window: Option<WindowId>,
+    home_preview_pane_total: usize,
+    preview_search: PreviewSearchState,
+    piping_panes: HashSet<PaneId>,
     picker_list_rect: Option<Rect>,
     picker_offset: usize,
     radar_list_rect: Option<Rect>,
@@ -518,6 +625,7 @@ pub struct App<'a> {
     emblem_step: usize,
     hydra_visible: bool,
     easter_step: usize,
+    desktop: DesktopState,
     exit: Option<Exit>,
 }
 
@@ -563,8 +671,11 @@ impl<'a> App<'a> {
             config,
             config_path,
             config_note: None,
+            tmux_conf_path: None,
+            popup_fallback_exe: None,
             context: tmux.context(),
             telemetry: CachedTelemetry::default(),
+            client_count: None,
             home_sessions: Vec::new(),
             home_windows: Vec::new(),
             home_panes: Vec::new(),
@@ -572,6 +683,9 @@ impl<'a> App<'a> {
             matrix_action: MatrixAction::Open,
             matrix_hits: Vec::new(),
             tab_hits: Default::default(),
+            quick_action_hits: Vec::new(),
+            preview_action_hits: Vec::new(),
+            controller_hits: Vec::new(),
             subview_list_rect: None,
             composer_mode,
             radar_selected: 0,
@@ -581,6 +695,11 @@ impl<'a> App<'a> {
             preview_scroll: 0,
             preview_rect: None,
             preview_target: None,
+            home_preview_pane_idx: 0,
+            home_preview_pane_window: None,
+            home_preview_pane_total: 0,
+            preview_search: PreviewSearchState::default(),
+            piping_panes: HashSet::new(),
             picker_list_rect: None,
             picker_offset: 0,
             radar_list_rect: None,
@@ -588,6 +707,7 @@ impl<'a> App<'a> {
             emblem_step: 0,
             hydra_visible: false,
             easter_step: 0,
+            desktop: DesktopState::default(),
             exit: None,
         };
         app.refresh_home_data();
@@ -595,6 +715,28 @@ impl<'a> App<'a> {
             app.execute_text(&format!("/{}", command.trim_start_matches('/')));
         }
         app
+    }
+
+    /// Configure the user `tmux.conf` path and auto-detect the active executable
+    /// for opt-in popup keybind management in `/config`.
+    pub fn with_tmux_conf_path(self, path: Option<PathBuf>) -> Self {
+        self.with_tmux_conf(path, crate::tmux_conf::detect_fallback_exe())
+    }
+
+    /// Configure an explicit `tmux.conf` path and optional fallback executable
+    /// for opt-in popup keybind & comfort management in `/config`.
+    pub fn with_tmux_conf(mut self, path: Option<PathBuf>, fallback_exe: Option<PathBuf>) -> Self {
+        if let Some(ref conf_path) = path {
+            if let Ok(installed) = crate::tmux_conf::is_installed(conf_path) {
+                self.config.tmux_popup = installed;
+            }
+            if let Ok(comfort) = crate::tmux_conf::read_comfort_block(conf_path) {
+                self.config.set_tmux_comfort_options(comfort);
+            }
+        }
+        self.tmux_conf_path = path;
+        self.popup_fallback_exe = fallback_exe;
+        self
     }
 
     pub fn config(&self) -> &Config {
@@ -635,24 +777,46 @@ impl<'a> App<'a> {
         self.emblem_step = self.emblem_step.wrapping_add(1);
     }
 
-    pub fn handle_event(&mut self, event: Event) {
+    pub fn handle_event(&mut self, event: Event) -> bool {
+        // Live PIP direct type-through MUST intercept keys & paste BEFORE Ctrl+C / Ctrl+P.
+        if let Some(changed) = self.try_handle_live_pip_event(&event) {
+            return changed;
+        }
+        if let Event::Resize(_, _) = event {
+            return true;
+        }
         if let Event::Paste(text) = event {
+            if let Some(rename) = self.desktop.inline_rename.as_mut() {
+                rename.input.insert_str(&text);
+                return true;
+            }
             self.paste(&text);
-            return;
+            return true;
         }
         if let Event::Mouse(mouse) = event {
-            if self.config.mouse {
-                self.handle_mouse(mouse);
-            }
-            return;
+            return if self.config.mouse {
+                self.handle_desktop_mouse(mouse)
+            } else {
+                false
+            };
         }
-        let Event::Key(key) = event else { return };
+        let Event::Key(key) = event else {
+            return false;
+        };
         if key.kind == KeyEventKind::Release {
-            return;
+            return false;
         }
         if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+            self.desktop.context_menu = None;
+            self.desktop.inline_rename = None;
             self.exit = Some(Exit::Quit);
-            return;
+            return true;
+        }
+        if self.desktop.inline_rename.is_some() {
+            return self.handle_inline_rename_key(key);
+        }
+        if self.desktop.context_menu.is_some() && self.handle_context_menu_key(key) {
+            return true;
         }
         if key.modifiers.contains(KeyModifiers::CONTROL)
             && !key.modifiers.contains(KeyModifiers::ALT)
@@ -660,16 +824,54 @@ impl<'a> App<'a> {
             match key.code {
                 KeyCode::Char('p' | 'P') => {
                     self.open_universal_palette();
-                    return;
+                    return true;
                 }
                 KeyCode::Char('k' | 'K') if self.is_non_text_context() => {
                     self.open_universal_palette();
-                    return;
+                    return true;
+                }
+                KeyCode::Char('g' | 'G') => {
+                    self.open_expose_view();
+                    return true;
+                }
+                KeyCode::Char('i' | 'I') => {
+                    self.toggle_live_pip(None);
+                    return true;
                 }
                 _ => {}
             }
         }
+        if !key.modifiers.contains(KeyModifiers::CONTROL)
+            && !key.modifiers.contains(KeyModifiers::ALT)
+        {
+            if key.code == KeyCode::F(3) {
+                self.open_expose_view();
+                return true;
+            }
+            if key.code == KeyCode::F(4) {
+                self.toggle_live_pip(None);
+                return true;
+            }
+            if key.code == KeyCode::F(2)
+                && !self.preview_search.active
+                && !matches!(
+                    self.views.top(),
+                    Some(View::Form(_) | View::DualForm(_) | View::Confirm(_))
+                )
+                && self.open_inline_rename_for_focused()
+            {
+                return true;
+            }
+        }
+        if self.handle_preview_search_key(key) {
+            return true;
+        }
         if key.code == KeyCode::Esc {
+            if !self.preview_search.active && self.preview_search.query_str().is_some() {
+                self.preview_search.reset();
+                self.status.clear();
+                return true;
+            }
             match self.views.pop() {
                 Some(View::ThemePicker { initial, .. }) => {
                     self.theme = self.theme.with_preset(initial);
@@ -693,21 +895,23 @@ impl<'a> App<'a> {
                         self.status.clear();
                         self.exit = Some(Exit::Quit);
                     }
-                    return;
+                    return true;
                 }
             }
             self.status.clear();
             self.sync_top_view_after_pop();
-            return;
+            return true;
         }
         // Take the top view out while handling it to make nested pushes explicit.
         match self.views.pop() {
             None => self.composer_key(key),
             Some(View::Picker(picker)) => self.picker_key(picker, key),
+            Some(View::TargetPick(state)) => self.target_pick_key(state, key),
             Some(View::Actions(resource, selected)) => {
                 self.resource_action_key(resource, selected, key)
             }
             Some(View::Form(form)) => self.form_key(form, key),
+            Some(View::DualForm(form)) => self.dual_form_key(form, key),
             Some(View::Confirm(confirm)) => self.confirm_key(confirm, key),
             Some(View::Created(resource)) => {
                 if key.code == KeyCode::Enter {
@@ -717,6 +921,11 @@ impl<'a> App<'a> {
                 }
             }
             Some(View::Split(studio)) => self.split_studio_key(studio, key),
+            Some(View::LayoutStudio(state)) => self.layout_studio_key(state, key),
+            Some(View::Expose(state)) => self.expose_key(state, key),
+            Some(View::Clients(state)) => self.clients_key(state, key),
+            Some(View::Buffers(state)) => self.buffers_key(state, key),
+            Some(View::Snapshots(state)) => self.snapshots_key(state, key),
             Some(View::ThemePicker { initial, selected }) => {
                 self.theme_picker_key(initial, selected, key);
             }
@@ -724,9 +933,13 @@ impl<'a> App<'a> {
             Some(View::Tribute { id, step }) => self.tribute_key(id, step, key),
             Some(View::Help) => self.views.push(View::Help),
         }
+        true
     }
 
     fn is_non_text_context(&self) -> bool {
+        if self.preview_search.active {
+            return false;
+        }
         match self.views.top() {
             None => self.composer.value().is_empty(),
             Some(
@@ -736,13 +949,25 @@ impl<'a> App<'a> {
                 | View::Config { .. }
                 | View::Actions(..)
                 | View::Split(..)
+                | View::LayoutStudio(..)
+                | View::Expose(..)
+                | View::Clients(..)
+                | View::Buffers(..)
+                | View::Snapshots(..)
                 | View::Created(..),
             ) => true,
-            Some(View::Picker(_) | View::Form(_) | View::Confirm(_)) => false,
+            Some(
+                View::Picker(_)
+                | View::TargetPick(_)
+                | View::Form(_)
+                | View::DualForm(_)
+                | View::Confirm(_),
+            ) => false,
         }
     }
 
     fn open_universal_palette(&mut self) {
+        self.preview_search.reset();
         while let Some(view) = self.views.pop() {
             if let View::ThemePicker { initial, .. } = view {
                 self.theme = self.theme.with_preset(initial);
@@ -766,12 +991,37 @@ impl<'a> App<'a> {
                 self.update_picker_preview(&picker);
                 self.views.push(View::Picker(picker));
             }
+            Some(View::TargetPick(state)) => {
+                self.update_target_pick_preview(&state);
+                self.views.push(View::TargetPick(state));
+            }
+            Some(View::LayoutStudio(mut state)) => {
+                self.refresh_layout_studio_state(&mut state);
+                self.views.push(View::LayoutStudio(state));
+            }
+            Some(View::Clients(mut state)) => {
+                self.reload_clients_state(&mut state);
+                self.views.push(View::Clients(state));
+            }
+            Some(View::Buffers(mut state)) => {
+                self.reload_buffers_state(&mut state);
+                self.views.push(View::Buffers(state));
+            }
+            Some(View::Snapshots(mut state)) => {
+                self.reload_snapshots_state(&mut state);
+                self.views.push(View::Snapshots(state));
+            }
             Some(other) => self.views.push(other),
         }
     }
 
     fn paste(&mut self, text: &str) {
         let text = text.replace("\r\n", "\n").replace(['\r', '\n', '\t'], " ");
+        if self.preview_search.active {
+            self.preview_search.query.insert_str(&text);
+            self.recompute_preview_search(true);
+            return;
+        }
         let top = self.views.pop();
         match top {
             None => {
@@ -788,9 +1038,19 @@ impl<'a> App<'a> {
                 self.update_picker_preview(&picker);
                 self.views.push(View::Picker(picker));
             }
+            Some(View::TargetPick(mut state)) => {
+                state.query.insert_str(&text);
+                state.selected = 0;
+                self.update_target_pick_preview(&state);
+                self.views.push(View::TargetPick(state));
+            }
             Some(View::Form(mut form)) => {
                 form.input.insert_str(&text);
                 self.views.push(View::Form(form));
+            }
+            Some(View::DualForm(mut form)) => {
+                form.active_input_mut().insert_str(&text);
+                self.views.push(View::DualForm(form));
             }
             Some(View::Confirm(mut confirm)) => {
                 confirm.input.insert_str(&text);
@@ -830,6 +1090,7 @@ impl<'a> App<'a> {
                 CommandKind::Kill
                     | CommandKind::Rename
                     | CommandKind::Split
+                    | CommandKind::Layout
                     | CommandKind::Window
                     | CommandKind::Pane
                     | CommandKind::Resume
@@ -961,6 +1222,18 @@ impl<'a> App<'a> {
                     self.status = theme_toast(next, self.theme.language);
                     return;
                 }
+                KeyCode::Char('f' | 'F')
+                    if self.config.live_preview && self.cached_preview.is_some() =>
+                {
+                    self.open_preview_search();
+                    return;
+                }
+                KeyCode::Char('y' | 'Y')
+                    if self.config.live_preview && self.cached_preview.is_some() =>
+                {
+                    self.copy_current_preview_to_clipboard();
+                    return;
+                }
                 _ => {}
             }
         }
@@ -1008,6 +1281,37 @@ impl<'a> App<'a> {
                 }
                 if key.modifiers.is_empty() {
                     match key.code {
+                        KeyCode::Char('[') if self.cycle_home_preview_pane(false) => {
+                            self.status.clear();
+                            return;
+                        }
+                        KeyCode::Char(']') if self.cycle_home_preview_pane(true) => {
+                            self.status.clear();
+                            return;
+                        }
+                        KeyCode::Char('f')
+                            if self.config.live_preview
+                                && self.cached_preview.is_some()
+                                && self.preview_target.is_some() =>
+                        {
+                            self.open_preview_search();
+                            return;
+                        }
+                        KeyCode::Char('y')
+                            if self.config.live_preview
+                                && self.cached_preview.is_some()
+                                && self.preview_target.is_some() =>
+                        {
+                            self.copy_current_preview_to_clipboard();
+                            return;
+                        }
+                        KeyCode::Char('n')
+                            if self.preview_search.query_str().is_some()
+                                && self.matrix_action != MatrixAction::Window =>
+                        {
+                            self.step_preview_search_match(true);
+                            return;
+                        }
                         KeyCode::Left => {
                             if self.matrix.move_column(-1) {
                                 self.sync_action_scope_with_matrix();
@@ -1048,6 +1352,14 @@ impl<'a> App<'a> {
                         _ => {}
                     }
                 }
+                if key.code == KeyCode::Char('N')
+                    && !ctrl
+                    && !alt
+                    && self.preview_search.query_str().is_some()
+                {
+                    self.step_preview_search_match(false);
+                    return;
+                }
                 let is_new_window = !ctrl
                     && !alt
                     && (key.code == KeyCode::Char('+')
@@ -1056,23 +1368,49 @@ impl<'a> App<'a> {
                             && key.modifiers.is_empty()));
                 if is_new_window && let Some(session) = self.matrix.selected_session().cloned() {
                     self.status.clear();
-                    self.views.push(View::Form(Form {
-                        action: FormAction::NewWindow(session.id),
-                        input: TextInput::default(),
-                    }));
+                    self.views
+                        .push(View::DualForm(DualForm::new_window(session.id)));
                     return;
                 }
             }
             if self.composer_mode == ComposerMode::LiveRadar && !ctrl && !alt {
                 match key.code {
+                    KeyCode::Char('f')
+                        if key.modifiers.is_empty()
+                            && self.config.live_preview
+                            && self.cached_preview.is_some() =>
+                    {
+                        self.open_preview_search();
+                        return;
+                    }
+                    KeyCode::Char('y')
+                        if key.modifiers.is_empty()
+                            && self.config.live_preview
+                            && self.cached_preview.is_some() =>
+                    {
+                        self.copy_current_preview_to_clipboard();
+                        return;
+                    }
+                    KeyCode::Char('n')
+                        if key.modifiers.is_empty()
+                            && self.preview_search.query_str().is_some() =>
+                    {
+                        self.step_preview_search_match(true);
+                        return;
+                    }
+                    KeyCode::Char('N') if self.preview_search.query_str().is_some() => {
+                        self.step_preview_search_match(false);
+                        return;
+                    }
                     KeyCode::Up => {
-                        self.radar_selected = self.radar_selected.saturating_sub(1);
+                        self.radar_selected =
+                            wrap_step(self.radar_selected, self.home_sessions.len(), -1);
                         self.refresh_radar_preview();
                         return;
                     }
                     KeyCode::Down => {
-                        self.radar_selected = (self.radar_selected + 1)
-                            .min(self.home_sessions.len().saturating_sub(1));
+                        self.radar_selected =
+                            wrap_step(self.radar_selected, self.home_sessions.len(), 1);
                         self.refresh_radar_preview();
                         return;
                     }
@@ -1110,12 +1448,11 @@ impl<'a> App<'a> {
         if !palette.is_empty() {
             match key.code {
                 KeyCode::Up => {
-                    self.palette_selected = self.palette_selected.saturating_sub(1);
+                    self.palette_selected = wrap_step(self.palette_selected, palette.len(), -1);
                     return;
                 }
                 KeyCode::Down => {
-                    self.palette_selected =
-                        (self.palette_selected + 1).min(palette.len().saturating_sub(1));
+                    self.palette_selected = wrap_step(self.palette_selected, palette.len(), 1);
                     return;
                 }
                 KeyCode::Tab => {
@@ -1142,12 +1479,12 @@ impl<'a> App<'a> {
             if !mentions.is_empty() {
                 match key.code {
                     KeyCode::Up => {
-                        self.mention_selected = self.mention_selected.saturating_sub(1);
+                        self.mention_selected =
+                            wrap_step(self.mention_selected, mentions.len(), -1);
                         return;
                     }
                     KeyCode::Down => {
-                        self.mention_selected =
-                            (self.mention_selected + 1).min(mentions.len().saturating_sub(1));
+                        self.mention_selected = wrap_step(self.mention_selected, mentions.len(), 1);
                         return;
                     }
                     KeyCode::Tab => {
@@ -1276,13 +1613,13 @@ impl<'a> App<'a> {
             && !key.modifiers.contains(KeyModifiers::ALT);
         match key.code {
             KeyCode::Up => {
-                selected = selected.saturating_sub(1);
+                selected = wrap_step(selected, ThemePreset::ALL.len(), -1);
                 let preset = ThemePreset::ALL.get(selected).copied().unwrap_or(initial);
                 self.theme = self.theme.with_preset(preset);
                 self.views.push(View::ThemePicker { initial, selected });
             }
             KeyCode::Down => {
-                selected = (selected + 1).min(ThemePreset::ALL.len().saturating_sub(1));
+                selected = wrap_step(selected, ThemePreset::ALL.len(), 1);
                 let preset = ThemePreset::ALL.get(selected).copied().unwrap_or(initial);
                 self.theme = self.theme.with_preset(preset);
                 self.views.push(View::ThemePicker { initial, selected });
@@ -1340,12 +1677,12 @@ impl<'a> App<'a> {
         let no_ctrl_alt = !key.modifiers.contains(KeyModifiers::CONTROL)
             && !key.modifiers.contains(KeyModifiers::ALT);
         match key.code {
-            KeyCode::Up => selected = selected.saturating_sub(1),
-            KeyCode::Down => selected = (selected + 1).min(CONFIG_ITEM_COUNT - 1),
-            KeyCode::Left if no_ctrl_alt => self.cycle_config_setting(selected, false, false),
-            KeyCode::Right if no_ctrl_alt => self.cycle_config_setting(selected, true, false),
-            KeyCode::Enter => self.cycle_config_setting(selected, true, true),
-            KeyCode::Char(' ') if no_ctrl_alt => self.cycle_config_setting(selected, true, true),
+            KeyCode::Up => selected = wrap_step(selected, CONFIG_ITEM_COUNT, -1),
+            KeyCode::Down => selected = wrap_step(selected, CONFIG_ITEM_COUNT, 1),
+            KeyCode::Left if no_ctrl_alt => self.cycle_config_setting(selected, false),
+            KeyCode::Right if no_ctrl_alt => self.cycle_config_setting(selected, true),
+            KeyCode::Enter => self.cycle_config_setting(selected, true),
+            KeyCode::Char(' ') if no_ctrl_alt => self.cycle_config_setting(selected, true),
             KeyCode::Char('s' | 'S') if no_ctrl_alt => {
                 let target = self
                     .config_path
@@ -1391,7 +1728,7 @@ impl<'a> App<'a> {
         self.views.push(View::Config { selected });
     }
 
-    fn cycle_config_setting(&mut self, index: usize, forward: bool, wrap_height: bool) {
+    fn cycle_config_setting(&mut self, index: usize, forward: bool) {
         let mut restart_changed = false;
         match index {
             0 => {
@@ -1449,10 +1786,12 @@ impl<'a> App<'a> {
                 let prev = self.config.inline_height;
                 self.config.inline_height = if forward {
                     if prev >= 40 {
-                        if wrap_height { 8 } else { 40 }
+                        8
                     } else {
                         (prev + 1).clamp(8, 40)
                     }
+                } else if prev <= 8 {
+                    40
                 } else {
                     prev.saturating_sub(1).clamp(8, 40)
                 };
@@ -1470,6 +1809,34 @@ impl<'a> App<'a> {
                 self.config.language = self.config.language.toggle();
                 self.theme = self.config.effective_theme();
             }
+            10 => self.toggle_tmux_popup(),
+            11 => self.update_tmux_comfort_setting(|opts| opts.mouse = !opts.mouse),
+            12 => self.update_tmux_comfort_setting(|opts| {
+                opts.history_limit = if forward {
+                    TmuxComfortOptions::next_history_limit_preset(opts.history_limit)
+                } else {
+                    let pos = HISTORY_LIMIT_PRESETS
+                        .iter()
+                        .position(|&p| p == opts.history_limit)
+                        .unwrap_or(0);
+                    let prev =
+                        (pos + HISTORY_LIMIT_PRESETS.len() - 1) % HISTORY_LIMIT_PRESETS.len();
+                    HISTORY_LIMIT_PRESETS[prev]
+                };
+            }),
+            13 => {
+                self.update_tmux_comfort_setting(|opts| opts.base_index_one = !opts.base_index_one);
+            }
+            14 => self.update_tmux_comfort_setting(|opts| {
+                opts.renumber_windows = !opts.renumber_windows;
+            }),
+            15 => self.update_tmux_comfort_setting(|opts| {
+                opts.zero_escape_time = !opts.zero_escape_time;
+            }),
+            16 => self.reload_tmux_conf_action(),
+            17 => {
+                self.config.live_stream = !self.config.live_stream;
+            }
             _ => {}
         }
         if restart_changed {
@@ -1481,6 +1848,137 @@ impl<'a> App<'a> {
                     )
                     .into(),
             );
+        }
+    }
+
+    fn shorten_home_path(path: &std::path::Path) -> String {
+        if let Some(home) = env::home_dir()
+            && let Ok(relative) = path.strip_prefix(home)
+        {
+            return if relative.as_os_str().is_empty() {
+                "~".into()
+            } else {
+                format!("~/{}", relative.display())
+            };
+        }
+        path.display().to_string()
+    }
+
+    fn toggle_tmux_popup(&mut self) {
+        let target = !self.config.tmux_popup;
+        let Some(conf_path) = self.tmux_conf_path.clone() else {
+            self.config.tmux_popup = target;
+            let message = self
+                .theme
+                .tr(
+                    "No ~/.tmux.conf path available (set HOME or JUSTMUX_TMUX_CONF)",
+                    "未找到 ~/.tmux.conf 路径（请设置 HOME 或 JUSTMUX_TMUX_CONF）",
+                )
+                .to_owned();
+            self.config_note = Some(message.clone());
+            self.status = message;
+            return;
+        };
+
+        let short = Self::shorten_home_path(&conf_path);
+        if target {
+            if let Err(err) =
+                crate::tmux_conf::install(&conf_path, self.popup_fallback_exe.as_deref())
+            {
+                let message = if self.theme.language.is_zh() {
+                    format!("无法更新 {short}：{err}")
+                } else {
+                    format!("Could not update {short}: {err}")
+                };
+                self.config_note = Some(message.clone());
+                self.status = message;
+                return;
+            }
+            self.config.tmux_popup = true;
+            let supports_popup = self
+                .tmux
+                .version()
+                .map(|version| version.supports_popup())
+                .unwrap_or(true);
+            let cmd = crate::tmux_conf::popup_run_shell_command(self.popup_fallback_exe.as_deref());
+            let message = match self.tmux.bind_popup_key(&cmd) {
+                Ok(true) if !supports_popup => {
+                    if self.theme.language.is_zh() {
+                        format!("✦ 已写入 {short}，但浮窗需要 tmux 3.2+")
+                    } else {
+                        format!("✦ Updated {short}, but display-popup requires tmux 3.2+")
+                    }
+                }
+                Ok(true) => {
+                    if self.theme.language.is_zh() {
+                        format!("✦ 已写入 {short} 并热加载 Ctrl+b j（终端与 agy 内均可唤出）")
+                    } else {
+                        format!(
+                            "✦ Enabled Ctrl+b j in {short} & reloaded tmux (works in shell & agy)"
+                        )
+                    }
+                }
+                Ok(false) if !supports_popup => {
+                    if self.theme.language.is_zh() {
+                        format!("✦ 已写入 {short}，但浮窗需要 tmux 3.2+")
+                    } else {
+                        format!("✦ Updated {short}, but display-popup requires tmux 3.2+")
+                    }
+                }
+                Ok(false) => {
+                    if self.theme.language.is_zh() {
+                        format!("✦ 已写入 {short}（启动 tmux 后按 Ctrl+b j 即可唤出）")
+                    } else {
+                        format!("✦ Enabled Ctrl+b j in {short} (active when tmux starts)")
+                    }
+                }
+                Err(err) => {
+                    if self.theme.language.is_zh() {
+                        format!("✦ 已写入 {short}（请执行 tmux source-file 重载：{err}）")
+                    } else {
+                        format!("✦ Updated {short} (run tmux source-file to reload: {err})")
+                    }
+                }
+            };
+            self.config_note = Some(message.clone());
+            self.status = message;
+        } else {
+            if let Err(err) = crate::tmux_conf::uninstall(&conf_path) {
+                let message = if self.theme.language.is_zh() {
+                    format!("无法更新 {short}：{err}")
+                } else {
+                    format!("Could not update {short}: {err}")
+                };
+                self.config_note = Some(message.clone());
+                self.status = message;
+                return;
+            }
+            self.config.tmux_popup = false;
+            let message = match self.tmux.unbind_popup_key() {
+                Ok(true) => {
+                    if self.theme.language.is_zh() {
+                        format!("✦ 已从 {short} 移除并解除当前 tmux 的 Ctrl+b j 绑定")
+                    } else {
+                        format!("✦ Removed Ctrl+b j from {short} & unbound live tmux")
+                    }
+                }
+                Ok(false) => {
+                    if self.theme.language.is_zh() {
+                        format!("✦ 已从 {short} 移除 JustMux 快捷键配置")
+                    } else {
+                        format!("✦ Removed JustMux popup keybind from {short}")
+                    }
+                }
+                Err(err) => {
+                    if self.theme.language.is_zh() {
+                        format!("✦ 已更新 {short}（请执行 tmux source-file 重载：{err}）")
+                    } else {
+                        format!("✦ Removed from {short} (run tmux source-file to reload: {err})")
+                    }
+                }
+            };
+            self.config_note = Some(message.clone());
+            self.status = message;
         }
     }
 
@@ -1565,6 +2063,74 @@ impl<'a> App<'a> {
                 description: tr(
                     "Interface language (en = English, zh = Chinese)",
                     "界面语言：英文 (en) / 简体中文 (zh)",
+                ),
+            },
+            ConfigItemView {
+                key: "tmux_popup",
+                value: self.config.tmux_popup.to_string(),
+                description: tr(
+                    "Bind Ctrl+b j in ~/.tmux.conf to pop up jm in shell or agy",
+                    "写入 ~/.tmux.conf 绑定 Ctrl+b j，在终端或 agy 内随时唤出 jm",
+                ),
+            },
+            ConfigItemView {
+                key: "tmux_mouse",
+                value: self.config.tmux_mouse.to_string(),
+                description: tr(
+                    "Enable native tmux mouse scroll, focus & pane drag (set -g mouse on)",
+                    "开启 tmux 原生鼠标滚轮、点击切窗格与拖拽调尺寸 (set -g mouse on)",
+                ),
+            },
+            ConfigItemView {
+                key: "tmux_history_limit",
+                value: if self.config.tmux_history_limit == 0 {
+                    tr("off", "未托管").to_owned()
+                } else {
+                    self.config.tmux_history_limit.to_string()
+                },
+                description: tr(
+                    "Scrollback lines in ~/.tmux.conf (off / 10000 / 50000 / 100000)",
+                    "tmux 滚动历史行数预设（未托管 / 10000 / 50000 / 100000）",
+                ),
+            },
+            ConfigItemView {
+                key: "tmux_base_index_one",
+                value: self.config.tmux_base_index_one.to_string(),
+                description: tr(
+                    "Number windows & panes from 1 instead of 0 (base-index 1)",
+                    "窗口与窗格编号从 1 开始，更贴合键盘数字键顺序 (base-index 1)",
+                ),
+            },
+            ConfigItemView {
+                key: "tmux_renumber_windows",
+                value: self.config.tmux_renumber_windows.to_string(),
+                description: tr(
+                    "Auto-close numbering gaps when a window is killed (renumber-windows)",
+                    "关闭窗口后自动重排剩余窗口编号，不留空号 (renumber-windows)",
+                ),
+            },
+            ConfigItemView {
+                key: "tmux_zero_escape_time",
+                value: self.config.tmux_zero_escape_time.to_string(),
+                description: tr(
+                    "Eliminate Esc key lag in Vim/Neovim & TUI apps (escape-time 0)",
+                    "消除 Vim/Neovim 与 TUI 中按 Esc 的延迟卡顿 (escape-time 0)",
+                ),
+            },
+            ConfigItemView {
+                key: "tmux_reload",
+                value: tr("[Reload]", "[立即重载]").to_owned(),
+                description: tr(
+                    "Press Enter to live-reload ~/.tmux.conf (tmux source-file)",
+                    "按 Enter 立即热重载 ~/.tmux.conf (tmux source-file)",
+                ),
+            },
+            ConfigItemView {
+                key: "live_stream",
+                value: self.config.live_stream.to_string(),
+                description: tr(
+                    "Auto-stream live pane previews & Expose wall in Fullscreen",
+                    "全屏模式下自动实时流式刷新终端预览与全景墙",
                 ),
             },
         ]
@@ -1708,6 +2274,7 @@ impl<'a> App<'a> {
             CommandKind::Kill => self.kill_confirm(resource),
             CommandKind::Resume => self.enter(resource.target()),
             CommandKind::Split => self.open_split_studio(Some(resource)),
+            CommandKind::Layout => self.open_layout_studio(Some(resource)),
             CommandKind::Rename => {
                 let target_resource = match resource {
                     Resource::Pane(pane) => self
@@ -1887,6 +2454,12 @@ impl<'a> App<'a> {
             .filter(|p| !p.as_os_str().is_empty())
             .unwrap_or_else(|| env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
 
+        let anchor_panes: Vec<Pane> = self
+            .home_panes
+            .iter()
+            .filter(|p| p.window_id == anchor_window.id)
+            .cloned()
+            .collect();
         let options = self.collect_split_window_options(
             &anchor_window.session_id,
             Some(&anchor_window.id),
@@ -1899,13 +2472,41 @@ impl<'a> App<'a> {
             }
         }
 
-        let studio = SplitStudio::new(
-            anchor_window.session_id,
-            anchor_cwd,
-            Some(&anchor_window.id),
-            options,
-            previews,
-        );
+        let studio = if anchor_panes.len() >= 2 {
+            let mut pane_previews = HashMap::new();
+            if self.config.live_preview {
+                for pane in anchor_panes.iter().take(4) {
+                    if let Ok(lines) = self
+                        .tmux
+                        .capture_pane(&Target::Pane(pane.id.clone()), PREVIEW_CAPTURE_LINES)
+                    {
+                        pane_previews.insert(pane.id.clone(), lines);
+                    }
+                }
+            }
+            SplitStudio::from_existing_window(
+                anchor_window.session_id,
+                anchor_window.id,
+                anchor_cwd,
+                anchor_window.synchronized,
+                &anchor_panes,
+                anchor_pane.as_ref().map(|p| &p.id),
+                options,
+                previews,
+                pane_previews,
+            )
+        } else {
+            let mut s = SplitStudio::new(
+                anchor_window.session_id,
+                anchor_cwd,
+                Some(&anchor_window.id),
+                options,
+                previews,
+            );
+            s.initial_sync_panes = anchor_window.synchronized;
+            s.sync_panes = anchor_window.synchronized;
+            s
+        };
         self.views.push(View::Split(studio));
     }
 
@@ -1986,10 +2587,21 @@ impl<'a> App<'a> {
     }
 
     fn ensure_selected_split_preview(&self, studio: &mut SplitStudio) {
-        if let Some(SplitSlotFill::Window(window_id)) =
-            studio.root.slot_fill(studio.selected_slot).cloned()
-        {
-            self.ensure_split_preview(studio, &window_id);
+        match studio.root.slot_fill(studio.selected_slot).cloned() {
+            Some(SplitSlotFill::Window(window_id)) => {
+                self.ensure_split_preview(studio, &window_id);
+            }
+            Some(SplitSlotFill::Pane(pane_id)) => {
+                if self.config.live_preview
+                    && !studio.pane_previews.contains_key(&pane_id)
+                    && let Ok(lines) = self
+                        .tmux
+                        .capture_pane(&Target::Pane(pane_id.clone()), PREVIEW_CAPTURE_LINES)
+                {
+                    studio.pane_previews.insert(pane_id, lines);
+                }
+            }
+            _ => {}
         }
     }
 
@@ -2005,7 +2617,7 @@ impl<'a> App<'a> {
         }
         let preferred_window_id = match &studio.initial_fill {
             SplitSlotFill::Window(wid) => Some(wid.clone()),
-            SplitSlotFill::NewShell => None,
+            SplitSlotFill::Pane(_) | SplitSlotFill::NewShell => studio.anchor_window_id.clone(),
         };
         let options = self.collect_split_window_options(
             &studio.anchor_session_id,
@@ -2014,7 +2626,9 @@ impl<'a> App<'a> {
         );
         let live_windows: HashSet<WindowId> =
             options.iter().map(|opt| opt.window.id.clone()).collect();
+        let live_panes: HashSet<PaneId> = self.home_panes.iter().map(|p| p.id.clone()).collect();
         studio.root.prune_missing_windows(&live_windows);
+        studio.root.prune_missing_panes(&live_panes);
         if let SplitSlotFill::Window(wid) = &studio.initial_fill
             && !live_windows.contains(wid)
         {
@@ -2023,7 +2637,7 @@ impl<'a> App<'a> {
         studio.preview_scrolls.retain(|slot_id, _| {
             matches!(
                 studio.root.slot_fill(*slot_id),
-                Some(SplitSlotFill::Window(_))
+                Some(SplitSlotFill::Window(_) | SplitSlotFill::Pane(_))
             )
         });
         studio.previews.clear();
@@ -2039,7 +2653,7 @@ impl<'a> App<'a> {
             .into_iter()
             .filter_map(|(_, fill)| match fill {
                 SplitSlotFill::Window(wid) => Some(wid),
-                SplitSlotFill::NewShell => None,
+                SplitSlotFill::Pane(_) | SplitSlotFill::NewShell => None,
             })
             .collect();
         for wid in leaf_windows {
@@ -2140,6 +2754,38 @@ impl<'a> App<'a> {
             KeyCode::Char('t' | 'T') if !ctrl && !alt => {
                 self.run_split_toolbar_action(&mut studio, SplitToolbarAction::FlipDirection);
             }
+            KeyCode::Char('[') if !ctrl && !alt => {
+                if let Some(ratio) = studio.adjust_selected_ratio(-5) {
+                    let other = 100u16.saturating_sub(ratio);
+                    self.status = if self.theme.language.is_zh() {
+                        format!("✦ 分屏比例：{ratio}/{other}")
+                    } else {
+                        format!("✦ Split ratio: {ratio}/{other}")
+                    };
+                }
+            }
+            KeyCode::Char(']') if !ctrl && !alt => {
+                if let Some(ratio) = studio.adjust_selected_ratio(5) {
+                    let other = 100u16.saturating_sub(ratio);
+                    self.status = if self.theme.language.is_zh() {
+                        format!("✦ 分屏比例：{ratio}/{other}")
+                    } else {
+                        format!("✦ Split ratio: {ratio}/{other}")
+                    };
+                }
+            }
+            KeyCode::Char('p' | 'P') if !ctrl && !alt => {
+                self.run_split_toolbar_action(&mut studio, SplitToolbarAction::RatioPreset);
+            }
+            KeyCode::Char('y' | 'Y') if !ctrl && !alt => {
+                self.run_split_toolbar_action(&mut studio, SplitToolbarAction::SyncToggle);
+            }
+            KeyCode::Char('g' | 'G') if !ctrl && !alt => {
+                self.run_split_toolbar_action(&mut studio, SplitToolbarAction::PresetGrid);
+            }
+            KeyCode::Char('b' | 'B') if !ctrl && !alt => {
+                self.run_split_toolbar_action(&mut studio, SplitToolbarAction::BreakOut);
+            }
             KeyCode::Char('x' | 'X') | KeyCode::Delete | KeyCode::Backspace if !ctrl && !alt => {
                 self.run_split_toolbar_action(&mut studio, SplitToolbarAction::RemoveSlot);
             }
@@ -2175,6 +2821,10 @@ impl<'a> App<'a> {
             Some(SplitSlotFill::Window(wid)) => studio
                 .previews
                 .get(wid)
+                .map_or(0, |lines| lines.len().saturating_sub(1)),
+            Some(SplitSlotFill::Pane(pid)) => studio
+                .pane_previews
+                .get(pid)
                 .map_or(0, |lines| lines.len().saturating_sub(1)),
             _ => 0,
         };
@@ -2223,6 +2873,99 @@ impl<'a> App<'a> {
                             "至少需要 2 个窗格才能翻转分屏方向。",
                         )
                         .into();
+                }
+            }
+            SplitToolbarAction::RatioPreset => {
+                if let Some(ratio) = studio.cycle_selected_ratio() {
+                    let other = 100u16.saturating_sub(ratio);
+                    self.status = if self.theme.language.is_zh() {
+                        format!("✦ 分屏比例：{ratio}/{other}")
+                    } else {
+                        format!("✦ Split ratio: {ratio}/{other}")
+                    };
+                } else {
+                    self.status = self
+                        .theme
+                        .tr(
+                            "Split into at least 2 panes to adjust ratio.",
+                            "至少拆分为 2 个窗格才可调整比例。",
+                        )
+                        .into();
+                }
+            }
+            SplitToolbarAction::SyncToggle => {
+                let on = studio.toggle_sync_panes();
+                self.status = if on {
+                    self.theme
+                        .tr(
+                            "⚡ Synchronize-panes ON (input broadcasts to all panes on apply)",
+                            "⚡ 同步输入已开启（应用后按键将广播到所有窗格）",
+                        )
+                        .into()
+                } else {
+                    self.theme
+                        .tr("Synchronize-panes OFF", "同步输入已关闭")
+                        .into()
+                };
+            }
+            SplitToolbarAction::PresetGrid => {
+                let preset = studio.apply_next_preset();
+                self.ensure_selected_split_preview(studio);
+                let label = preset.label(self.theme.language.is_zh());
+                self.status = if self.theme.language.is_zh() {
+                    format!("✦ 已切换分屏预设：{label}")
+                } else {
+                    format!("✦ Split preset: {label}")
+                };
+            }
+            SplitToolbarAction::BreakOut => {
+                let Some(pane_id) = studio.selected_existing_pane() else {
+                    self.status = self
+                        .theme
+                        .tr(
+                            "Select an existing pane to break out.",
+                            "请选中已有窗格后再拆出为独立窗口。",
+                        )
+                        .into();
+                    return;
+                };
+                if studio.root.leaf_count() <= 1 {
+                    self.status = self
+                        .theme
+                        .tr(
+                            "Cannot break out the only pane in this window.",
+                            "无法将窗口中唯一的窗格拆出。",
+                        )
+                        .into();
+                    return;
+                }
+                match self.tmux.break_pane(&pane_id, None) {
+                    Ok(created) => {
+                        studio.editing_existing_panes.retain(|p| p.id != pane_id);
+                        studio.pane_previews.remove(&pane_id);
+                        studio.remove_selected();
+                        self.refresh_home_data();
+                        let opts = self.collect_split_window_options(
+                            &studio.anchor_session_id,
+                            studio.anchor_window_id.as_ref(),
+                            None,
+                        );
+                        studio.window_options = opts;
+                        studio.sync_cursor_to_selected_slot();
+                        self.ensure_selected_split_preview(studio);
+                        self.status = if self.theme.language.is_zh() {
+                            format!(
+                                "✦ 已将窗格拆出为独立窗口 {}:{}",
+                                created.session_name, created.index
+                            )
+                        } else {
+                            format!(
+                                "✦ Broke pane out to window {}:{} ({})",
+                                created.session_name, created.index, created.name
+                            )
+                        };
+                    }
+                    Err(error) => self.status = error.to_string(),
                 }
             }
             SplitToolbarAction::RemoveSlot => {
@@ -2331,6 +3074,11 @@ impl<'a> App<'a> {
                     self.recover_split_studio(studio);
                     return;
                 }
+                SplitSlotFill::Pane(pane_id) => {
+                    let _ = self.tmux.select(&Target::Pane(pane_id.clone()));
+                    self.enter(Target::Pane(pane_id.clone()));
+                    return;
+                }
                 SplitSlotFill::NewShell => {
                     match self
                         .tmux
@@ -2355,64 +3103,181 @@ impl<'a> App<'a> {
         }
 
         let (_, first_fill) = studio.root.first_leaf();
-        let (target_session_id, target_window_id, first_anchor_pane) =
-            if let SplitSlotFill::Window(win_id) = &first_fill
-                && let Some(win) = window_map.get(win_id)
-                && let Some((pane_id, 1, _)) = rep_panes.get(win_id)
-            {
-                (win.session_id.clone(), win.id.clone(), pane_id.clone())
-            } else {
-                let target_sess = match &first_fill {
-                    SplitSlotFill::Window(win_id) => window_map
-                        .get(win_id)
-                        .map(|w| w.session_id.clone())
-                        .unwrap_or_else(|| studio.anchor_session_id.clone()),
-                    SplitSlotFill::NewShell => studio.anchor_session_id.clone(),
-                };
-                let created = match self.tmux.new_window(&target_sess, None, anchor_cwd) {
-                    Ok(w) => w,
-                    Err(error) => {
-                        self.status = error.to_string();
-                        self.recover_split_studio(studio);
-                        return;
-                    }
-                };
-                let created_panes = match self.tmux.list_panes(Some(&created.id)) {
-                    Ok(p) => p,
-                    Err(error) => {
-                        self.status = error.to_string();
-                        self.recover_split_studio(studio);
-                        return;
-                    }
-                };
-                let Some(fresh_pane) = created_panes.first() else {
-                    self.status = "Created window has no active pane.".into();
-                    self.recover_split_studio(studio);
-                    return;
-                };
-                let anchor_pane = if let SplitSlotFill::Window(win_id) = &first_fill
-                    && let Some((src_pane, _, _)) = rep_panes.get(win_id)
-                {
-                    if let Err(error) =
-                        self.tmux
-                            .join_pane(src_pane, &fresh_pane.id, SplitDirection::SideBySide)
+        let (target_session_id, target_window_id, first_anchor_pane) = if studio
+            .is_editing_existing()
+            && let Some(anchor_wid) = studio.anchor_window_id.clone()
+            && let Some(anchor_win) = window_map.get(&anchor_wid).cloned()
+        {
+            let existing_in_anchor: Vec<PaneId> = panes
+                .iter()
+                .filter(|p| p.window_id == anchor_wid)
+                .map(|p| p.id.clone())
+                .collect();
+            let desired_anchor = match &first_fill {
+                SplitSlotFill::Pane(pid) if existing_in_anchor.contains(pid) => Some(pid.clone()),
+                _ => None,
+            };
+            let first_pane = if let Some(keeper) = desired_anchor {
+                for pid in &existing_in_anchor {
+                    if pid != &keeper
+                        && let Err(error) = self.tmux.break_pane(pid, None)
                     {
                         self.status = error.to_string();
                         self.recover_split_studio(studio);
                         return;
                     }
-                    if let Err(error) = self.tmux.kill_pane(&fresh_pane.id) {
+                }
+                keeper
+            } else if let Some(temp_pane) = existing_in_anchor.first().cloned() {
+                let inserted = match &first_fill {
+                    SplitSlotFill::Window(win_id) => {
+                        if let Some((src_pane, _, _)) = rep_panes.get(win_id)
+                            && src_pane != &temp_pane
+                        {
+                            if let Err(error) = self.tmux.join_pane(
+                                src_pane,
+                                &temp_pane,
+                                SplitDirection::SideBySide,
+                            ) {
+                                self.status = error.to_string();
+                                self.recover_split_studio(studio);
+                                return;
+                            }
+                            src_pane.clone()
+                        } else {
+                            match self.tmux.split_pane(&temp_pane, SplitDirection::SideBySide) {
+                                Ok(p) => p.id,
+                                Err(error) => {
+                                    self.status = error.to_string();
+                                    self.recover_split_studio(studio);
+                                    return;
+                                }
+                            }
+                        }
+                    }
+                    SplitSlotFill::Pane(src_pane) => {
+                        if src_pane != &temp_pane {
+                            if let Err(error) = self.tmux.join_pane(
+                                src_pane,
+                                &temp_pane,
+                                SplitDirection::SideBySide,
+                            ) {
+                                self.status = error.to_string();
+                                self.recover_split_studio(studio);
+                                return;
+                            }
+                            src_pane.clone()
+                        } else {
+                            temp_pane.clone()
+                        }
+                    }
+                    SplitSlotFill::NewShell => {
+                        match self.tmux.split_pane(&temp_pane, SplitDirection::SideBySide) {
+                            Ok(p) => p.id,
+                            Err(error) => {
+                                self.status = error.to_string();
+                                self.recover_split_studio(studio);
+                                return;
+                            }
+                        }
+                    }
+                };
+                for pid in &existing_in_anchor {
+                    if pid != &inserted
+                        && let Err(error) = self.tmux.break_pane(pid, None)
+                    {
                         self.status = error.to_string();
                         self.recover_split_studio(studio);
                         return;
                     }
-                    src_pane.clone()
-                } else {
-                    fresh_pane.id.clone()
-                };
-                window_map.insert(created.id.clone(), created.clone());
-                (target_sess, created.id, anchor_pane)
+                }
+                inserted
+            } else {
+                self.status = self
+                    .theme
+                    .tr(
+                        "Target window no longer has live panes.",
+                        "目标窗口中已没有活跃窗格。",
+                    )
+                    .into();
+                self.recover_split_studio(studio);
+                return;
             };
+            (anchor_win.session_id, anchor_win.id, first_pane)
+        } else if let SplitSlotFill::Window(win_id) = &first_fill
+            && let Some(win) = window_map.get(win_id)
+            && let Some((pane_id, 1, _)) = rep_panes.get(win_id)
+        {
+            (win.session_id.clone(), win.id.clone(), pane_id.clone())
+        } else {
+            let target_sess = match &first_fill {
+                SplitSlotFill::Window(win_id) => window_map
+                    .get(win_id)
+                    .map(|w| w.session_id.clone())
+                    .unwrap_or_else(|| studio.anchor_session_id.clone()),
+                SplitSlotFill::Pane(_) | SplitSlotFill::NewShell => {
+                    studio.anchor_session_id.clone()
+                }
+            };
+            let created = match self.tmux.new_window(&target_sess, None, anchor_cwd) {
+                Ok(w) => w,
+                Err(error) => {
+                    self.status = error.to_string();
+                    self.recover_split_studio(studio);
+                    return;
+                }
+            };
+            let created_panes = match self.tmux.list_panes(Some(&created.id)) {
+                Ok(p) => p,
+                Err(error) => {
+                    self.status = error.to_string();
+                    self.recover_split_studio(studio);
+                    return;
+                }
+            };
+            let Some(fresh_pane) = created_panes.first() else {
+                self.status = "Created window has no active pane.".into();
+                self.recover_split_studio(studio);
+                return;
+            };
+            let anchor_pane = if let SplitSlotFill::Window(win_id) = &first_fill
+                && let Some((src_pane, _, _)) = rep_panes.get(win_id)
+            {
+                if let Err(error) =
+                    self.tmux
+                        .join_pane(src_pane, &fresh_pane.id, SplitDirection::SideBySide)
+                {
+                    self.status = error.to_string();
+                    self.recover_split_studio(studio);
+                    return;
+                }
+                if let Err(error) = self.tmux.kill_pane(&fresh_pane.id) {
+                    self.status = error.to_string();
+                    self.recover_split_studio(studio);
+                    return;
+                }
+                src_pane.clone()
+            } else if let SplitSlotFill::Pane(src_pane) = &first_fill {
+                if let Err(error) =
+                    self.tmux
+                        .join_pane(src_pane, &fresh_pane.id, SplitDirection::SideBySide)
+                {
+                    self.status = error.to_string();
+                    self.recover_split_studio(studio);
+                    return;
+                }
+                if let Err(error) = self.tmux.kill_pane(&fresh_pane.id) {
+                    self.status = error.to_string();
+                    self.recover_split_studio(studio);
+                    return;
+                }
+                src_pane.clone()
+            } else {
+                fresh_pane.id.clone()
+            };
+            window_map.insert(created.id.clone(), created.clone());
+            (target_sess, created.id, anchor_pane)
+        };
 
         let mut slot_panes: HashMap<SlotId, PaneId> = HashMap::new();
         if let Err(error) = self.materialize_split_subtree(
@@ -2425,12 +3290,42 @@ impl<'a> App<'a> {
             self.recover_split_studio(studio);
             return;
         }
+        self.apply_split_ratios(&studio.root, &slot_panes);
+        if studio.sync_panes || studio.sync_panes != studio.initial_sync_panes {
+            let _ = self
+                .tmux
+                .set_synchronize_panes(&target_window_id, studio.sync_panes);
+        }
 
         if let Some(selected_pane_id) = slot_panes.get(&studio.selected_slot) {
             let _ = self.tmux.select(&Target::Pane(selected_pane_id.clone()));
         }
         self.refresh_home_data();
         self.enter(Target::Window(target_session_id, target_window_id));
+    }
+
+    fn apply_split_ratios(&self, node: &SplitNode, slot_panes: &HashMap<SlotId, PaneId>) {
+        if let SplitNode::Split {
+            direction,
+            ratio,
+            first,
+            second,
+        } = node
+        {
+            if *ratio != split::DEFAULT_SPLIT_RATIO {
+                let first_slot = first.first_leaf().0;
+                if let Some(pane_id) = slot_panes.get(&first_slot) {
+                    let pct = (*ratio).clamp(split::MIN_SPLIT_RATIO, split::MAX_SPLIT_RATIO) as u8;
+                    let (w, h) = match direction {
+                        SplitDirection::SideBySide => (Some(pct), None),
+                        SplitDirection::Stacked => (None, Some(pct)),
+                    };
+                    let _ = self.tmux.resize_pane_percent(pane_id, w, h);
+                }
+            }
+            self.apply_split_ratios(first, slot_panes);
+            self.apply_split_ratios(second, slot_panes);
+        }
     }
 
     fn materialize_split_subtree(
@@ -2449,6 +3344,7 @@ impl<'a> App<'a> {
                 direction,
                 first,
                 second,
+                ..
             } => {
                 let second_anchor = match second.first_leaf().1 {
                     SplitSlotFill::Window(win_id) => {
@@ -2457,6 +3353,14 @@ impl<'a> App<'a> {
                         {
                             self.tmux.join_pane(src_pane, first_anchor, *direction)?;
                             src_pane.clone()
+                        } else {
+                            self.tmux.split_pane(first_anchor, *direction)?.id
+                        }
+                    }
+                    SplitSlotFill::Pane(src_pane) => {
+                        if &src_pane != first_anchor {
+                            self.tmux.join_pane(&src_pane, first_anchor, *direction)?;
+                            src_pane
                         } else {
                             self.tmux.split_pane(first_anchor, *direction)?.id
                         }
@@ -2474,6 +3378,10 @@ impl<'a> App<'a> {
             SplitToolbarButton::SplitHorizontal => SplitToolbarAction::SplitHorizontal,
             SplitToolbarButton::SplitVertical => SplitToolbarAction::SplitVertical,
             SplitToolbarButton::FlipDirection => SplitToolbarAction::FlipDirection,
+            SplitToolbarButton::RatioPreset => SplitToolbarAction::RatioPreset,
+            SplitToolbarButton::SyncToggle => SplitToolbarAction::SyncToggle,
+            SplitToolbarButton::PresetGrid => SplitToolbarAction::PresetGrid,
+            SplitToolbarButton::BreakOut => SplitToolbarAction::BreakOut,
             SplitToolbarButton::RemoveSlot => SplitToolbarAction::RemoveSlot,
             SplitToolbarButton::Reset => SplitToolbarAction::Reset,
             SplitToolbarButton::ApplyAndEnter => SplitToolbarAction::ApplyAndEnter,
@@ -2492,6 +3400,11 @@ impl<'a> App<'a> {
                     SplitSlotFill::Window(wid) => {
                         studio.previews.get(wid).map(Vec::as_slice).unwrap_or(&[])
                     }
+                    SplitSlotFill::Pane(pid) => studio
+                        .pane_previews
+                        .get(pid)
+                        .map(Vec::as_slice)
+                        .unwrap_or(&[]),
                     SplitSlotFill::NewShell => &[],
                 };
                 let (title, subtitle, is_new_shell) = match fill {
@@ -2507,6 +3420,18 @@ impl<'a> App<'a> {
                             )
                         } else {
                             (win_id.as_str().to_owned(), String::new(), false)
+                        }
+                    }
+                    SplitSlotFill::Pane(pane_id) => {
+                        if let Some(info) = studio.pane_info(pane_id) {
+                            let label = if !info.title.trim().is_empty() {
+                                format!(".{} {}", info.index, info.title)
+                            } else {
+                                format!(".{} {}", info.index, info.command)
+                            };
+                            (label, info.command.clone(), false)
+                        } else {
+                            (pane_id.as_str().to_owned(), String::new(), false)
                         }
                     }
                     SplitSlotFill::NewShell => (
@@ -2530,10 +3455,12 @@ impl<'a> App<'a> {
             }
             SplitNode::Split {
                 direction,
+                ratio,
                 first,
                 second,
             } => SplitCanvasNode::Split {
                 horizontal: *direction == SplitDirection::SideBySide,
+                ratio: *ratio,
                 first: Box::new(self.build_split_canvas_node(studio, first)),
                 second: Box::new(self.build_split_canvas_node(studio, second)),
             },
@@ -2571,6 +3498,137 @@ impl<'a> App<'a> {
             self.composer.set_value("");
             self.palette_selected = 0;
             self.split_quick_direction(SplitDirection::Stacked);
+            return true;
+        }
+        if matches!(lower.as_str(), "zoom" | "unzoom" | "zoom pane") {
+            self.status.clear();
+            self.composer.set_value("");
+            self.palette_selected = 0;
+            self.refresh_home_data();
+            if let Some(pane) = self.focused_or_active_pane() {
+                self.toggle_zoom_pane_action(&pane);
+            } else {
+                self.status = self
+                    .theme
+                    .tr("No active pane to zoom.", "没有可缩放的活跃窗格。")
+                    .into();
+            }
+            return true;
+        }
+        if matches!(lower.as_str(), "break pane" | "break out" | "break") {
+            self.status.clear();
+            self.composer.set_value("");
+            self.palette_selected = 0;
+            self.refresh_home_data();
+            if let Some(pane) = self.focused_or_active_pane() {
+                self.break_pane_action(&pane);
+            } else {
+                self.status = self
+                    .theme
+                    .tr("No active pane to break out.", "没有可拆出的活跃窗格。")
+                    .into();
+            }
+            return true;
+        }
+        if matches!(
+            lower.as_str(),
+            "sync panes" | "sync" | "synchronize panes" | "unsync panes"
+        ) {
+            self.status.clear();
+            self.composer.set_value("");
+            self.palette_selected = 0;
+            self.refresh_home_data();
+            if let Some(window) = self.focused_or_active_window() {
+                self.toggle_sync_panes_action(&window);
+            } else {
+                self.status = self
+                    .theme
+                    .tr(
+                        "No active window to synchronize.",
+                        "没有可切换同步输入的窗口。",
+                    )
+                    .into();
+            }
+            return true;
+        }
+        if matches!(lower.as_str(), "detach") {
+            self.status.clear();
+            self.composer.set_value("");
+            self.palette_selected = 0;
+            self.detach();
+            return true;
+        }
+        if matches!(
+            lower.as_str(),
+            "detach others" | "detach other clients" | "fix dotted border"
+        ) {
+            self.status.clear();
+            self.composer.set_value("");
+            self.palette_selected = 0;
+            self.detach_other_clients_action(None);
+            return true;
+        }
+        if matches!(lower.as_str(), "clients" | "list clients") {
+            self.status.clear();
+            self.composer.set_value("");
+            self.palette_selected = 0;
+            self.open_clients_view();
+            return true;
+        }
+        if matches!(lower.as_str(), "buffers" | "paste buffers" | "clipboard") {
+            self.status.clear();
+            self.composer.set_value("");
+            self.palette_selected = 0;
+            self.open_buffers_view();
+            return true;
+        }
+        if matches!(lower.as_str(), "save workspace" | "save snapshot") {
+            self.status.clear();
+            self.composer.set_value("");
+            self.palette_selected = 0;
+            self.views.push(View::Form(Form {
+                action: FormAction::SaveSnapshotName {
+                    session_filter: None,
+                },
+                input: TextInput::default(),
+            }));
+            return true;
+        }
+        if matches!(
+            lower.as_str(),
+            "restore workspace" | "restore snapshot" | "snapshots"
+        ) {
+            self.status.clear();
+            self.composer.set_value("");
+            self.palette_selected = 0;
+            self.open_snapshots_view();
+            return true;
+        }
+        if matches!(
+            lower.as_str(),
+            "reload tmux" | "reload conf" | "reload tmux.conf"
+        ) {
+            self.status.clear();
+            self.composer.set_value("");
+            self.palette_selected = 0;
+            self.reload_tmux_conf_action();
+            return true;
+        }
+        if matches!(lower.as_str(), "popup" | "scratchpad") {
+            self.status.clear();
+            self.composer.set_value("");
+            self.palette_selected = 0;
+            self.open_popup_shell();
+            return true;
+        }
+        if matches!(
+            lower.as_str(),
+            "expose" | "mission control" | "mission" | "wall"
+        ) {
+            self.status.clear();
+            self.composer.set_value("");
+            self.palette_selected = 0;
+            self.open_expose_view();
             return true;
         }
         if let Some(target_part) = trimmed
@@ -2625,6 +3683,13 @@ impl<'a> App<'a> {
                     | CommandKind::Quit
                     | CommandKind::Exit
                     | CommandKind::Theme
+                    | CommandKind::Layout
+                    | CommandKind::Expose
+                    | CommandKind::Clients
+                    | CommandKind::Buffers
+                    | CommandKind::Snapshot
+                    | CommandKind::Popup
+                    | CommandKind::KillServer
                     | CommandKind::Tribute(_)
                     | CommandKind::MicroTribute(_)
             );
@@ -2694,10 +3759,8 @@ impl<'a> App<'a> {
                 self.status.clear();
                 self.composer.set_value("");
                 self.sync_home_matrix();
-                self.views.push(View::Form(Form {
-                    action: FormAction::NewWindow(session.id),
-                    input: TextInput::default(),
-                }));
+                self.views
+                    .push(View::DualForm(DualForm::new_window(session.id)));
             }
             SelectedMatrixTarget::Session(session) => match self.matrix_action {
                 MatrixAction::Open => {
@@ -2725,10 +3788,8 @@ impl<'a> App<'a> {
                     self.status.clear();
                     self.composer.set_value("");
                     self.sync_home_matrix();
-                    self.views.push(View::Form(Form {
-                        action: FormAction::NewWindow(session.id),
-                        input: TextInput::default(),
-                    }));
+                    self.views
+                        .push(View::DualForm(DualForm::new_window(session.id)));
                 }
                 MatrixAction::Inspect => {
                     self.composer.set_value("");
@@ -2798,6 +3859,7 @@ impl<'a> App<'a> {
                     CommandKind::Kill
                         | CommandKind::Rename
                         | CommandKind::Split
+                        | CommandKind::Layout
                         | CommandKind::Window
                         | CommandKind::Pane
                         | CommandKind::Resume
@@ -3034,6 +4096,92 @@ impl<'a> App<'a> {
                     )
                     .to_owned();
             }
+            C::Layout => {
+                if let Some(arg) = parsed.args.first() {
+                    let low = arg.to_ascii_lowercase();
+                    let preset = match low.as_str() {
+                        "even-horizontal" | "eh" | "horizontal" => {
+                            Some(LayoutPreset::EvenHorizontal)
+                        }
+                        "even-vertical" | "ev" | "vertical" => Some(LayoutPreset::EvenVertical),
+                        "main-horizontal" | "mh" => Some(LayoutPreset::MainHorizontal),
+                        "main-vertical" | "mv" => Some(LayoutPreset::MainVertical),
+                        "tiled" | "grid" => Some(LayoutPreset::Tiled),
+                        _ => None,
+                    };
+                    if let Some(preset) = preset {
+                        self.refresh_home_data();
+                        if let Some(window) = self.focused_or_active_window() {
+                            match self.tmux.select_layout(&window.id, preset) {
+                                Ok(()) => {
+                                    self.refresh_home_data();
+                                    let label = preset.label(self.theme.language.is_zh());
+                                    let msg = if self.theme.language.is_zh() {
+                                        format!("✦ 已应用布局：{label}")
+                                    } else {
+                                        format!("✦ Applied layout: {label}")
+                                    };
+                                    self.push_toast(ToastKind::Success, msg);
+                                }
+                                Err(error) => self.push_toast(ToastKind::Error, error.to_string()),
+                            }
+                            return;
+                        }
+                    }
+                }
+                self.open_layout_studio(None);
+            }
+            C::Expose => self.open_expose_view(),
+            C::Clients => self.open_clients_view(),
+            C::Buffers => self.open_buffers_view(),
+            C::Snapshot => {
+                if let Some(sub) = parsed.args.first().map(|s| s.to_ascii_lowercase()) {
+                    match sub.as_str() {
+                        "save" => {
+                            if let Some(name) = parsed.args.get(1) {
+                                match self.save_snapshot_by_name(name, None) {
+                                    Ok(snap) => {
+                                        self.status = if self.theme.language.is_zh() {
+                                            format!(
+                                                "✦ 已保存工作区快照 '{}'（{} 会话 / {} 窗口）",
+                                                snap.name,
+                                                snap.session_count(),
+                                                snap.window_count()
+                                            )
+                                        } else {
+                                            format!(
+                                                "✦ Saved snapshot '{}' ({} session(s), {} window(s))",
+                                                snap.name,
+                                                snap.session_count(),
+                                                snap.window_count()
+                                            )
+                                        };
+                                    }
+                                    Err(err) => self.status = err,
+                                }
+                            } else {
+                                self.views.push(View::Form(Form {
+                                    action: FormAction::SaveSnapshotName {
+                                        session_filter: None,
+                                    },
+                                    input: TextInput::default(),
+                                }));
+                            }
+                            return;
+                        }
+                        "restore" => {
+                            if let Some(name) = parsed.args.get(1) {
+                                self.restore_snapshot_by_name(name);
+                                return;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                self.open_snapshots_view();
+            }
+            C::Popup => self.open_popup_shell(),
+            C::KillServer => self.open_kill_server_confirm(),
             C::Exit => self.detach(),
             C::Quit => self.exit = Some(Exit::Quit),
         }
@@ -3083,6 +4231,7 @@ impl<'a> App<'a> {
             self.home_sessions.clear();
             self.home_windows.clear();
             self.home_panes.clear();
+            self.client_count = None;
             self.telemetry = CachedTelemetry::default();
             self.radar_selected = 0;
             self.sync_home_matrix();
@@ -3093,6 +4242,7 @@ impl<'a> App<'a> {
             self.home_sessions = sessions;
             self.home_windows.clear();
             self.home_panes.clear();
+            self.client_count = Some(0);
             self.telemetry = CachedTelemetry {
                 sessions: Some(0),
                 windows: Some(0),
@@ -3111,6 +4261,7 @@ impl<'a> App<'a> {
             None => (Vec::new(), sessions.iter().map(|s| s.windows).sum()),
         };
         let panes = self.tmux.list_panes(None).ok().unwrap_or_default();
+        self.client_count = self.tmux.list_clients().ok().map(|c| c.len());
         self.telemetry = CachedTelemetry {
             sessions: Some(sessions.len()),
             windows: Some(window_count),
@@ -3132,11 +4283,20 @@ impl<'a> App<'a> {
         self.cached_preview = None;
         self.preview_target = None;
         self.preview_scroll = 0;
+        self.home_preview_pane_total = 0;
+        self.preview_search.reset();
+        self.sync_preview_desktop_metadata();
     }
 
     fn preview_visible_rows(&self) -> usize {
-        self.preview_rect
-            .map_or(10, |r| usize::from(r.height.saturating_sub(2)).max(1))
+        self.desktop
+            .preview_layout
+            .content_rect
+            .map(|r| usize::from(r.height).max(1))
+            .unwrap_or_else(|| {
+                self.preview_rect
+                    .map_or(10, |r| usize::from(r.height.saturating_sub(2)).max(1))
+            })
     }
 
     fn max_preview_scroll(&self) -> usize {
@@ -3246,6 +4406,10 @@ impl<'a> App<'a> {
             self.preview_scroll = self.preview_scroll.min(max_scroll);
         }
         self.cached_preview = Some((title, subtitle, lines));
+        self.sync_preview_desktop_metadata();
+        if self.preview_search.query_str().is_some() {
+            self.recompute_preview_search(false);
+        }
     }
 
     fn refresh_home_preview(&mut self) {
@@ -3254,6 +4418,7 @@ impl<'a> App<'a> {
             return;
         }
         if self.composer_mode == ComposerMode::LiveRadar {
+            self.home_preview_pane_total = 0;
             let Some(session) = self.home_sessions.get(self.radar_selected) else {
                 self.clear_preview();
                 return;
@@ -3281,6 +4446,7 @@ impl<'a> App<'a> {
         {
             self.preview_target = None;
             self.preview_scroll = 0;
+            self.home_preview_pane_total = 0;
             self.cached_preview = Some((
                 self.theme.tr("New Session", "新建会话").into(),
                 self.theme
@@ -3311,9 +4477,34 @@ impl<'a> App<'a> {
             self.clear_preview();
             return;
         };
-        let target = Target::Window(session.id.clone(), window.id.clone());
-        let subtitle = format!("{}: {}", window.index, window.name);
-        self.capture_and_store_preview(target, session.name, subtitle);
+        let mut window_panes: Vec<Pane> = self
+            .home_panes
+            .iter()
+            .filter(|p| p.window_id == window.id)
+            .cloned()
+            .collect();
+        window_panes.sort_by_key(|p| p.index);
+        if self.home_preview_pane_window.as_ref() != Some(&window.id) {
+            self.home_preview_pane_window = Some(window.id.clone());
+            self.home_preview_pane_idx = window_panes.iter().position(|p| p.active).unwrap_or(0);
+        }
+        self.home_preview_pane_total = window_panes.len();
+        if window_panes.len() > 1 {
+            let idx = self.home_preview_pane_idx.min(window_panes.len() - 1);
+            self.home_preview_pane_idx = idx;
+            let pane = &window_panes[idx];
+            let target = Target::Pane(pane.id.clone());
+            let subtitle = format!(
+                "{}: {} · .{} {}",
+                window.index, window.name, pane.index, pane.current_command
+            );
+            self.capture_and_store_preview(target, session.name, subtitle);
+        } else {
+            self.home_preview_pane_idx = 0;
+            let target = Target::Window(session.id.clone(), window.id.clone());
+            let subtitle = format!("{}: {}", window.index, window.name);
+            self.capture_and_store_preview(target, session.name, subtitle);
+        }
     }
 
     fn refresh_radar_preview(&mut self) {
@@ -3371,18 +4562,59 @@ impl<'a> App<'a> {
     }
 
     fn picker_key(&mut self, mut picker: Picker, key: KeyEvent) {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let alt = key.modifiers.contains(KeyModifiers::ALT);
         if self.handle_preview_paging_key(key, picker.query.value().is_empty()) {
             self.views.push(View::Picker(picker));
             return;
         }
+        if self.config.live_preview
+            && self.cached_preview.is_some()
+            && ((ctrl && !alt && matches!(key.code, KeyCode::Char('f' | 'F')))
+                || (picker.query.value().is_empty()
+                    && key.modifiers.is_empty()
+                    && key.code == KeyCode::Char('f')))
+        {
+            self.open_preview_search();
+            self.views.push(View::Picker(picker));
+            return;
+        }
+        if self.config.live_preview
+            && self.cached_preview.is_some()
+            && ((ctrl && !alt && matches!(key.code, KeyCode::Char('y' | 'Y')))
+                || (picker.query.value().is_empty()
+                    && key.modifiers.is_empty()
+                    && key.code == KeyCode::Char('y')))
+        {
+            self.copy_current_preview_to_clipboard();
+            self.views.push(View::Picker(picker));
+            return;
+        }
+        if picker.query.value().is_empty()
+            && !ctrl
+            && !alt
+            && self.preview_search.query_str().is_some()
+        {
+            if key.code == KeyCode::Char('n') && key.modifiers.is_empty() {
+                self.step_preview_search_match(true);
+                self.views.push(View::Picker(picker));
+                return;
+            }
+            if key.code == KeyCode::Char('N') {
+                self.step_preview_search_match(false);
+                self.views.push(View::Picker(picker));
+                return;
+            }
+        }
         match key.code {
             KeyCode::Up => {
-                picker.selected = picker.selected.saturating_sub(1);
+                let len = picker.rows(&mut self.matcher).len();
+                picker.selected = wrap_step(picker.selected, len, -1);
                 self.update_picker_preview(&picker);
             }
             KeyCode::Down => {
-                picker.selected = (picker.selected + 1)
-                    .min(picker.rows(&mut self.matcher).len().saturating_sub(1));
+                let len = picker.rows(&mut self.matcher).len();
+                picker.selected = wrap_step(picker.selected, len, 1);
                 self.update_picker_preview(&picker);
             }
             KeyCode::Enter => {
@@ -3427,74 +4659,108 @@ impl<'a> App<'a> {
         }
     }
 
-    fn handle_mouse(&mut self, mouse: MouseEvent) {
-        match mouse.kind {
-            MouseEventKind::ScrollUp => self.mouse_scroll(mouse.column, mouse.row, true),
-            MouseEventKind::ScrollDown => self.mouse_scroll(mouse.column, mouse.row, false),
-            MouseEventKind::Down(MouseButton::Left) => {
-                self.mouse_left_click(mouse.column, mouse.row)
-            }
-            _ => {}
-        }
-    }
-
     fn mouse_scroll(&mut self, column: u16, row: u16, up: bool) {
+        let delta = if up { -1 } else { 1 };
         match self.views.pop() {
             None => {
                 if commands::popup_query(self.composer.value()).is_some() {
                     let count = self.palette().len();
                     if count > 0 {
-                        self.palette_selected = if up {
-                            self.palette_selected.saturating_sub(1)
-                        } else {
-                            (self.palette_selected + 1).min(count - 1)
-                        };
+                        self.palette_selected = wrap_step(self.palette_selected, count, delta);
                     }
                 } else if self.active_mention().is_some() {
                     let count = self.mention_candidates().len();
                     if count > 0 {
-                        self.mention_selected = if up {
-                            self.mention_selected.saturating_sub(1)
-                        } else {
-                            (self.mention_selected + 1).min(count - 1)
-                        };
+                        self.mention_selected = wrap_step(self.mention_selected, count, delta);
                     }
                 } else if self.scroll_preview_wheel(column, row, up) {
                 } else if self.composer_mode == ComposerMode::LiveRadar
                     && !self.home_sessions.is_empty()
                 {
-                    self.radar_selected = if up {
-                        self.radar_selected.saturating_sub(1)
-                    } else {
-                        (self.radar_selected + 1).min(self.home_sessions.len() - 1)
-                    };
+                    self.radar_selected =
+                        wrap_step(self.radar_selected, self.home_sessions.len(), delta);
                     self.refresh_radar_preview();
                 } else if self.composer_mode == ComposerMode::CommandJump
-                    && self.matrix.move_row(if up { -1 } else { 1 })
+                    && self.matrix.move_row(delta)
                 {
+                    self.sync_action_scope_with_matrix();
                     self.refresh_home_preview();
                 }
             }
             Some(View::Picker(mut picker)) => {
                 if !self.scroll_preview_wheel(column, row, up) {
                     let count = picker.rows(&mut self.matcher).len();
-                    picker.selected = if up {
-                        picker.selected.saturating_sub(1)
-                    } else {
-                        (picker.selected + 1).min(count.saturating_sub(1))
-                    };
+                    picker.selected = wrap_step(picker.selected, count, delta);
                     self.update_picker_preview(&picker);
                 }
                 self.views.push(View::Picker(picker));
             }
+            Some(View::TargetPick(mut state)) => {
+                if !self.scroll_preview_wheel(column, row, up) {
+                    let count = state.filtered_indices(&mut self.matcher).len();
+                    state.selected = wrap_step(state.selected, count, delta);
+                    self.update_target_pick_preview(&state);
+                }
+                self.views.push(View::TargetPick(state));
+            }
             Some(View::Actions(resource, mut selected)) => {
-                let count = resource.actions_for(self.theme.language).len();
-                selected = if up {
-                    selected.saturating_sub(1)
-                } else {
-                    (selected + 1).min(count.saturating_sub(1))
-                };
+                let count = resource
+                    .actions_for(&self.piping_panes, self.theme.language)
+                    .len();
+                selected = wrap_step(selected, count, delta);
                 self.views.push(View::Actions(resource, selected));
+            }
+            Some(View::LayoutStudio(mut state)) => {
+                state.selected_preset =
+                    wrap_step(state.selected_preset, LayoutPreset::ALL.len(), delta);
+                self.views.push(View::LayoutStudio(state));
+            }
+            Some(View::Expose(mut state)) => {
+                let count = state.tiles.len();
+                state.selected = wrap_step(state.selected, count, delta);
+                state.sync_page_to_selected();
+                self.views.push(View::Expose(state));
+            }
+            Some(View::Clients(mut state)) => {
+                let count = state.clients.len();
+                state.selected = wrap_step(state.selected, count, delta);
+                self.views.push(View::Clients(state));
+            }
+            Some(View::Buffers(mut state)) => {
+                if self
+                    .preview_rect
+                    .is_some_and(|rect| rect.contains((column, row).into()))
+                {
+                    let max = state.preview_lines.len().saturating_sub(1);
+                    state.preview_scroll = if up {
+                        state.preview_scroll.saturating_sub(PREVIEW_WHEEL_STEP)
+                    } else {
+                        (state.preview_scroll + PREVIEW_WHEEL_STEP).min(max)
+                    };
+                } else {
+                    let count = state.buffers.len();
+                    state.selected = wrap_step(state.selected, count, delta);
+                    self.refresh_selected_buffer_preview(&mut state);
+                }
+                self.views.push(View::Buffers(state));
+            }
+            Some(View::Snapshots(mut state)) => {
+                if self
+                    .preview_rect
+                    .is_some_and(|rect| rect.contains((column, row).into()))
+                {
+                    let max = state.tree_preview.len().saturating_sub(1);
+                    state.preview_scroll = if up {
+                        state.preview_scroll.saturating_sub(PREVIEW_WHEEL_STEP)
+                    } else {
+                        (state.preview_scroll + PREVIEW_WHEEL_STEP).min(max)
+                    };
+                } else {
+                    let count = state.snapshots.len();
+                    state.selected = wrap_step(state.selected, count, delta);
+                    self.refresh_selected_snapshot_preview(&mut state);
+                }
+                self.views.push(View::Snapshots(state));
             }
             Some(View::Split(mut studio)) => {
                 if let Some((_, slot_id)) = studio
@@ -3514,21 +4780,13 @@ impl<'a> App<'a> {
                 initial,
                 mut selected,
             }) => {
-                selected = if up {
-                    selected.saturating_sub(1)
-                } else {
-                    (selected + 1).min(ThemePreset::ALL.len().saturating_sub(1))
-                };
+                selected = wrap_step(selected, ThemePreset::ALL.len(), delta);
                 let preset = ThemePreset::ALL.get(selected).copied().unwrap_or(initial);
                 self.theme = self.theme.with_preset(preset);
                 self.views.push(View::ThemePicker { initial, selected });
             }
             Some(View::Config { mut selected }) => {
-                selected = if up {
-                    selected.saturating_sub(1)
-                } else {
-                    (selected + 1).min(CONFIG_ITEM_COUNT - 1)
-                };
+                selected = wrap_step(selected, CONFIG_ITEM_COUNT, delta);
                 self.views.push(View::Config { selected });
             }
             Some(View::Confirm(mut confirm)) => {
@@ -3552,191 +4810,17 @@ impl<'a> App<'a> {
         }
     }
 
-    fn mouse_left_click(&mut self, column: u16, row: u16) {
-        match self.views.pop() {
-            None => {
-                if self.composer_mode == ComposerMode::LiveRadar
-                    && let Some(rect) = self.radar_list_rect
-                    && rect.contains((column, row).into())
-                {
-                    let clicked = self.radar_offset + usize::from(row - rect.y);
-                    if let Some(session) = self.home_sessions.get(clicked) {
-                        if self.radar_selected == clicked {
-                            let id = session.id.clone();
-                            self.status.clear();
-                            self.enter(Target::Session(id));
-                        } else {
-                            self.radar_selected = clicked;
-                            self.refresh_radar_preview();
-                        }
-                    }
-                } else if self.composer_mode == ComposerMode::CommandJump {
-                    if let Some((_, action)) = self
-                        .tab_hits
-                        .iter()
-                        .find(|(rect, _)| rect.contains((column, row).into()))
-                        .copied()
-                    {
-                        let scope = if self.matrix.is_session_selected() {
-                            TargetScope::Session
-                        } else {
-                            TargetScope::Window
-                        };
-                        self.matrix_action = match action {
-                            MatrixAction::Rename(_) => MatrixAction::Rename(scope),
-                            MatrixAction::Kill(_) => MatrixAction::Kill(scope),
-                            other => other,
-                        };
-                        self.status.clear();
-                        return;
-                    }
-                    if let Some(hit) = self
-                        .matrix_hits
-                        .iter()
-                        .find(|hit| hit.rect.contains((column, row).into()))
-                        .cloned()
-                    {
-                        let activate = self.matrix.select_hit(&hit.target);
-                        self.sync_action_scope_with_matrix();
-                        match hit.target {
-                            MatrixHitTarget::NewWindow(_) | MatrixHitTarget::NewSession => {
-                                if activate {
-                                    self.activate_matrix_selection();
-                                } else {
-                                    self.refresh_home_preview();
-                                }
-                            }
-                            MatrixHitTarget::Session(_) => {
-                                if activate
-                                    && matches!(
-                                        self.matrix_action,
-                                        MatrixAction::Open
-                                            | MatrixAction::Inspect
-                                            | MatrixAction::Split
-                                            | MatrixAction::Rename(_)
-                                            | MatrixAction::Kill(_)
-                                    )
-                                {
-                                    self.activate_matrix_selection();
-                                } else {
-                                    self.refresh_home_preview();
-                                }
-                            }
-                            MatrixHitTarget::Window { .. } => {
-                                if activate {
-                                    self.activate_matrix_selection();
-                                } else {
-                                    self.refresh_home_preview();
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            Some(View::Picker(mut picker)) => {
-                if let Some(rect) = self.picker_list_rect
-                    && rect.contains((column, row).into())
-                {
-                    let rows = picker.rows(&mut self.matcher);
-                    let clicked = self.picker_offset + usize::from(row - rect.y);
-                    if let Some(target_row) = rows.get(clicked).copied() {
-                        if picker.selected == clicked {
-                            self.activate_picker_row(picker, target_row);
-                            return;
-                        }
-                        picker.selected = clicked;
-                        self.update_picker_preview(&picker);
-                    }
-                }
-                self.views.push(View::Picker(picker));
-            }
-            Some(View::Config { mut selected }) => {
-                if let Some(rect) = self.subview_list_rect
-                    && rect.contains((column, row).into())
-                {
-                    let clicked =
-                        Self::list_scroll_offset(selected, rect.height) + usize::from(row - rect.y);
-                    if clicked < CONFIG_ITEM_COUNT {
-                        if clicked == selected {
-                            self.cycle_config_setting(clicked, true, true);
-                        } else {
-                            selected = clicked;
-                            self.config_note = None;
-                        }
-                    }
-                }
-                self.views.push(View::Config { selected });
-            }
-            Some(View::ThemePicker {
-                initial,
-                mut selected,
-            }) => {
-                if let Some(rect) = self.subview_list_rect
-                    && rect.contains((column, row).into())
-                {
-                    let clicked =
-                        Self::list_scroll_offset(selected, rect.height) + usize::from(row - rect.y);
-                    if let Some(&preset) = ThemePreset::ALL.get(clicked) {
-                        if clicked == selected {
-                            self.theme = self.theme.with_preset(preset);
-                            self.config.theme = preset;
-                            self.status = theme_toast(preset, self.theme.language);
-                            return;
-                        }
-                        selected = clicked;
-                        self.theme = self.theme.with_preset(preset);
-                    }
-                }
-                self.views.push(View::ThemePicker { initial, selected });
-            }
-            Some(View::Split(mut studio)) => {
-                if let Some((_, action)) = studio
-                    .toolbar_hits
-                    .iter()
-                    .find(|(rect, _)| rect.contains((column, row).into()))
-                    .copied()
-                {
-                    if action == SplitToolbarAction::ApplyAndEnter {
-                        self.apply_split_studio_and_enter(studio);
-                        return;
-                    }
-                    self.run_split_toolbar_action(&mut studio, action);
-                } else if let Some((_, slot_id)) = studio
-                    .slot_hits
-                    .iter()
-                    .find(|(rect, _)| rect.contains((column, row).into()))
-                    .copied()
-                {
-                    if studio.select_slot(slot_id) {
-                        self.ensure_selected_split_preview(&mut studio);
-                    }
-                } else if let Some(rect) = studio.window_list_rect
-                    && rect.contains((column, row).into())
-                {
-                    let clicked = Self::list_scroll_offset(studio.window_cursor, rect.height)
-                        + usize::from(row - rect.y);
-                    if studio.assign_cursor_row(clicked) {
-                        self.ensure_selected_split_preview(&mut studio);
-                    }
-                }
-                self.views.push(View::Split(studio));
-            }
-            Some(other) => self.views.push(other),
-        }
-    }
-
     fn resource_action_key(&mut self, resource: Resource, mut selected: usize, key: KeyEvent) {
-        let actions = resource.actions_for(self.theme.language);
+        let actions = resource.actions_for(&self.piping_panes, self.theme.language);
         match key.code {
-            KeyCode::Up => selected = selected.saturating_sub(1),
-            KeyCode::Down => selected = (selected + 1).min(actions.len() - 1),
+            KeyCode::Up => selected = wrap_step(selected, actions.len(), -1),
+            KeyCode::Down => selected = wrap_step(selected, actions.len(), 1),
             KeyCode::Enter => {
-                match actions[selected].1 {
-                    ResourceAction::Open => self.enter(resource.target()),
-                    ResourceAction::Rename => self.rename_form(resource),
-                    ResourceAction::Close => self.kill_confirm(resource),
+                if let Some((_, action)) = actions.get(selected) {
+                    let action = *action;
+                    self.execute_resource_action(resource, action);
+                    return;
                 }
-                return;
             }
             _ => {}
         }
@@ -3804,7 +4888,7 @@ impl<'a> App<'a> {
             " Type yes, then Enter to confirm. Empty input cancels."
         });
         self.views.push(View::Confirm(Confirm {
-            resource,
+            target: ConfirmTarget::Resource(Box::new(resource)),
             input: TextInput::default(),
             message,
             scroll: 0,
@@ -3833,15 +4917,31 @@ impl<'a> App<'a> {
                     .into();
                 return;
             }
-            let result = match &confirm.resource {
-                Resource::Session(session) => self.tmux.kill_session(&session.id),
-                Resource::Window(window) => self.tmux.kill_window(&window.id),
-                Resource::Pane(pane) => self.tmux.kill_pane(&pane.id),
+            let result = match &confirm.target {
+                ConfirmTarget::Resource(res) => match res.as_ref() {
+                    Resource::Session(session) => self.tmux.kill_session(&session.id),
+                    Resource::Window(window) => self.tmux.kill_window(&window.id),
+                    Resource::Pane(pane) => self.tmux.kill_pane(&pane.id),
+                },
+                ConfirmTarget::KillServer => self.tmux.kill_server(),
             };
             match result {
                 Ok(()) => {
-                    self.status = self.theme.tr("Target killed", "已关闭目标").into();
-                    self.refresh_parent();
+                    self.status = match confirm.target {
+                        ConfirmTarget::KillServer => self
+                            .theme
+                            .tr("✦ tmux server stopped.", "✦ tmux 服务已关闭。")
+                            .into(),
+                        ConfirmTarget::Resource(_) => {
+                            self.theme.tr("Target killed", "已关闭目标").into()
+                        }
+                    };
+                    if matches!(confirm.target, ConfirmTarget::KillServer) {
+                        self.views = ViewStack::default();
+                        self.refresh_home_data();
+                    } else {
+                        self.refresh_parent();
+                    }
                 }
                 Err(error) => {
                     self.status = error.to_string();
@@ -3905,23 +5005,103 @@ impl<'a> App<'a> {
                     }
                 }
             }
-            FormAction::NewWindow(session) => {
-                let name = if value.is_empty() {
-                    None
-                } else {
-                    Some(value.as_str())
-                };
-                match self.tmux.new_window(session, name, None) {
-                    Ok(window) => {
-                        self.views = ViewStack::default();
-                        self.matrix_action = MatrixAction::Window;
-                        self.composer.set_value("");
-                        self.refresh_home_data();
-                        self.status = self.theme.tr("Window created", "窗口已创建").into();
-                        self.views.push(View::Created(Resource::Window(window)));
+            FormAction::RenamePaneTitle(pane) => {
+                match self.tmux.rename_pane_title(&pane.id, &value) {
+                    Ok(()) => {
+                        self.status = self
+                            .theme
+                            .tr("✦ Updated pane title", "✦ 已更新窗格标题")
+                            .into();
+                        self.refresh_parent();
                     }
                     Err(error) => {
                         self.status = error.to_string();
+                        self.views.push(View::Form(form));
+                    }
+                }
+            }
+            FormAction::SendCommandToPane(pane) => {
+                if value.is_empty() {
+                    self.status = self
+                        .theme
+                        .tr("Command cannot be empty.", "发送的命令不能为空。")
+                        .into();
+                    self.views.push(View::Form(form));
+                    return;
+                }
+                let result = self
+                    .tmux
+                    .send_keys(&pane.id, &[value.as_str()], true)
+                    .and_then(|()| self.tmux.send_keys(&pane.id, &["Enter"], false));
+                match result {
+                    Ok(()) => {
+                        self.status = if self.theme.language.is_zh() {
+                            format!("✦ 已发送命令到窗格 {}", pane.id)
+                        } else {
+                            format!("✦ Sent command to pane {}", pane.id)
+                        };
+                        self.refresh_parent();
+                    }
+                    Err(error) => {
+                        self.status = error.to_string();
+                        self.views.push(View::Form(form));
+                    }
+                }
+            }
+            FormAction::NewBufferContent => {
+                if value.is_empty() {
+                    self.status = self
+                        .theme
+                        .tr("Buffer content cannot be empty.", "缓冲区内容不能为空。")
+                        .into();
+                    self.views.push(View::Form(form));
+                    return;
+                }
+                match self.tmux.set_buffer(&value) {
+                    Ok(()) => {
+                        self.status = self
+                            .theme
+                            .tr("✦ Created tmux paste buffer", "✦ 已新建 tmux 粘贴缓冲区")
+                            .into();
+                        if let Some(View::Buffers(mut state)) = self.views.pop() {
+                            self.reload_buffers_state(&mut state);
+                            state.status_note = Some(self.status.clone());
+                            self.views.push(View::Buffers(state));
+                        }
+                    }
+                    Err(error) => {
+                        self.status = error.to_string();
+                        self.views.push(View::Form(form));
+                    }
+                }
+            }
+            FormAction::SaveSnapshotName { session_filter } => {
+                let filter = session_filter.clone();
+                match self.save_snapshot_by_name(value.trim(), filter.as_ref()) {
+                    Ok(snap) => {
+                        self.status = if self.theme.language.is_zh() {
+                            format!(
+                                "✦ 已保存工作区快照 '{}'（{} 会话 / {} 窗口）",
+                                snap.name,
+                                snap.session_count(),
+                                snap.window_count()
+                            )
+                        } else {
+                            format!(
+                                "✦ Saved snapshot '{}' ({} session(s), {} window(s))",
+                                snap.name,
+                                snap.session_count(),
+                                snap.window_count()
+                            )
+                        };
+                        if let Some(View::Snapshots(mut state)) = self.views.pop() {
+                            self.reload_snapshots_state(&mut state);
+                            state.status_note = Some(self.status.clone());
+                            self.views.push(View::Snapshots(state));
+                        }
+                    }
+                    Err(error) => {
+                        self.status = error;
                         self.views.push(View::Form(form));
                     }
                 }
@@ -4081,11 +5261,16 @@ impl<'a> App<'a> {
     }
 
     pub fn render(&mut self, frame: &mut Frame) {
+        let full_area = frame.area();
+        self.desktop.clear_render_hits(full_area);
         self.preview_rect = None;
         self.picker_list_rect = None;
         self.subview_list_rect = None;
         self.radar_list_rect = None;
         self.tab_hits = Default::default();
+        self.quick_action_hits.clear();
+        self.preview_action_hits.clear();
+        self.controller_hits.clear();
         self.matrix_hits.clear();
         let area = frame.area();
         let indent = if area.width >= 24 { 2 } else { 0 };
@@ -4100,12 +5285,18 @@ impl<'a> App<'a> {
                 && area.width >= 36
                 && area.height >= 12
             {
+                let body_area = if area.height >= 17 {
+                    Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas::<2>(area)
+                        [1]
+                } else {
+                    area
+                };
                 let [welcome, _, _] = Layout::vertical([
                     Constraint::Min(0),
                     Constraint::Length(3),
                     Constraint::Length(1),
                 ])
-                .areas(area);
+                .areas(body_area);
                 let raw_inner = Block::default().borders(Borders::ALL).inner(welcome);
                 let inner = if raw_inner.width >= 6 {
                     Rect {
@@ -4181,6 +5372,49 @@ impl<'a> App<'a> {
                     }
                 })
                 .collect();
+            let (preview_zoomed, preview_synced, preview_piping) = self.preview_status_flags();
+            let preview_pip_active = self.desktop.pip_target.as_ref().is_some_and(|pid| {
+                self.preview_target.as_ref() == Some(&Target::Pane(pid.clone()))
+                    || self
+                        .focused_or_active_pane()
+                        .is_some_and(|pane| &pane.id == pid)
+            });
+            let preview_pane_index = (self.composer_mode == ComposerMode::CommandJump
+                && self.home_preview_pane_total > 1)
+                .then_some((self.home_preview_pane_idx + 1, self.home_preview_pane_total));
+            let preview_match_count = self.preview_search.match_lines.len();
+            let preview_current_match = if preview_match_count > 0 {
+                self.preview_search.current_match + 1
+            } else {
+                0
+            };
+            let preview_hovered_action = match self.desktop.hover {
+                HoverTarget::PreviewAction(act) => Some(act),
+                _ => None,
+            };
+            let preview_dock_highlight = self.desktop.drag.as_ref().and_then(|d| {
+                d.dock_target
+                    .and_then(|(rect, zone)| (self.preview_rect == Some(rect)).then_some(zone))
+            });
+            let active_tab = self.active_desktop_tab();
+            let menubar_hovered = match self.desktop.hover {
+                HoverTarget::Menubar(item) => Some(item),
+                _ => None,
+            };
+            let menubar_menu_open = self
+                .desktop
+                .context_menu
+                .as_ref()
+                .is_some_and(|m| m.from_menubar);
+            let inside_tmux = self.context.is_inside();
+            let home_split_ratio = self.desktop.home_split_ratio;
+            let home_sash_hovered =
+                self.desktop.hover == HoverTarget::Sash(SashId::HomePreviewMatrix);
+            let home_sash_dragging = self.desktop.is_dragging_sash(SashId::HomePreviewMatrix);
+            let scrollbar_hovered = self.desktop.hover == HoverTarget::PreviewScrollbar;
+            let scrollbar_dragging = self.desktop.is_dragging_scrollbar();
+            let preview_selection = self.desktop.preview_selection;
+            let preview_show_actions = self.preview_target.is_some();
             let preview = self
                 .cached_preview
                 .as_ref()
@@ -4190,7 +5424,32 @@ impl<'a> App<'a> {
                     subtitle: subtitle.as_str(),
                     lines: lines.as_slice(),
                     scroll: self.preview_scroll,
+                    search_query: self.preview_search.query_str(),
+                    search_active: self.preview_search.active,
+                    match_count: preview_match_count,
+                    current_match: preview_current_match,
+                    pane_index: preview_pane_index,
+                    zoomed: preview_zoomed,
+                    synchronized: preview_synced,
+                    piping: preview_piping,
+                    show_actions: preview_show_actions,
+                    pip_active: preview_pip_active,
+                    hovered_action: preview_hovered_action,
+                    scrollbar_hovered,
+                    scrollbar_dragging,
+                    search_match_lines: &self.preview_search.match_lines,
+                    error_lines: &self.desktop.preview_error_lines,
+                    selection_range: preview_selection,
+                    dock_highlight: preview_dock_highlight,
                 });
+            let menubar = DesktopMenubarState {
+                active_tab,
+                hovered: menubar_hovered,
+                menu_open: menubar_menu_open,
+                pip_active: self.desktop.pip_target.is_some(),
+                inside_tmux,
+                sparkline: &self.desktop.activity_sparkline,
+            };
             let (context, session) = match &self.context {
                 Context::Outside => (self.theme.tr("standalone", "独立模式"), None),
                 Context::Inside(inside) => (
@@ -4214,6 +5473,12 @@ impl<'a> App<'a> {
                 MatrixAction::Rename(TargetScope::Session)
                     | MatrixAction::Kill(TargetScope::Session)
             );
+            let dead_windows: HashSet<WindowId> = self
+                .home_panes
+                .iter()
+                .filter(|p| p.dead)
+                .map(|p| p.window_id.clone())
+                .collect();
             let mut hits = Vec::new();
             let matrix = &mut self.matrix;
             let theme = self.theme;
@@ -4232,6 +5497,7 @@ impl<'a> App<'a> {
                         sessions: self.telemetry.sessions,
                         windows: self.telemetry.windows,
                         attached: self.telemetry.attached,
+                        clients: self.client_count,
                         hint_badge: (self.theme.preset != ThemePreset::Classic)
                             .then_some(badge.as_str()),
                     },
@@ -4243,6 +5509,7 @@ impl<'a> App<'a> {
                     radar_selected: self.radar_selected,
                     preview,
                     live_preview: self.config.live_preview,
+                    inside_tmux,
                     emblem_mode: self.config.emblem_mode,
                     emblem_step: if self.config.emblem_mode.should_animate() {
                         self.emblem_step
@@ -4251,30 +5518,43 @@ impl<'a> App<'a> {
                     },
                     popup: &items,
                     popup_selected: self.palette_selected,
+                    menubar,
+                    home_split_ratio,
+                    home_sash_hovered,
+                    home_sash_dragging,
                 },
                 theme,
                 |frame, body| {
-                    hits = matrix.render_matrix_body(
+                    hits = matrix.render_matrix_body_with_dead_windows(
                         frame,
                         body,
                         current_session.as_ref(),
                         highlight_header,
+                        &dead_windows,
                         theme,
                     );
                 },
             );
             self.matrix_hits = hits;
             self.tab_hits = layout.tab_hits;
+            self.quick_action_hits = layout.quick_action_hits;
+            self.preview_action_hits = layout.preview_action_hits;
             self.preview_rect = layout.preview_area;
             self.hydra_visible = layout.hydra_rendered;
+            self.desktop.menubar_hits = layout.menubar_hits;
+            self.desktop.sash_hits = layout.sash_hits;
+            self.desktop.preview_layout = layout.preview_layout;
+            self.render_desktop_overlays_for_frame(frame, full_area);
             return;
         }
+        #[allow(clippy::too_many_arguments)]
         fn draw_subview(
             frame: &mut Frame<'_>,
             area: Rect,
             details: HomeDetails<'_>,
             telemetry: HomeTelemetry<'_>,
             emblem: (EmblemMode, usize),
+            menubar: DesktopMenubarState<'_>,
             theme: Theme,
             content: SubviewContent<'_>,
         ) -> ui::WorkspaceSubviewLayout {
@@ -4288,6 +5568,7 @@ impl<'a> App<'a> {
                     emblem_step: emblem.1,
                     footer_hint: "",
                     content,
+                    menubar,
                 },
                 theme,
             )
@@ -4305,10 +5586,14 @@ impl<'a> App<'a> {
         } else {
             (area, None)
         };
-        let picker_rows = if let Some(View::Picker(picker)) = self.views.0.last() {
-            Some(picker.rich_rows(&mut self.matcher, &self.context, self.theme))
-        } else {
-            None
+        let picker_rows = match self.views.0.last() {
+            Some(View::Picker(picker)) => {
+                Some(picker.rich_rows(&mut self.matcher, &self.context, self.theme))
+            }
+            Some(View::TargetPick(state)) => {
+                Some(state.rich_rows(&mut self.matcher, &self.context, self.theme))
+            }
+            _ => None,
         };
         let (context, session) = match &self.context {
             Context::Outside => (self.theme.tr("standalone", "独立模式"), None),
@@ -4338,6 +5623,7 @@ impl<'a> App<'a> {
             sessions: self.telemetry.sessions,
             windows: self.telemetry.windows,
             attached: self.telemetry.attached,
+            clients: self.client_count,
             hint_badge: (self.theme.preset != ThemePreset::Classic).then_some(badge.as_str()),
         };
         let emblem = (
@@ -4348,16 +5634,8 @@ impl<'a> App<'a> {
                 0
             },
         );
-        let preview = self
-            .cached_preview
-            .as_ref()
-            .filter(|_| self.config.live_preview)
-            .map(|(title, subtitle, lines)| ui::PanePreview {
-                title: title.as_str(),
-                subtitle: subtitle.as_str(),
-                lines: lines.as_slice(),
-                scroll: self.preview_scroll,
-            });
+        let preview = self.build_pane_preview(false);
+        let menubar = self.build_menubar_state();
         let mut picker_selected_and_len = None;
         let sub_layout = match self.views.0.last() {
             Some(View::Picker(picker)) => {
@@ -4369,6 +5647,7 @@ impl<'a> App<'a> {
                     details,
                     telemetry,
                     emblem,
+                    menubar,
                     self.theme,
                     SubviewContent::Picker {
                         title: picker.purpose.title_for(self.theme.language),
@@ -4382,9 +5661,35 @@ impl<'a> App<'a> {
                     },
                 )
             }
+            Some(View::TargetPick(state)) => {
+                let rows = picker_rows.as_deref().unwrap_or(&[]);
+                picker_selected_and_len = Some((state.selected, rows.len()));
+                let banner = state.purpose.action_banner(self.theme.language);
+                draw_subview(
+                    frame,
+                    subview_area,
+                    details,
+                    telemetry,
+                    emblem,
+                    menubar,
+                    self.theme,
+                    SubviewContent::TargetPicker {
+                        title: state.purpose.title(self.theme.language),
+                        action_banner: &banner,
+                        query: &state.query,
+                        rows,
+                        selected: state.selected,
+                        empty: self
+                            .theme
+                            .tr("No matching targets. Esc back", "没有匹配的目标 · Esc 返回"),
+                        preview,
+                    },
+                )
+            }
             Some(View::Actions(resource, selected)) => {
-                let actions = resource.actions_for(self.theme.language);
-                let action_labels: Vec<&str> = actions.iter().map(|(label, _)| *label).collect();
+                let actions = resource.actions_for(&self.piping_panes, self.theme.language);
+                let action_labels: Vec<&str> =
+                    actions.iter().map(|(label, _)| label.as_str()).collect();
                 let title = match resource {
                     Resource::Session(_) => self.theme.tr("Session actions", "会话操作"),
                     Resource::Window(_) => self.theme.tr("Window actions", "窗口操作"),
@@ -4397,6 +5702,7 @@ impl<'a> App<'a> {
                     details,
                     telemetry,
                     emblem,
+                    menubar,
                     self.theme,
                     SubviewContent::Actions {
                         title,
@@ -4407,7 +5713,7 @@ impl<'a> App<'a> {
                 )
             }
             Some(View::Form(form)) => {
-                let rename_label;
+                let dynamic_label;
                 let (title, label) = match &form.action {
                     FormAction::NewSessionName => (
                         self.theme.tr("New session", "新建会话"),
@@ -4421,17 +5727,48 @@ impl<'a> App<'a> {
                         ),
                     ),
                     FormAction::Rename(resource) => {
-                        rename_label = if self.theme.language.is_zh() {
+                        dynamic_label = if self.theme.language.is_zh() {
                             format!("将 {} 重命名为", resource.label())
                         } else {
                             format!("New name for {}", resource.label())
                         };
-                        (self.theme.tr("Rename", "重命名"), rename_label.as_str())
+                        (self.theme.tr("Rename", "重命名"), dynamic_label.as_str())
                     }
-                    FormAction::NewWindow(_) => (
-                        self.theme.tr("New window", "新建窗口"),
-                        self.theme.tr("Window name (optional)", "窗口名称（可选）"),
+                    FormAction::RenamePaneTitle(pane) => {
+                        dynamic_label = if self.theme.language.is_zh() {
+                            format!("窗格 {} 的新标题", pane.id)
+                        } else {
+                            format!("New title for pane {}", pane.id)
+                        };
+                        (
+                            self.theme.tr("Rename pane title", "重命名窗格标题"),
+                            dynamic_label.as_str(),
+                        )
+                    }
+                    FormAction::SendCommandToPane(pane) => {
+                        dynamic_label = if self.theme.language.is_zh() {
+                            format!("向窗格 {} 发送命令并回车执行", pane.id)
+                        } else {
+                            format!("Command to run in pane {} (Enter to send)", pane.id)
+                        };
+                        (
+                            self.theme.tr("Send command", "发送命令"),
+                            dynamic_label.as_str(),
+                        )
+                    }
+                    FormAction::NewBufferContent => (
+                        self.theme.tr("New paste buffer", "新建粘贴缓冲区"),
+                        self.theme
+                            .tr("Text to store in tmux buffer", "要存入 tmux 缓冲区的文本"),
                     ),
+                    FormAction::SaveSnapshotName { session_filter } => {
+                        let scope = if session_filter.is_some() {
+                            self.theme.tr("Session snapshot name", "会话快照名称")
+                        } else {
+                            self.theme.tr("Workspace snapshot name", "工作区快照名称")
+                        };
+                        (self.theme.tr("Save snapshot", "保存工作区快照"), scope)
+                    }
                 };
                 draw_subview(
                     frame,
@@ -4439,6 +5776,7 @@ impl<'a> App<'a> {
                     details,
                     telemetry,
                     emblem,
+                    menubar,
                     self.theme,
                     SubviewContent::Form {
                         title,
@@ -4447,14 +5785,44 @@ impl<'a> App<'a> {
                     },
                 )
             }
-            Some(View::Confirm(confirm)) => {
-                let summary = confirm.resource.label();
+            Some(View::DualForm(form)) => {
+                let (title, first_label, second_label) = match &form.action {
+                    controller::DualFormAction::NewWindow(_) => (
+                        self.theme.tr("New window", "新建窗口"),
+                        self.theme.tr("Window name (optional)", "窗口名称（可选）"),
+                        self.theme.tr(
+                            "Working directory (optional, Tab to edit)",
+                            "工作目录（可选，按 Tab 切换）",
+                        ),
+                    ),
+                };
                 draw_subview(
                     frame,
                     subview_area,
                     details,
                     telemetry,
                     emblem,
+                    menubar,
+                    self.theme,
+                    SubviewContent::DualForm {
+                        title,
+                        first_label,
+                        first_input: &form.first_input,
+                        second_label,
+                        second_input: &form.second_input,
+                        active_field: form.active_field,
+                    },
+                )
+            }
+            Some(View::Confirm(confirm)) => {
+                let summary = confirm.target.summary(self.theme.language);
+                draw_subview(
+                    frame,
+                    subview_area,
+                    details,
+                    telemetry,
+                    emblem,
+                    menubar,
                     self.theme,
                     SubviewContent::Confirm {
                         title: self
@@ -4475,6 +5843,7 @@ impl<'a> App<'a> {
                     details,
                     telemetry,
                     emblem,
+                    menubar,
                     self.theme,
                     SubviewContent::Created {
                         target_label: &target_label,
@@ -4535,8 +5904,17 @@ impl<'a> App<'a> {
                         .can_split(studio.selected_slot, SplitDirection::Stacked),
                     can_flip: studio.root.can_flip(),
                     can_remove: studio.root.leaf_count() > 1,
+                    active_ratio: studio.active_ratio(),
+                    can_adjust_ratio: studio.can_adjust_ratio(),
+                    sync_panes: studio.sync_panes,
+                    can_break_out: studio.selected_existing_pane().is_some()
+                        && studio.root.leaf_count() > 1,
+                    editing_existing: studio.is_editing_existing(),
                     window_rows: &window_rows,
                     window_cursor: studio.window_cursor,
+                    hovered_sash: self.desktop.hovered_sash_id(),
+                    dragging_sash: self.desktop.dragging_sash_id(),
+                    hovered_dock: self.desktop.drag.as_ref().and_then(|d| d.split_dock_slot),
                 };
                 draw_subview(
                     frame,
@@ -4544,8 +5922,134 @@ impl<'a> App<'a> {
                     details,
                     telemetry,
                     emblem,
+                    menubar,
                     self.theme,
                     SubviewContent::Split(view),
+                )
+            }
+            Some(View::LayoutStudio(state)) => draw_subview(
+                frame,
+                subview_area,
+                details,
+                telemetry,
+                emblem,
+                menubar,
+                self.theme,
+                SubviewContent::LayoutStudio(LayoutStudioView {
+                    target_label: &state.target_label,
+                    selected_preset: state.selected_preset,
+                    pane_size: state.pane_size,
+                    pane_count: state.pane_count,
+                    resize_step: state.resize_step,
+                    zoomed: state.zoomed,
+                    synchronized: state.synchronized,
+                    status_note: state.status_note.as_deref(),
+                    hovered_sash: self.desktop.hovered_sash_id(),
+                    dragging_sash: self.desktop.dragging_sash_id(),
+                }),
+            ),
+            Some(View::Expose(state)) => {
+                let tiles = self.build_expose_tile_views(state);
+                let expose_view = self.expose_view_summary(state, &tiles);
+                draw_subview(
+                    frame,
+                    subview_area,
+                    details,
+                    telemetry,
+                    emblem,
+                    menubar,
+                    self.theme,
+                    SubviewContent::Expose(expose_view),
+                )
+            }
+            Some(View::Clients(state)) => {
+                let current_client = match &self.context {
+                    Context::Inside(inside) => inside.client_name.as_deref(),
+                    _ => None,
+                };
+                let rows: Vec<ClientRowView> = state
+                    .clients
+                    .iter()
+                    .map(|c| ClientRowView {
+                        name: c.name.clone(),
+                        session_name: c.session_name.clone(),
+                        width: c.width,
+                        height: c.height,
+                        tty: c.tty.clone(),
+                        readonly: c.readonly,
+                        is_current: current_client == Some(c.name.as_str()),
+                    })
+                    .collect();
+                draw_subview(
+                    frame,
+                    subview_area,
+                    details,
+                    telemetry,
+                    emblem,
+                    menubar,
+                    self.theme,
+                    SubviewContent::Clients(ClientsView {
+                        clients: &rows,
+                        selected: state.selected,
+                        size_mismatch_warning: state.has_size_mismatch(),
+                        status_note: state.status_note.as_deref(),
+                    }),
+                )
+            }
+            Some(View::Buffers(state)) => {
+                let rows: Vec<BufferRowView> = state
+                    .buffers
+                    .iter()
+                    .map(|b| BufferRowView {
+                        name: b.name.clone(),
+                        size: b.size,
+                        sample: b.sample.clone(),
+                    })
+                    .collect();
+                draw_subview(
+                    frame,
+                    subview_area,
+                    details,
+                    telemetry,
+                    emblem,
+                    menubar,
+                    self.theme,
+                    SubviewContent::Buffers(BuffersView {
+                        buffers: &rows,
+                        selected: state.selected,
+                        preview_lines: &state.preview_lines,
+                        preview_scroll: state.preview_scroll,
+                        status_note: state.status_note.as_deref(),
+                    }),
+                )
+            }
+            Some(View::Snapshots(state)) => {
+                let rows: Vec<SnapshotRowView> = state
+                    .snapshots
+                    .iter()
+                    .map(|s| SnapshotRowView {
+                        name: s.name.clone(),
+                        created_label: WorkspaceSnapshot::format_epoch_utc(s.created_epoch),
+                        session_count: s.session_count,
+                        window_count: s.window_count,
+                        pane_count: s.pane_count,
+                    })
+                    .collect();
+                draw_subview(
+                    frame,
+                    subview_area,
+                    details,
+                    telemetry,
+                    emblem,
+                    menubar,
+                    self.theme,
+                    SubviewContent::Snapshots(SnapshotsView {
+                        snapshots: &rows,
+                        selected: state.selected,
+                        tree_preview: &state.tree_preview,
+                        preview_scroll: state.preview_scroll,
+                        status_note: state.status_note.as_deref(),
+                    }),
                 )
             }
             Some(View::ThemePicker { initial, selected }) => draw_subview(
@@ -4554,6 +6058,7 @@ impl<'a> App<'a> {
                 details,
                 telemetry,
                 emblem,
+                menubar,
                 self.theme,
                 SubviewContent::Theme {
                     presets: ThemePreset::ALL,
@@ -4575,6 +6080,7 @@ impl<'a> App<'a> {
                     details,
                     telemetry,
                     emblem,
+                    menubar,
                     self.theme,
                     SubviewContent::Config {
                         path_label: &path_label,
@@ -4592,6 +6098,7 @@ impl<'a> App<'a> {
                     details,
                     telemetry,
                     emblem,
+                    menubar,
                     self.theme,
                     SubviewContent::Tribute(ui::TributeModal {
                         badge: card.badge,
@@ -4615,6 +6122,7 @@ impl<'a> App<'a> {
                 details,
                 telemetry,
                 emblem,
+                menubar,
                 self.theme,
                 SubviewContent::Help,
             ),
@@ -4623,6 +6131,12 @@ impl<'a> App<'a> {
         self.hydra_visible = sub_layout.hydra_rendered;
         self.preview_rect = sub_layout.preview_area;
         self.subview_list_rect = sub_layout.list_rect;
+        self.preview_action_hits = sub_layout.preview_action_hits;
+        self.controller_hits = sub_layout.controller_hits;
+        self.desktop.menubar_hits = sub_layout.menubar_hits;
+        self.desktop.sash_hits = sub_layout.sash_hits;
+        self.desktop.expose_hits = sub_layout.expose_tile_hits;
+        self.desktop.preview_layout = sub_layout.preview_layout;
         if let Some((selected, rows_len)) = picker_selected_and_len
             && rows_len > 0
             && let Some(list_area) = sub_layout.list_rect
@@ -4659,6 +6173,7 @@ impl<'a> App<'a> {
                 chunks[2],
             );
         }
+        self.render_desktop_overlays_for_frame(frame, full_area);
     }
 
     pub fn exit(&self) -> Option<&Exit> {
@@ -4726,7 +6241,7 @@ mod tests {
         let mut app = App::new(&tmux, AppOptions::default());
         app.views.push(View::Help);
         app.views.push(View::Confirm(Confirm {
-            resource: Resource::Session(session("$1", "orion")),
+            target: ConfirmTarget::Resource(Box::new(Resource::Session(session("$1", "orion")))),
             input: TextInput::default(),
             message: "An irreversible action".into(),
             scroll: 0,
@@ -4760,7 +6275,7 @@ mod tests {
         .with_program("/nonexistent-justmux-test-tmux");
         let mut app = App::new(&tmux, AppOptions::default());
         app.views.push(View::Confirm(Confirm {
-            resource: Resource::Session(session("$1", "orion")),
+            target: ConfirmTarget::Resource(Box::new(Resource::Session(session("$1", "orion")))),
             input: TextInput::default(),
             message: "An irreversible action".into(),
             scroll: 0,
@@ -4772,5 +6287,451 @@ mod tests {
         assert_eq!(app.status, "Cancelled. Nothing was killed.");
         assert!(app.views.top().is_none());
         assert!(app.exit().is_none());
+    }
+
+    #[test]
+    fn kill_server_requires_exact_yes_and_private_socket_controller_flows_work() {
+        use ratatui::{Terminal, backend::TestBackend};
+
+        let socket = format!(
+            "jm-app-ctrl-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        );
+        let tmux = crate::tmux::TmuxClient::new(crate::tmux::SocketSpec::Name(socket.clone()))
+            .with_config_file("/dev/null");
+        // Ensure clean server teardown even on assertion failure.
+        struct Cleanup(crate::tmux::TmuxClient);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = self.0.kill_server();
+            }
+        }
+        let _cleanup = Cleanup(tmux.clone());
+
+        let cwd = std::env::temp_dir();
+        let sess = tmux.new_session("ctrl-demo", &cwd).expect("new session");
+        let wins = tmux.list_windows(Some(&sess.id)).expect("list windows");
+        let panes = tmux.list_panes(Some(&wins[0].id)).expect("list panes");
+        let _second_pane = tmux
+            .split_pane(&panes[0].id, SplitDirection::SideBySide)
+            .expect("split pane");
+
+        let conf_dir = tempfile::tempdir().expect("tempdir");
+        let conf_path = conf_dir.path().join(".tmux.conf");
+
+        let mut app =
+            App::new(&tmux, AppOptions::default()).with_tmux_conf(Some(conf_path.clone()), None);
+        let send_key = |app: &mut App<'_>, code: KeyCode| {
+            app.handle_event(Event::Key(KeyEvent::new(code, KeyModifiers::NONE)));
+        };
+        let send_str = |app: &mut App<'_>, s: &str| {
+            for c in s.chars() {
+                send_key(app, KeyCode::Char(c));
+            }
+        };
+        let mut term = Terminal::new(TestBackend::new(110, 32)).expect("test backend");
+
+        // 1. Multi-pane Home preview cycling (`[` / `]`) & preview search (`f` .. `Esc`).
+        assert_eq!(app.home_preview_pane_total, 2);
+        let first_idx = app.home_preview_pane_idx;
+        send_key(&mut app, KeyCode::Char(']'));
+        assert_ne!(app.home_preview_pane_idx, first_idx);
+        send_key(&mut app, KeyCode::Char('['));
+        assert_eq!(app.home_preview_pane_idx, first_idx);
+
+        send_key(&mut app, KeyCode::Char('f'));
+        assert!(app.preview_search.active);
+        send_str(&mut app, "nonexistent");
+        term.draw(|f| app.render(f)).expect("draw preview search");
+        send_key(&mut app, KeyCode::Esc);
+        assert!(!app.preview_search.active);
+        assert!(app.exit().is_none());
+
+        // 2. Natural phrases: zoom, sync panes, clients, buffers, layout.
+        send_str(&mut app, "zoom");
+        send_key(&mut app, KeyCode::Enter);
+        assert!(
+            tmux.list_windows(Some(&sess.id))
+                .expect("windows after zoom")[0]
+                .zoomed
+        );
+        send_str(&mut app, "unzoom");
+        send_key(&mut app, KeyCode::Enter);
+        assert!(
+            !tmux
+                .list_windows(Some(&sess.id))
+                .expect("windows after unzoom")[0]
+                .zoomed
+        );
+
+        send_str(&mut app, "sync panes");
+        send_key(&mut app, KeyCode::Enter);
+        assert!(
+            tmux.list_windows(Some(&sess.id))
+                .expect("windows after sync")[0]
+                .synchronized
+        );
+        send_str(&mut app, "sync panes");
+        send_key(&mut app, KeyCode::Enter);
+
+        // 3. /layout, /clients, /buffers, /snapshot subviews open & render cleanly.
+        send_str(&mut app, "/layout");
+        send_key(&mut app, KeyCode::Enter);
+        assert!(matches!(app.views.top(), Some(View::LayoutStudio(_))));
+        term.draw(|f| app.render(f)).expect("draw layout studio");
+        send_key(&mut app, KeyCode::Char('1'));
+        send_key(&mut app, KeyCode::Esc);
+
+        send_str(&mut app, "/clients");
+        send_key(&mut app, KeyCode::Enter);
+        assert!(matches!(app.views.top(), Some(View::Clients(_))));
+        term.draw(|f| app.render(f)).expect("draw clients");
+        send_key(&mut app, KeyCode::Esc);
+
+        tmux.set_buffer("hello-justmux-buffer").expect("set buffer");
+        send_str(&mut app, "/buffers");
+        send_key(&mut app, KeyCode::Enter);
+        assert!(matches!(app.views.top(), Some(View::Buffers(_))));
+        term.draw(|f| app.render(f)).expect("draw buffers");
+        send_key(&mut app, KeyCode::Esc);
+
+        send_str(&mut app, "/snapshot");
+        send_key(&mut app, KeyCode::Enter);
+        assert!(matches!(app.views.top(), Some(View::Snapshots(_))));
+        term.draw(|f| app.render(f)).expect("draw snapshots");
+        send_key(&mut app, KeyCode::Esc);
+
+        // 4. Split Studio loads existing 2-pane window with real panes and renders cleanly.
+        send_str(&mut app, "/split");
+        send_key(&mut app, KeyCode::Enter);
+        send_key(&mut app, KeyCode::Enter); // activate selected window in Split mode
+        assert!(matches!(
+            app.views.top(),
+            Some(View::Split(s)) if s.is_editing_existing() && s.root.leaf_count() == 2
+        ));
+        send_key(&mut app, KeyCode::Char('p')); // cycle ratio preset
+        send_key(&mut app, KeyCode::Char('y')); // toggle sync_panes
+        term.draw(|f| app.render(f)).expect("draw split studio");
+        send_key(&mut app, KeyCode::Esc);
+
+        // 5. DualForm New Window (Tab between Name & Directory, 1-step Enter works).
+        app.views
+            .push(View::DualForm(DualForm::new_window(sess.id.clone())));
+        send_str(&mut app, "dual-win");
+        send_key(&mut app, KeyCode::Tab);
+        send_str(&mut app, &cwd.display().to_string());
+        term.draw(|f| app.render(f)).expect("draw dual form");
+        send_key(&mut app, KeyCode::Enter);
+        assert!(
+            tmux.list_windows(Some(&sess.id))
+                .expect("windows after dual form")
+                .iter()
+                .any(|w| w.name == "dual-win")
+        );
+        send_key(&mut app, KeyCode::Esc);
+
+        // 6. /config comfort toggles sync isolated tempdir tmux.conf & live tmux.
+        send_str(&mut app, "/config");
+        send_key(&mut app, KeyCode::Enter);
+        for _ in 0..11 {
+            send_key(&mut app, KeyCode::Down);
+        }
+        send_key(&mut app, KeyCode::Enter); // toggle tmux_mouse ON (row 11)
+        assert!(app.config().tmux_mouse);
+        let conf_text = std::fs::read_to_string(&conf_path).expect("read temp tmux.conf");
+        assert!(conf_text.contains("set -g mouse on"), "{conf_text}");
+        term.draw(|f| app.render(f)).expect("draw config comfort");
+        send_key(&mut app, KeyCode::Enter); // toggle tmux_mouse OFF
+        assert!(!app.config().tmux_mouse);
+        send_key(&mut app, KeyCode::Esc);
+
+        // 7. /kill-server cancels on empty Enter and kills private server on exact "yes".
+        send_str(&mut app, "/kill-server");
+        send_key(&mut app, KeyCode::Enter);
+        assert!(matches!(app.views.top(), Some(View::Confirm(_))));
+        send_key(&mut app, KeyCode::Enter); // empty cancels
+        assert!(tmux.server_running().expect("server still running"));
+
+        send_str(&mut app, "/kill-server");
+        send_key(&mut app, KeyCode::Enter);
+        send_str(&mut app, "yes");
+        send_key(&mut app, KeyCode::Enter);
+        assert!(!tmux.server_running().expect("server stopped"));
+    }
+
+    #[test]
+    fn with_tmux_conf_syncs_removed_comfort_block_and_clients_keys_match_ui_pills() {
+        use std::cell::RefCell;
+
+        struct ClientsStubTmux {
+            detached: RefCell<Vec<String>>,
+            detached_others: RefCell<Vec<Option<String>>>,
+        }
+
+        impl Tmux for ClientsStubTmux {
+            fn version(&self) -> TmuxResult<crate::tmux::TmuxVersion> {
+                Ok(crate::tmux::TmuxVersion {
+                    raw: "3.4".into(),
+                    number: Some((3, 4)),
+                })
+            }
+            fn server_running(&self) -> TmuxResult<bool> {
+                Ok(true)
+            }
+            fn context(&self) -> Context {
+                Context::Inside(InsideContext {
+                    client_name: Some("/dev/ttys001".into()),
+                    ..InsideContext::default()
+                })
+            }
+            fn list_sessions(&self) -> TmuxResult<Vec<Session>> {
+                Ok(Vec::new())
+            }
+            fn has_session(&self, _: &SessionId) -> TmuxResult<bool> {
+                Ok(false)
+            }
+            fn new_session(&self, _: &str, _: &std::path::Path) -> TmuxResult<Session> {
+                Err(crate::tmux::TmuxError::NoServer)
+            }
+            fn rename_session(&self, _: &SessionId, _: &str) -> TmuxResult<()> {
+                Ok(())
+            }
+            fn kill_session(&self, _: &SessionId) -> TmuxResult<()> {
+                Ok(())
+            }
+            fn list_windows(&self, _: Option<&SessionId>) -> TmuxResult<Vec<Window>> {
+                Ok(Vec::new())
+            }
+            fn new_window(
+                &self,
+                _: &SessionId,
+                _: Option<&str>,
+                _: Option<&std::path::Path>,
+            ) -> TmuxResult<Window> {
+                Err(crate::tmux::TmuxError::NoServer)
+            }
+            fn rename_window(&self, _: &WindowId, _: &str) -> TmuxResult<()> {
+                Ok(())
+            }
+            fn kill_window(&self, _: &WindowId) -> TmuxResult<()> {
+                Ok(())
+            }
+            fn list_panes(&self, _: Option<&WindowId>) -> TmuxResult<Vec<Pane>> {
+                Ok(Vec::new())
+            }
+            fn split_pane(&self, _: &PaneId, _: SplitDirection) -> TmuxResult<Pane> {
+                Err(crate::tmux::TmuxError::NoServer)
+            }
+            fn join_pane(&self, _: &PaneId, _: &PaneId, _: SplitDirection) -> TmuxResult<()> {
+                Ok(())
+            }
+            fn kill_pane(&self, _: &PaneId) -> TmuxResult<()> {
+                Ok(())
+            }
+            fn select(&self, _: &Target) -> TmuxResult<()> {
+                Ok(())
+            }
+            fn switch_client(&self, _: &Target) -> TmuxResult<()> {
+                Ok(())
+            }
+            fn attach_command(&self, _: &Target) -> std::process::Command {
+                std::process::Command::new("tmux")
+            }
+            fn detach_client(&self, client: &str) -> TmuxResult<()> {
+                self.detached.borrow_mut().push(client.to_owned());
+                Ok(())
+            }
+            fn list_clients(&self) -> TmuxResult<Vec<crate::tmux::ClientInfo>> {
+                Ok(vec![
+                    crate::tmux::ClientInfo {
+                        name: "/dev/ttys001".into(),
+                        session_name: "dev".into(),
+                        session_id: SessionId::new("$1"),
+                        width: 120,
+                        height: 40,
+                        tty: "/dev/ttys001".into(),
+                        readonly: false,
+                        control_mode: false,
+                        activity: 0,
+                    },
+                    crate::tmux::ClientInfo {
+                        name: "/dev/ttys002".into(),
+                        session_name: "dev".into(),
+                        session_id: SessionId::new("$1"),
+                        width: 80,
+                        height: 24,
+                        tty: "/dev/ttys002".into(),
+                        readonly: false,
+                        control_mode: false,
+                        activity: 0,
+                    },
+                ])
+            }
+            fn detach_other_clients(
+                &self,
+                _: Option<&SessionId>,
+                keep_client: Option<&str>,
+            ) -> TmuxResult<usize> {
+                self.detached_others
+                    .borrow_mut()
+                    .push(keep_client.map(ToOwned::to_owned));
+                Ok(1)
+            }
+        }
+
+        let stub = ClientsStubTmux {
+            detached: RefCell::new(Vec::new()),
+            detached_others: RefCell::new(Vec::new()),
+        };
+
+        // Removing comfort block from tmux.conf must clear stale config.toml comfort flags.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let empty_conf = dir.path().join(".tmux.conf");
+        std::fs::write(&empty_conf, "# user config without comfort block\n").expect("write conf");
+        let stale_cfg = Config {
+            tmux_mouse: true,
+            tmux_history_limit: 50_000,
+            tmux_base_index_one: true,
+            tmux_renumber_windows: true,
+            tmux_zero_escape_time: true,
+            ..Config::default()
+        };
+        let mut app = App::with_config(&stub, AppOptions::default(), stale_cfg, None)
+            .with_tmux_conf(Some(empty_conf), None);
+        assert!(!app.config().tmux_mouse);
+        assert_eq!(app.config().tmux_history_limit, 0);
+        assert!(!app.config().tmux_base_index_one);
+        assert!(!app.config().tmux_renumber_windows);
+        assert!(!app.config().tmux_zero_escape_time);
+
+        // /clients: `d` / `o` / DetachOtherClients detach others; `x` / Enter / DetachSelectedClient detach selected.
+        app.open_clients_view();
+        app.handle_event(Event::Key(KeyEvent::new(
+            KeyCode::Char('d'),
+            KeyModifiers::NONE,
+        )));
+        assert_eq!(
+            stub.detached_others.borrow().as_slice(),
+            &[Some("/dev/ttys001".to_owned())]
+        );
+        assert!(stub.detached.borrow().is_empty());
+
+        app.handle_event(Event::Key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)));
+        app.handle_event(Event::Key(KeyEvent::new(
+            KeyCode::Char('x'),
+            KeyModifiers::NONE,
+        )));
+        assert_eq!(
+            stub.detached.borrow().as_slice(),
+            &["/dev/ttys002".to_owned()]
+        );
+
+        app.handle_controller_action(ControllerAction::DetachOtherClients);
+        assert_eq!(stub.detached_others.borrow().len(), 2);
+        app.handle_controller_action(ControllerAction::DetachSelectedClient);
+        assert_eq!(stub.detached.borrow().len(), 2);
+    }
+
+    #[test]
+    fn circular_selection_wraps_across_lists_config_and_layout_wheel() {
+        // 1. wrap_step edge cases
+        assert_eq!(wrap_step(0, 0, 1), 0);
+        assert_eq!(wrap_step(5, 0, -1), 0);
+        assert_eq!(wrap_step(0, 1, 1), 0);
+        assert_eq!(wrap_step(0, 1, -1), 0);
+        assert_eq!(wrap_step(0, 5, -1), 4);
+        assert_eq!(wrap_step(4, 5, 1), 0);
+        assert_eq!(wrap_step(99, 5, 1), 0); // stale index clamps to 4, then +1 wraps to 0
+        assert_eq!(wrap_step(99, 5, -1), 3); // stale index clamps to 4, then -1 gives 3
+
+        let tmux = crate::tmux::TmuxClient::new(crate::tmux::SocketSpec::Name(format!(
+            "jm-wrap-test-{}",
+            std::process::id()
+        )))
+        .with_program("/nonexistent-justmux-test-tmux");
+        let mut app = App::new(&tmux, AppOptions::default());
+
+        // 2. `/` command palette wraps keyboard Up/Down and mouse wheel.
+        app.handle_event(Event::Key(KeyEvent::new(
+            KeyCode::Char('/'),
+            KeyModifiers::NONE,
+        )));
+        let total_cmds = app.palette().len();
+        assert_eq!(total_cmds, 19);
+        assert_eq!(app.palette_selected, 0);
+        app.handle_event(Event::Key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE)));
+        assert_eq!(app.palette_selected, total_cmds - 1);
+        app.handle_event(Event::Key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)));
+        assert_eq!(app.palette_selected, 0);
+        app.mouse_scroll(0, 0, true);
+        assert_eq!(app.palette_selected, total_cmds - 1);
+        app.mouse_scroll(0, 0, false);
+        assert_eq!(app.palette_selected, 0);
+
+        // 3. Config wraps selection (Up/Down + wheel) and inline_height wraps 8 <-> 40.
+        app.config.inline_height = 8;
+        app.views.push(View::Config { selected: 0 });
+        app.handle_event(Event::Key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE)));
+        assert!(matches!(
+            app.views.top(),
+            Some(View::Config { selected }) if *selected == CONFIG_ITEM_COUNT - 1
+        ));
+        app.mouse_scroll(0, 0, false);
+        assert!(matches!(
+            app.views.top(),
+            Some(View::Config { selected: 0 })
+        ));
+        app.views.pop();
+        app.views.push(View::Config { selected: 6 });
+        app.handle_event(Event::Key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE)));
+        assert_eq!(app.config.inline_height, 40);
+        app.handle_event(Event::Key(KeyEvent::new(
+            KeyCode::Right,
+            KeyModifiers::NONE,
+        )));
+        assert_eq!(app.config.inline_height, 8);
+        app.views.pop();
+
+        // 4. LayoutStudio mouse wheel wraps preset selection circularly.
+        app.views.push(View::LayoutStudio(LayoutStudioState {
+            window_id: WindowId::new("@1").expect("window id"),
+            pane_id: PaneId::new("%1").expect("pane id"),
+            target_label: "dev:0 main".into(),
+            selected_preset: 0,
+            pane_size: (80, 24),
+            pane_count: 2,
+            resize_step: 5,
+            zoomed: false,
+            synchronized: false,
+            status_note: None,
+        }));
+        app.mouse_scroll(0, 0, true);
+        assert!(matches!(
+            app.views.top(),
+            Some(View::LayoutStudio(s)) if s.selected_preset == LayoutPreset::ALL.len() - 1
+        ));
+        app.mouse_scroll(0, 0, false);
+        assert!(matches!(
+            app.views.top(),
+            Some(View::LayoutStudio(s)) if s.selected_preset == 0
+        ));
+        app.views.pop();
+
+        // 5. Confirm text scroll stays clamped (does not wrap).
+        app.views.push(View::Confirm(Confirm {
+            target: ConfirmTarget::Resource(Box::new(Resource::Session(session("$1", "orion")))),
+            input: TextInput::default(),
+            message: "msg".into(),
+            scroll: 0,
+        }));
+        app.mouse_scroll(0, 0, true);
+        assert!(matches!(
+            app.views.top(),
+            Some(View::Confirm(c)) if c.scroll == 0
+        ));
     }
 }

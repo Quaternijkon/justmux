@@ -16,6 +16,13 @@ pub enum CommandKind {
     Window,
     Pane,
     Split,
+    Layout,
+    Expose,
+    Clients,
+    Buffers,
+    Snapshot,
+    Popup,
+    KillServer,
     Theme,
     Config,
     Update,
@@ -36,6 +43,13 @@ impl CommandKind {
             Self::Window => "window",
             Self::Pane => "pane",
             Self::Split => "split",
+            Self::Layout => "layout",
+            Self::Expose => "expose",
+            Self::Clients => "clients",
+            Self::Buffers => "buffers",
+            Self::Snapshot => "snapshot",
+            Self::Popup => "popup",
+            Self::KillServer => "kill-server",
             Self::Theme => "theme",
             Self::Config => "config",
             Self::Update => "update",
@@ -89,18 +103,25 @@ pub const fn description_for(kind: CommandKind, lang: crate::ui::Language) -> &'
     if !matches!(lang, crate::ui::Language::Zh) {
         return match kind {
             CommandKind::Resume => "Open a window in an existing tmux session",
+            CommandKind::New => "Create a tmux session",
+            CommandKind::Window => "Open, create, move, rename, or close windows",
+            CommandKind::Split => "Open interactive 2x2 visual Split Studio",
+            CommandKind::Layout => "Visual layout presets & interactive pane resize",
+            CommandKind::Expose => "Mission Control live multi-window preview wall",
             CommandKind::Rename => "Rename a session or window in workspace",
             CommandKind::Kill => "Kill a session or window with confirmation",
-            CommandKind::Split => "Open interactive 2x2 visual Split Studio",
-            CommandKind::Pane => "Inspect, switch, or close individual panes",
-            CommandKind::Config => "Configure screen mode, theme, preview & spin",
+            CommandKind::Pane => "Inspect, zoom, break, swap, or close individual panes",
+            CommandKind::Clients => "Manage attached clients & fix screen-size locks",
+            CommandKind::Buffers => "Browse, copy & paste tmux paste buffers",
+            CommandKind::Snapshot => "Save & restore workspace layouts",
+            CommandKind::Popup => "Open a floating scratchpad terminal (tmux 3.2+)",
+            CommandKind::Config => "Configure screen mode, theme, preview & tmux.conf",
             CommandKind::Theme => "Live-preview and switch color themes",
             CommandKind::Help => "Keyboard shortcuts & command reference",
-            CommandKind::Quit => "Quit JustMux (or /exit to detach client)",
-            CommandKind::New => "Create a tmux session",
-            CommandKind::Window => "Open, create, rename, or close windows",
-            CommandKind::List => "List tmux sessions",
             CommandKind::Exit => "Detach the current tmux client",
+            CommandKind::KillServer => "Stop the entire tmux server (requires yes)",
+            CommandKind::Quit => "Quit JustMux (or /exit to detach client)",
+            CommandKind::List => "List tmux sessions",
             CommandKind::Update => "How to update JustMux (jm update)",
             CommandKind::Tribute(TributeId::Codex) => "Celebrate OpenAI Codex CLI craft",
             CommandKind::Tribute(TributeId::ClaudeCode) => "Celebrate Anthropic Claude Code flow",
@@ -120,18 +141,25 @@ pub const fn description_for(kind: CommandKind, lang: crate::ui::Language) -> &'
     }
     match kind {
         CommandKind::Resume => "在已有 tmux 会话中打开窗口",
+        CommandKind::New => "创建新的 tmux 会话",
+        CommandKind::Window => "打开、新建、移动、重命名或关闭窗口",
+        CommandKind::Split => "打开 2x2 可视化分屏工作台",
+        CommandKind::Layout => "可视化布局预设与交互式窗格尺寸调整",
+        CommandKind::Expose => "Mission Control 多窗口实时预览全景墙",
         CommandKind::Rename => "重命名工作区中的会话或窗口",
         CommandKind::Kill => "二次确认并结束会话或窗口",
-        CommandKind::Split => "打开 2x2 可视化分屏工作台",
-        CommandKind::Pane => "查看、切换或关闭单个窗格",
-        CommandKind::Config => "修改显示模式、主题、语言与点阵设置",
+        CommandKind::Pane => "查看、全屏缩放、拆出、互换或关闭单个窗格",
+        CommandKind::Clients => "管理已附着客户端并解除点阵边框尺寸锁定",
+        CommandKind::Buffers => "浏览、复制到剪贴板与粘贴 tmux 缓冲区",
+        CommandKind::Snapshot => "保存与一键恢复工作区快照布局",
+        CommandKind::Popup => "打开原生悬浮临时终端窗口 (tmux 3.2+)",
+        CommandKind::Config => "修改显示模式、主题、预览与 ~/.tmux.conf 快捷配置",
         CommandKind::Theme => "实时预览并切换配色主题",
         CommandKind::Help => "查看快捷键与命令参考",
-        CommandKind::Quit => "退出 JustMux（/exit 仅分离当前客户端）",
-        CommandKind::New => "创建新的 tmux 会话",
-        CommandKind::Window => "打开、新建、重命名或关闭窗口",
-        CommandKind::List => "浏览所有 tmux 会话列表",
         CommandKind::Exit => "分离当前所在的 tmux 客户端",
+        CommandKind::KillServer => "关闭整个 tmux 服务进程（需输入 yes 确认）",
+        CommandKind::Quit => "退出 JustMux（/exit 仅分离当前客户端）",
+        CommandKind::List => "浏览所有 tmux 会话列表",
         CommandKind::Update => "查看 JustMux 更新方式 (jm update)",
         CommandKind::Tribute(TributeId::Codex) => "致敬 OpenAI Codex CLI 匠心",
         CommandKind::Tribute(TributeId::ClaudeCode) => "致敬 Anthropic Claude Code 心流",
@@ -162,6 +190,7 @@ impl SlashCommand {
 }
 
 pub const COMMANDS: &[SlashCommand] = &[
+    // Workspace (0..=5)
     SlashCommand {
         kind: CommandKind::Resume,
         group: CommandGroup::Workspace,
@@ -169,6 +198,22 @@ pub const COMMANDS: &[SlashCommand] = &[
         aliases: &["r", "attach", "switch"],
         description: "Open a window in an existing tmux session",
         usage: "/resume [@target]",
+    },
+    SlashCommand {
+        kind: CommandKind::New,
+        group: CommandGroup::Workspace,
+        name: "new",
+        aliases: &["n"],
+        description: "Create a tmux session",
+        usage: "/new [name] [directory]",
+    },
+    SlashCommand {
+        kind: CommandKind::Window,
+        group: CommandGroup::Workspace,
+        name: "window",
+        aliases: &["w", "win", "windows"],
+        description: "Open, create, move, rename, or close windows",
+        usage: "/window [@target]",
     },
     SlashCommand {
         kind: CommandKind::Rename,
@@ -187,28 +232,61 @@ pub const COMMANDS: &[SlashCommand] = &[
         usage: "/kill [@target]",
     },
     SlashCommand {
-        kind: CommandKind::Split,
+        kind: CommandKind::Snapshot,
         group: CommandGroup::Workspace,
+        name: "snapshot",
+        aliases: &["save", "restore", "template", "workspace"],
+        description: "Save & restore workspace layouts",
+        usage: "/snapshot [save|restore]",
+    },
+    // Studio (6..=13)
+    SlashCommand {
+        kind: CommandKind::Pane,
+        group: CommandGroup::Studio,
+        name: "pane",
+        aliases: &["p"],
+        description: "Inspect, zoom, break, swap, or close individual panes",
+        usage: "/pane [@target]",
+    },
+    SlashCommand {
+        kind: CommandKind::Split,
+        group: CommandGroup::Studio,
         name: "split",
         aliases: &["s"],
         description: "Open interactive 2x2 visual Split Studio",
         usage: "/split [horizontal|vertical|@target]",
     },
     SlashCommand {
-        kind: CommandKind::Pane,
+        kind: CommandKind::Layout,
         group: CommandGroup::Studio,
-        name: "pane",
-        aliases: &["p"],
-        description: "Inspect, switch, or close individual panes",
-        usage: "/pane [@target]",
+        name: "layout",
+        aliases: &["resize", "arrange", "l"],
+        description: "Visual layout presets & interactive pane resize",
+        usage: "/layout [preset|@target]",
     },
     SlashCommand {
-        kind: CommandKind::Config,
+        kind: CommandKind::Expose,
         group: CommandGroup::Studio,
-        name: "config",
-        aliases: &["settings", "prefs"],
-        description: "Configure screen mode, theme, preview & spin",
-        usage: "/config",
+        name: "expose",
+        aliases: &["mission", "wall", "grid", "overview"],
+        description: "Mission Control live multi-window preview wall",
+        usage: "/expose",
+    },
+    SlashCommand {
+        kind: CommandKind::Buffers,
+        group: CommandGroup::Studio,
+        name: "buffers",
+        aliases: &["buffer", "clip", "paste", "copy"],
+        description: "Browse, copy & paste tmux paste buffers",
+        usage: "/buffers",
+    },
+    SlashCommand {
+        kind: CommandKind::Popup,
+        group: CommandGroup::Studio,
+        name: "popup",
+        aliases: &["scratch", "float"],
+        description: "Open a floating scratchpad terminal (tmux 3.2+)",
+        usage: "/popup",
     },
     SlashCommand {
         kind: CommandKind::Theme,
@@ -219,12 +297,45 @@ pub const COMMANDS: &[SlashCommand] = &[
         usage: "/theme [aurora|codex|claude|matrix|classic]",
     },
     SlashCommand {
+        kind: CommandKind::Config,
+        group: CommandGroup::Studio,
+        name: "config",
+        aliases: &["settings", "prefs"],
+        description: "Configure screen mode, theme, preview & tmux.conf",
+        usage: "/config",
+    },
+    // System (14..=18)
+    SlashCommand {
+        kind: CommandKind::Clients,
+        group: CommandGroup::System,
+        name: "clients",
+        aliases: &["client", "who"],
+        description: "Manage attached clients & fix screen-size locks",
+        usage: "/clients",
+    },
+    SlashCommand {
         kind: CommandKind::Help,
         group: CommandGroup::System,
         name: "help",
         aliases: &["?"],
         description: "Keyboard shortcuts & command reference",
         usage: "/help [command]",
+    },
+    SlashCommand {
+        kind: CommandKind::Exit,
+        group: CommandGroup::System,
+        name: "exit",
+        aliases: &["detach"],
+        description: "Detach the current tmux client",
+        usage: "/exit",
+    },
+    SlashCommand {
+        kind: CommandKind::KillServer,
+        group: CommandGroup::System,
+        name: "kill-server",
+        aliases: &["shutdown"],
+        description: "Stop the entire tmux server (requires yes)",
+        usage: "/kill-server",
     },
     SlashCommand {
         kind: CommandKind::Quit,
@@ -236,40 +347,14 @@ pub const COMMANDS: &[SlashCommand] = &[
     },
 ];
 
-pub const MERGED_COMMANDS: &[SlashCommand] = &[
-    SlashCommand {
-        kind: CommandKind::New,
-        group: CommandGroup::Workspace,
-        name: "new",
-        aliases: &["n"],
-        description: "Create a tmux session",
-        usage: "/new [name] [directory]",
-    },
-    SlashCommand {
-        kind: CommandKind::Window,
-        group: CommandGroup::Workspace,
-        name: "window",
-        aliases: &["w", "win", "windows"],
-        description: "Open, create, rename, or close windows",
-        usage: "/window [@target]",
-    },
-    SlashCommand {
-        kind: CommandKind::List,
-        group: CommandGroup::Workspace,
-        name: "list",
-        aliases: &["ls"],
-        description: "List tmux sessions",
-        usage: "/list",
-    },
-    SlashCommand {
-        kind: CommandKind::Exit,
-        group: CommandGroup::System,
-        name: "exit",
-        aliases: &["detach"],
-        description: "Detach the current tmux client",
-        usage: "/exit",
-    },
-];
+pub const MERGED_COMMANDS: &[SlashCommand] = &[SlashCommand {
+    kind: CommandKind::List,
+    group: CommandGroup::Workspace,
+    name: "list",
+    aliases: &["ls"],
+    description: "List tmux sessions",
+    usage: "/list",
+}];
 
 pub const SECRET_COMMANDS: &[SlashCommand] = &[
     SlashCommand {
@@ -730,8 +815,8 @@ mod tests {
     }
 
     #[test]
-    fn registry_has_nine_grouped_commands_and_merged_commands_parse_and_complete() {
-        assert_eq!(registry().len(), 9);
+    fn registry_surfaces_zero_memorization_commands_and_merged_list_completes() {
+        assert_eq!(registry().len(), 19);
         assert_eq!(
             registry()
                 .iter()
@@ -739,14 +824,44 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![
                 (CommandKind::Resume, CommandGroup::Workspace),
+                (CommandKind::New, CommandGroup::Workspace),
+                (CommandKind::Window, CommandGroup::Workspace),
                 (CommandKind::Rename, CommandGroup::Workspace),
                 (CommandKind::Kill, CommandGroup::Workspace),
-                (CommandKind::Split, CommandGroup::Workspace),
+                (CommandKind::Snapshot, CommandGroup::Workspace),
                 (CommandKind::Pane, CommandGroup::Studio),
-                (CommandKind::Config, CommandGroup::Studio),
+                (CommandKind::Split, CommandGroup::Studio),
+                (CommandKind::Layout, CommandGroup::Studio),
+                (CommandKind::Expose, CommandGroup::Studio),
+                (CommandKind::Buffers, CommandGroup::Studio),
+                (CommandKind::Popup, CommandGroup::Studio),
                 (CommandKind::Theme, CommandGroup::Studio),
+                (CommandKind::Config, CommandGroup::Studio),
+                (CommandKind::Clients, CommandGroup::System),
                 (CommandKind::Help, CommandGroup::System),
+                (CommandKind::Exit, CommandGroup::System),
+                (CommandKind::KillServer, CommandGroup::System),
                 (CommandKind::Quit, CommandGroup::System),
+            ]
+        );
+        // Verify groups appear in strictly contiguous blocks (Workspace -> Studio -> System).
+        let mut seen_groups = Vec::new();
+        for cmd in registry() {
+            if seen_groups.last() != Some(&cmd.group) {
+                assert!(
+                    !seen_groups.contains(&cmd.group),
+                    "command group {:?} is not contiguous in COMMANDS",
+                    cmd.group
+                );
+                seen_groups.push(cmd.group);
+            }
+        }
+        assert_eq!(
+            seen_groups,
+            vec![
+                CommandGroup::Workspace,
+                CommandGroup::Studio,
+                CommandGroup::System,
             ]
         );
         assert_eq!(CommandGroup::Workspace.label(), "workspace");
@@ -765,7 +880,42 @@ mod tests {
         assert_eq!(parse("/close").unwrap().command, CommandKind::Kill);
         assert_eq!(parse("/rm").unwrap().command, CommandKind::Kill);
 
-        // Merged commands remain executable & searchable on non-empty queries, hidden on bare `/`.
+        // New controller commands & aliases parse cleanly.
+        for (cmd, expected) in [
+            ("/layout", CommandKind::Layout),
+            ("/resize", CommandKind::Layout),
+            ("/arrange", CommandKind::Layout),
+            ("/l", CommandKind::Layout),
+            ("/expose", CommandKind::Expose),
+            ("/mission", CommandKind::Expose),
+            ("/wall", CommandKind::Expose),
+            ("/grid", CommandKind::Expose),
+            ("/overview", CommandKind::Expose),
+            ("/clients", CommandKind::Clients),
+            ("/client", CommandKind::Clients),
+            ("/who", CommandKind::Clients),
+            ("/buffers", CommandKind::Buffers),
+            ("/buffer", CommandKind::Buffers),
+            ("/clip", CommandKind::Buffers),
+            ("/paste", CommandKind::Buffers),
+            ("/copy", CommandKind::Buffers),
+            ("/snapshot", CommandKind::Snapshot),
+            ("/save", CommandKind::Snapshot),
+            ("/restore", CommandKind::Snapshot),
+            ("/template", CommandKind::Snapshot),
+            ("/workspace", CommandKind::Snapshot),
+            ("/popup", CommandKind::Popup),
+            ("/scratch", CommandKind::Popup),
+            ("/float", CommandKind::Popup),
+            ("/kill-server", CommandKind::KillServer),
+            ("/shutdown", CommandKind::KillServer),
+        ] {
+            assert_eq!(parse(cmd).unwrap().command, expected, "{cmd}");
+            assert!(!description_for(expected, crate::ui::Language::En).is_empty());
+            assert!(!description_for(expected, crate::ui::Language::Zh).is_empty());
+        }
+
+        // Core commands surfaced on bare `/`; `/list` remains searchable via MERGED_COMMANDS.
         assert_eq!(parse("/new demo").unwrap().command, CommandKind::New);
         assert_eq!(parse("/n").unwrap().command, CommandKind::New);
         assert_eq!(parse("/window").unwrap().command, CommandKind::Window);
@@ -777,11 +927,27 @@ mod tests {
 
         let mut matcher = FuzzyMatcher::new();
         let bare = filter_commands("", &mut matcher);
-        assert_eq!(bare.len(), 9);
+        assert_eq!(bare.len(), registry().len());
         assert!(
             bare.iter()
                 .all(|row| !MERGED_COMMANDS.contains(row.command))
         );
+        for surfaced in [
+            CommandKind::Exit,
+            CommandKind::New,
+            CommandKind::Window,
+            CommandKind::Pane,
+            CommandKind::Layout,
+            CommandKind::Clients,
+            CommandKind::Buffers,
+            CommandKind::Snapshot,
+            CommandKind::Popup,
+        ] {
+            assert!(
+                bare.iter().any(|row| row.command.kind == surfaced),
+                "expected {surfaced:?} on bare / palette"
+            );
+        }
 
         assert!(
             filter_commands("n", &mut matcher)
@@ -845,7 +1011,7 @@ mod tests {
         }
 
         let mut matcher = FuzzyMatcher::new();
-        assert_eq!(filter_commands("", &mut matcher).len(), 9);
+        assert_eq!(filter_commands("", &mut matcher).len(), registry().len());
         assert!(
             filter_commands("c", &mut matcher)
                 .iter()
@@ -854,6 +1020,10 @@ mod tests {
         let co = filter_commands("co", &mut matcher);
         assert_eq!(co[0].command.kind, CommandKind::Config);
         assert!(co.iter().any(|row| row.command.kind == CommandKind::Theme));
+        assert!(
+            co.iter()
+                .any(|row| row.command.kind == CommandKind::Buffers)
+        );
         assert!(co.iter().any(|row| row.command.name == "codex"));
         assert!(co.iter().any(|row| row.command.name == "compact"));
         assert!(co.iter().any(|row| row.command.name == "cost"));
@@ -863,8 +1033,10 @@ mod tests {
         assert_eq!(att[0].command.kind, CommandKind::Resume);
 
         let cl = filter_commands("cl", &mut matcher);
-        assert_eq!(cl[0].command.kind, CommandKind::Kill);
-        assert_eq!(cl[0].alias, Some("close"));
+        assert_eq!(cl[0].command.kind, CommandKind::Clients);
+        assert_eq!(cl[0].alias, None);
+        assert!(cl.iter().any(|r| r.command.kind == CommandKind::Kill));
+        assert!(cl.iter().any(|r| r.command.kind == CommandKind::Buffers));
         assert!(cl.iter().any(|r| r.command.name == "claude"));
 
         assert_eq!(

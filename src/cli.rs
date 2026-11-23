@@ -16,7 +16,6 @@ use std::{
     time::{Duration, Instant},
 };
 
-const EMBLEM_TICK: Duration = Duration::from_millis(85);
 const KEYBIND: &str = r#"bind-key j run-shell 'tmux display-popup -E -w 80% -h 70% -c #{q:client_name} "JUSTMUX_CLIENT=#{q:client_name} JUSTMUX_PANE=#{q:pane_id} JUSTMUX_POPUP=1 jm"'"#;
 
 #[derive(Debug, Parser)]
@@ -195,6 +194,26 @@ fn doctor(tmux: &TmuxClient, loaded: &LoadedConfig) -> Result<()> {
         loaded.config.language.as_str(),
         loaded.config.language.display_name(loaded.config.ascii)
     );
+    let popup_keybind_label = match crate::tmux_conf::resolve_tmux_conf_path() {
+        Some(path) => match crate::tmux_conf::is_installed(&path) {
+            Ok(true) => format!("enabled ({})", path.display()),
+            Ok(false) => format!("disabled ({})", path.display()),
+            Err(err) => format!("error checking {} ({err})", path.display()),
+        },
+        None => "disabled (no tmux.conf path)".to_owned(),
+    };
+    println!("Popup keybind: {popup_keybind_label}");
+    let comfort_label = match crate::tmux_conf::resolve_tmux_conf_path() {
+        Some(path) => match crate::tmux_conf::read_comfort_block(&path) {
+            Ok(opts) if opts.is_any_enabled() => {
+                format!("enabled ({}/5 in {})", opts.enabled_count(), path.display())
+            }
+            Ok(_) => format!("disabled ({})", path.display()),
+            Err(err) => format!("error checking {} ({err})", path.display()),
+        },
+        None => "disabled (no tmux.conf path)".to_owned(),
+    };
+    println!("Tmux comfort: {comfort_label}");
     Ok(())
 }
 
@@ -268,7 +287,8 @@ fn run_tui(tmux: &TmuxClient, options: AppOptions, loaded: LoadedConfig) -> Resu
         TerminalOptions { viewport },
     )
     .context("could not initialise terminal")?;
-    let mut app = App::with_config(tmux, options, loaded.config, loaded.path);
+    let mut app = App::with_config(tmux, options, loaded.config, loaded.path)
+        .with_tmux_conf_path(crate::tmux_conf::resolve_tmux_conf_path());
     if invoked_as_long_alias(
         std::env::args_os().next().as_deref(),
         std::env::var("JUSTMUX_INVOKED_AS").ok().as_deref(),
@@ -284,6 +304,9 @@ fn run_tui(tmux: &TmuxClient, options: AppOptions, loaded: LoadedConfig) -> Resu
             return match exit {
                 Exit::Quit | Exit::Switched => guard.restore(),
                 Exit::Attach(target) => exec_tmux(guard, tmux.attach_command(&target)),
+                Exit::AttachReadOnly(target) => {
+                    exec_tmux(guard, tmux.attach_command_readonly(&target))
+                }
                 Exit::Detach(client) => {
                     guard.restore()?;
                     tmux.detach_client(&client)
@@ -295,25 +318,34 @@ fn run_tui(tmux: &TmuxClient, options: AppOptions, loaded: LoadedConfig) -> Resu
             .draw(|frame| app.render(frame))
             .context("could not draw JustMux")?;
 
-        // Render once per input batch, without polling while idle. Bursts of
-        // arrow-key repeats or pasted text therefore don't emit a frame each.
+        // Render once per input batch, without polling while idle in Inline mode.
+        // Bursts of arrow-key repeats, mouse moves, or pasted text never emit
+        // redundant frames; unchanged tmux capture hashes skip redraws entirely.
         let mut changed = false;
         let mut resized = false;
-        let tick_deadline = app.should_animate().then(|| Instant::now() + EMBLEM_TICK);
+        let mut tick_deadline = app
+            .next_poll_interval(settings.mode)
+            .map(|interval| Instant::now() + interval);
         while !changed {
             if let Some(deadline) = tick_deadline {
                 let remaining = deadline.saturating_duration_since(Instant::now());
                 if remaining.is_zero() || !event::poll(remaining)? {
-                    app.tick_animation();
-                    break;
+                    if app.tick_live_frame(settings.mode) {
+                        break;
+                    }
+                    tick_deadline = app
+                        .next_poll_interval(settings.mode)
+                        .map(|interval| Instant::now() + interval);
+                    continue;
                 }
             }
             let first = event::read().context("could not read terminal input")?;
             let mut current = first;
             for index in 0..64 {
                 resized |= matches!(current, Event::Resize(_, _));
-                if redraw_event(&current) {
-                    app.handle_event(current);
+                if redraw_event(&current)
+                    && (matches!(current, Event::Resize(_, _)) || app.handle_event(current))
+                {
                     changed = true;
                 }
                 if index == 63 || app.exit().is_some() || !event::poll(Duration::ZERO)? {
@@ -343,7 +375,10 @@ fn redraw_event(event: &Event) -> bool {
         Event::Paste(_) | Event::Resize(_, _) => true,
         Event::Mouse(mouse) => matches!(
             mouse.kind,
-            MouseEventKind::Down(MouseButton::Left)
+            MouseEventKind::Down(MouseButton::Left | MouseButton::Right | MouseButton::Middle)
+                | MouseEventKind::Up(MouseButton::Left)
+                | MouseEventKind::Drag(MouseButton::Left)
+                | MouseEventKind::Moved
                 | MouseEventKind::ScrollUp
                 | MouseEventKind::ScrollDown
         ),
@@ -420,16 +455,40 @@ mod tests {
             row: 3,
             modifiers: KeyModifiers::NONE,
         })));
-        assert!(!redraw_event(&Event::Mouse(MouseEvent {
+        assert!(redraw_event(&Event::Mouse(MouseEvent {
             kind: MouseEventKind::Moved,
             column: 2,
             row: 3,
             modifiers: KeyModifiers::NONE,
         })));
-        assert!(!redraw_event(&Event::Mouse(MouseEvent {
+        assert!(redraw_event(&Event::Mouse(MouseEvent {
             kind: MouseEventKind::Down(MouseButton::Right),
             column: 2,
             row: 3,
+            modifiers: KeyModifiers::NONE,
+        })));
+        assert!(redraw_event(&Event::Mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Middle),
+            column: 2,
+            row: 3,
+            modifiers: KeyModifiers::NONE,
+        })));
+        assert!(redraw_event(&Event::Mouse(MouseEvent {
+            kind: MouseEventKind::Drag(MouseButton::Left),
+            column: 4,
+            row: 5,
+            modifiers: KeyModifiers::NONE,
+        })));
+        assert!(redraw_event(&Event::Mouse(MouseEvent {
+            kind: MouseEventKind::Up(MouseButton::Left),
+            column: 4,
+            row: 5,
+            modifiers: KeyModifiers::NONE,
+        })));
+        assert!(!redraw_event(&Event::Mouse(MouseEvent {
+            kind: MouseEventKind::Up(MouseButton::Right),
+            column: 4,
+            row: 5,
             modifiers: KeyModifiers::NONE,
         })));
     }

@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 #[cfg(test)]
 use crossterm::event::{KeyCode, KeyEvent};
@@ -361,13 +361,10 @@ impl ResumePicker {
 
     pub(super) fn move_column(&mut self, delta: isize) -> bool {
         let total = self.total_columns();
-        if total == 0 {
+        if total <= 1 || delta == 0 {
             return false;
         }
-        let next = self
-            .selected_column
-            .saturating_add_signed(delta)
-            .min(total.saturating_sub(1));
+        let next = super::wrap_step(self.selected_column, total, delta);
         self.select_column_index(next)
     }
 
@@ -414,13 +411,10 @@ impl ResumePicker {
         };
         let win_count = column.windows.len();
         if !self.create_actions {
-            if win_count == 0 {
+            if win_count <= 1 || delta == 0 {
                 return false;
             }
-            let next = self
-                .selected_row
-                .saturating_add_signed(delta)
-                .min(win_count.saturating_sub(1));
+            let next = super::wrap_step(self.selected_row, win_count, delta);
             if next == self.selected_row {
                 return false;
             }
@@ -432,56 +426,30 @@ impl ResumePicker {
             return false;
         }
         let show_create = self.show_create();
-        let before = (self.row_focus, self.selected_row);
-        let steps = delta.unsigned_abs();
-        for _ in 0..steps {
-            if delta < 0 {
-                match self.row_focus {
-                    RowFocus::SessionHeader => break,
-                    RowFocus::Window => {
-                        if self.selected_row > 0 {
-                            self.selected_row -= 1;
-                        } else {
-                            self.row_focus = RowFocus::SessionHeader;
-                        }
-                    }
-                    RowFocus::NewWindow => {
-                        if win_count > 0 {
-                            self.row_focus = RowFocus::Window;
-                            self.selected_row = win_count - 1;
-                        } else {
-                            self.row_focus = RowFocus::SessionHeader;
-                            self.selected_row = 0;
-                        }
-                    }
-                }
-            } else {
-                match self.row_focus {
-                    RowFocus::SessionHeader => {
-                        if win_count > 0 {
-                            self.row_focus = RowFocus::Window;
-                            self.selected_row = 0;
-                        } else if show_create {
-                            self.row_focus = RowFocus::NewWindow;
-                            self.selected_row = 0;
-                        } else {
-                            break;
-                        }
-                    }
-                    RowFocus::Window => {
-                        if self.selected_row + 1 < win_count {
-                            self.selected_row += 1;
-                        } else if show_create {
-                            self.row_focus = RowFocus::NewWindow;
-                        } else {
-                            break;
-                        }
-                    }
-                    RowFocus::NewWindow => break,
-                }
-            }
+        let total_stops = 1 + win_count + usize::from(show_create);
+        if total_stops <= 1 {
+            return false;
         }
-        (self.row_focus, self.selected_row) != before
+        let current_stop = match self.row_focus {
+            RowFocus::SessionHeader => 0,
+            RowFocus::Window => 1 + self.selected_row.min(win_count.saturating_sub(1)),
+            RowFocus::NewWindow => 1 + win_count,
+        };
+        let next_stop = super::wrap_step(current_stop, total_stops, delta);
+        if next_stop == current_stop {
+            return false;
+        }
+        if next_stop == 0 {
+            self.row_focus = RowFocus::SessionHeader;
+            self.selected_row = 0;
+        } else if next_stop <= win_count {
+            self.row_focus = RowFocus::Window;
+            self.selected_row = next_stop - 1;
+        } else {
+            self.row_focus = RowFocus::NewWindow;
+            self.selected_row = win_count;
+        }
+        true
     }
 
     pub(super) fn select_session(&mut self, session_id: &SessionId) -> bool {
@@ -535,6 +503,29 @@ impl ResumePicker {
                 self.row_focus = RowFocus::Window;
                 false
             }
+        }
+    }
+
+    pub(super) fn resolve_hit(&self, target: &MatrixHitTarget) -> Option<MatrixSelection<'_>> {
+        match target {
+            MatrixHitTarget::Session(col) => {
+                let visible_col = self.visible.get(*col)?;
+                let column = self.columns.get(visible_col.index)?;
+                Some(MatrixSelection::Session(&column.session))
+            }
+            MatrixHitTarget::Window { col, row } => {
+                let visible_col = self.visible.get(*col)?;
+                let column = self.columns.get(visible_col.index)?;
+                let vis_win = visible_col.windows.get(*row)?;
+                let window = column.windows.get(vis_win.index)?;
+                Some(MatrixSelection::Window(&column.session, window))
+            }
+            MatrixHitTarget::NewWindow(col) => {
+                let visible_col = self.visible.get(*col)?;
+                let column = self.columns.get(visible_col.index)?;
+                Some(MatrixSelection::NewWindow(&column.session))
+            }
+            MatrixHitTarget::NewSession => Some(MatrixSelection::NewSession),
         }
     }
 
@@ -827,12 +818,33 @@ impl ResumePicker {
         }
     }
 
+    #[cfg(test)]
     pub(super) fn render_matrix_body(
         &mut self,
         frame: &mut Frame<'_>,
         body: Rect,
         current_session: Option<&SessionId>,
         highlight_session_header: bool,
+        theme: Theme,
+    ) -> Vec<MatrixHit> {
+        let empty_dead = HashSet::new();
+        self.render_matrix_body_with_dead_windows(
+            frame,
+            body,
+            current_session,
+            highlight_session_header,
+            &empty_dead,
+            theme,
+        )
+    }
+
+    pub(super) fn render_matrix_body_with_dead_windows(
+        &mut self,
+        frame: &mut Frame<'_>,
+        body: Rect,
+        current_session: Option<&SessionId>,
+        highlight_session_header: bool,
+        dead_windows: &HashSet<WindowId>,
         theme: Theme,
     ) -> Vec<MatrixHit> {
         let accent = theme.style(theme.accent).add_modifier(Modifier::BOLD);
@@ -1032,10 +1044,24 @@ impl ResumePicker {
                     (false, false) => Span::styled(det_label, muted),
                     (false, true) => Span::styled(det_ascii, muted),
                 };
-                lines.push(Line::from(vec![
+                let mut sub_spans = vec![
                     Span::styled(format!("{}w ", column.session.windows), muted),
                     status_span,
-                ]));
+                ];
+                if column.session.attached > 1 {
+                    let multi_spans = crate::ui::window_status_badge_spans(
+                        crate::ui::WindowStatusFlags {
+                            multi_clients: column.session.attached,
+                            ..Default::default()
+                        },
+                        theme,
+                    );
+                    if !multi_spans.is_empty() {
+                        sub_spans.push(Span::raw(" "));
+                        sub_spans.extend(multi_spans);
+                    }
+                }
+                lines.push(Line::from(sub_spans));
             }
             let offset = if focused { first_row } else { 0 };
             let mut rendered_rows = 0usize;
@@ -1098,6 +1124,35 @@ impl ResumePicker {
                     if used + badge.width() <= usize::from(area.width) {
                         let badge_style = if row_is_reversed { style } else { muted };
                         spans.push(Span::styled(badge, badge_style));
+                    }
+                }
+                let status_badges = crate::ui::window_status_badge_spans(
+                    crate::ui::WindowStatusFlags {
+                        zoomed: window.zoomed,
+                        synchronized: window.synchronized,
+                        activity: window.activity_flag,
+                        bell: window.bell_flag,
+                        silence: window.silence_flag,
+                        dead: dead_windows.contains(&window.id),
+                        multi_clients: 0,
+                    },
+                    theme,
+                );
+                if !status_badges.is_empty() {
+                    let badge_w: usize = 1 + status_badges
+                        .iter()
+                        .map(|s| s.content.width())
+                        .sum::<usize>();
+                    let used: usize = spans.iter().map(|span| span.content.width()).sum();
+                    if used + badge_w <= usize::from(area.width) {
+                        spans.push(Span::styled(" ", style));
+                        for badge_span in status_badges {
+                            if row_is_reversed {
+                                spans.push(Span::styled(badge_span.content, style));
+                            } else {
+                                spans.push(badge_span);
+                            }
+                        }
                     }
                 }
                 lines.push(Line::from(spans));
@@ -1281,6 +1336,14 @@ mod tests {
                     },
                     active: index == 0,
                     panes: 1,
+                    zoomed: false,
+                    synchronized: false,
+                    activity_flag: false,
+                    bell_flag: false,
+                    silence_flag: false,
+                    layout: String::new(),
+                    monitor_activity: false,
+                    monitor_silence: 0,
                 })
             })
             .collect();
@@ -1380,6 +1443,14 @@ mod tests {
             name: name.into(),
             active,
             panes,
+            zoomed: false,
+            synchronized: false,
+            activity_flag: false,
+            bell_flag: false,
+            silence_flag: false,
+            layout: String::new(),
+            monitor_activity: false,
+            monitor_silence: 0,
         }
     }
 
@@ -1849,18 +1920,36 @@ mod tests {
         assert!(!picker.select_visible_cell(0, None));
 
         picker.replace(vec![alpha.clone(), beta.clone()], windows, &mut matcher);
-        assert!(!picker.move_column(-1));
+        // Columns wrap circularly in both directions (alpha <-> beta).
+        assert!(picker.move_column(-1));
+        assert_eq!(picker.selected_session().map(|s| &s.id), Some(&beta.id));
+        assert!(picker.move_column(1));
+        assert_eq!(picker.selected_session().map(|s| &s.id), Some(&alpha.id));
         assert!(picker.move_column(1));
         assert_eq!(picker.selected_session().map(|s| &s.id), Some(&beta.id));
-        assert!(!picker.move_column(1));
 
         assert!(picker.cycle_column());
         assert_eq!(picker.selected_session().map(|s| &s.id), Some(&alpha.id));
 
-        assert!(!picker.move_row(-1));
-        assert!(picker.move_row(1));
-        assert!(!picker.move_row(1));
+        // Rows wrap circularly in both directions (row 0 <-> row 1).
+        assert!(picker.move_row(-1));
         assert_eq!(picker.selected_row, 1);
+        assert!(picker.move_row(1));
+        assert_eq!(picker.selected_row, 0);
+        assert!(picker.move_row(1));
+        assert_eq!(picker.selected_row, 1);
+
+        // Single-column / single-window still returns false without pointless redraws.
+        let mut single = ResumePicker::default();
+        single.replace(
+            vec![alpha.clone()],
+            vec![make_window("@0", &alpha, 0, "editor", true, 1)],
+            &mut matcher,
+        );
+        assert!(!single.move_column(1));
+        assert!(!single.move_column(-1));
+        assert!(!single.move_row(1));
+        assert!(!single.move_row(-1));
 
         let missing = SessionId::new("$999").expect("missing id");
         assert!(!picker.select_session(&missing));
@@ -2010,15 +2099,18 @@ mod tests {
         );
         assert!(!picker.is_session_selected());
 
-        // ↑ from row 0 enters SessionHeader; preview_window falls back to active window.
+        // ↑ from row 0 enters SessionHeader; ↑ again wraps to + New window, ↓ wraps back to SessionHeader.
         assert!(picker.move_row(-1));
-        assert!(!picker.move_row(-1));
         assert!(picker.is_session_selected());
         assert_eq!(picker.selection(), Some(MatrixSelection::Session(&alpha)));
         assert_eq!(picker.selected_window(), None);
         assert_eq!(picker.preview_window(), Some((&alpha, &w0)));
+        assert!(picker.move_row(-1));
+        assert_eq!(picker.selection(), Some(MatrixSelection::NewWindow(&alpha)));
+        assert!(picker.move_row(1));
+        assert_eq!(picker.selection(), Some(MatrixSelection::Session(&alpha)));
 
-        // ↓ from SessionHeader goes to row 0, then row 1, then + New window.
+        // ↓ from SessionHeader goes to row 0, then row 1, then + New window; ↓ again wraps to SessionHeader.
         assert!(picker.move_row(1));
         assert_eq!(
             picker.selection(),
@@ -2030,9 +2122,12 @@ mod tests {
             Some(MatrixSelection::Window(&alpha, &w1))
         );
         assert!(picker.move_row(1));
-        assert!(!picker.move_row(1));
         assert_eq!(picker.selection(), Some(MatrixSelection::NewWindow(&alpha)));
         assert_eq!(picker.preview_window(), Some((&alpha, &w0)));
+        assert!(picker.move_row(1));
+        assert_eq!(picker.selection(), Some(MatrixSelection::Session(&alpha)));
+        assert!(picker.move_row(-1));
+        assert_eq!(picker.selection(), Some(MatrixSelection::NewWindow(&alpha)));
 
         // sync preserves RowFocus::NewWindow when filter & session remain unchanged.
         picker.sync(
@@ -2050,17 +2145,23 @@ mod tests {
             Some(MatrixSelection::Window(&alpha, &w1))
         );
 
-        // → traverses alpha -> beta -> + New session, and cycle_column wraps back to alpha.
+        // → traverses alpha -> beta -> + New session -> wraps to alpha; ← from alpha wraps to + New session.
         assert!(picker.move_column(1));
         assert_eq!(
             picker.selection(),
             Some(MatrixSelection::Window(&beta, &w2))
         );
         assert!(picker.move_column(1));
-        assert!(!picker.move_column(1));
         assert_eq!(picker.selection(), Some(MatrixSelection::NewSession));
         assert_eq!(picker.selected_session(), None);
         assert_eq!(picker.preview_window(), None);
+        assert!(picker.move_column(1));
+        assert_eq!(
+            picker.selection(),
+            Some(MatrixSelection::Window(&alpha, &w0))
+        );
+        assert!(picker.move_column(-1));
+        assert_eq!(picker.selection(), Some(MatrixSelection::NewSession));
         assert!(picker.cycle_column());
         assert_eq!(
             picker.selection(),
@@ -2144,5 +2245,66 @@ mod tests {
             h.target,
             MatrixHitTarget::NewWindow(_) | MatrixHitTarget::NewSession
         )));
+    }
+
+    #[test]
+    fn matrix_renders_zoom_sync_activity_bell_dead_and_multiclient_badges() {
+        let sess = make_session("$0", "ops", 3, 2);
+        let mut w0 = make_window("@0", &sess, 0, "main", true, 2);
+        w0.zoomed = true;
+        w0.synchronized = true;
+        let mut w1 = make_window("@1", &sess, 1, "logs", false, 1);
+        w1.bell_flag = true;
+        let mut w2 = make_window("@2", &sess, 2, "worker", false, 1);
+        w2.activity_flag = true;
+
+        let mut picker = ResumePicker::default();
+        let mut matcher = FuzzyMatcher::new();
+        picker.replace(vec![sess.clone()], vec![w0, w1, w2], &mut matcher);
+
+        let dead_windows: HashSet<WindowId> =
+            [WindowId::new("@2").expect("wid")].into_iter().collect();
+        let mut term = Terminal::new(TestBackend::new(60, 10)).expect("term");
+        term.draw(|frame| {
+            picker.render_matrix_body_with_dead_windows(
+                frame,
+                frame.area(),
+                Some(&sess.id),
+                false,
+                &dead_windows,
+                Theme::default(),
+            );
+        })
+        .expect("draw badges");
+        let screen = term.backend().to_string();
+        assert!(screen.contains("👥 2"), "{screen}");
+        assert!(screen.contains("⛶"), "{screen}");
+        assert!(screen.contains("⚡SYNC"), "{screen}");
+        assert!(screen.contains("🔔"), "{screen}");
+        assert!(screen.contains("●"), "{screen}");
+        assert!(screen.contains("✕"), "{screen}");
+
+        let ascii_theme = Theme {
+            ascii: true,
+            ..Theme::default()
+        };
+        term.draw(|frame| {
+            picker.render_matrix_body_with_dead_windows(
+                frame,
+                frame.area(),
+                Some(&sess.id),
+                false,
+                &dead_windows,
+                ascii_theme,
+            );
+        })
+        .expect("draw ascii badges");
+        let ascii_screen = term.backend().to_string();
+        assert!(ascii_screen.is_ascii(), "{ascii_screen}");
+        assert!(ascii_screen.contains("2c"), "{ascii_screen}");
+        assert!(ascii_screen.contains("[Z]"), "{ascii_screen}");
+        assert!(ascii_screen.contains("[!SYNC]"), "{ascii_screen}");
+        assert!(ascii_screen.contains("[!]"), "{ascii_screen}");
+        assert!(ascii_screen.contains("[X]"), "{ascii_screen}");
     }
 }

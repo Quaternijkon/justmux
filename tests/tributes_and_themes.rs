@@ -1,6 +1,6 @@
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -43,6 +43,19 @@ impl PrivateServer {
         let client =
             TmuxClient::new(SocketSpec::Name(socket.clone())).with_config_file("/dev/null");
         Self { socket, client }
+    }
+
+    fn tmux(&self, args: &[&str]) -> std::process::Output {
+        Command::new("tmux")
+            .arg("-L")
+            .arg(&self.socket)
+            .arg("-f")
+            .arg("/dev/null")
+            .args(args)
+            .env_remove("TMUX")
+            .env_remove("TMUX_PANE")
+            .output()
+            .expect("tmux executable")
     }
 }
 
@@ -90,23 +103,59 @@ fn render_app(app: &mut App<'_>, width: u16, height: u16) -> Terminal<TestBacken
 
 #[test]
 fn inline_popup_at_100x16_keeps_quit_visible_after_10_down_presses() {
-    assert_eq!(commands::registry().len(), 9);
-    assert_eq!(
-        commands::registry().last().map(|cmd| cmd.kind),
-        Some(CommandKind::Quit)
+    let reg = commands::registry();
+    assert_eq!(reg.len(), 19);
+    assert_eq!(reg.first().map(|cmd| cmd.kind), Some(CommandKind::Resume));
+    assert_eq!(reg.get(9).map(|cmd| cmd.kind), Some(CommandKind::Expose));
+    assert_eq!(reg.last().map(|cmd| cmd.kind), Some(CommandKind::Quit));
+    // Verify contiguous grouped blocks: Workspace [0..6], Studio [6..14], System [14..19].
+    assert!(
+        reg[..6]
+            .iter()
+            .all(|c| c.group == commands::CommandGroup::Workspace)
+    );
+    assert!(
+        reg[6..14]
+            .iter()
+            .all(|c| c.group == commands::CommandGroup::Studio)
+    );
+    assert!(
+        reg[14..]
+            .iter()
+            .all(|c| c.group == commands::CommandGroup::System)
     );
 
     let tmux = offline_tmux();
     let mut app = App::new(&tmux, AppOptions::default());
     type_text(&mut app, "/");
-    for _ in 0..10 {
+
+    // Pressing `Up` once from index 0 wraps immediately to the last command (`/quit`).
+    key(&mut app, KeyCode::Up);
+    let wrapped_up = render_app(&mut app, 100, 16).backend().to_string();
+    assert!(wrapped_up.contains("/theme"), "{wrapped_up}");
+    assert!(wrapped_up.contains("/config"), "{wrapped_up}");
+    assert!(wrapped_up.contains("/kill-server"), "{wrapped_up}");
+    assert!(wrapped_up.contains("/quit"), "{wrapped_up}");
+
+    // One `Down` from `/quit` wraps back to index 0 (`/resume`).
+    key(&mut app, KeyCode::Down);
+    let wrapped_back = render_app(&mut app, 100, 16).backend().to_string();
+    assert!(wrapped_back.contains("/resume"), "{wrapped_back}");
+
+    // 18 `Down` presses from index 0 reach index 18 (`/quit`) with bottom commands visible.
+    for _ in 0..(reg.len() - 1) {
         key(&mut app, KeyCode::Down);
     }
+    let at_quit = render_app(&mut app, 100, 16).backend().to_string();
+    assert!(at_quit.contains("/theme"), "{at_quit}");
+    assert!(at_quit.contains("/config"), "{at_quit}");
+    assert!(at_quit.contains("/kill-server"), "{at_quit}");
+    assert!(at_quit.contains("/quit"), "{at_quit}");
 
-    let terminal = render_app(&mut app, 100, 16);
-    let output = terminal.backend().to_string();
-    assert!(output.contains("/theme"), "{output}");
-    assert!(output.contains("/quit"), "{output}");
+    // One more `Down` (19th) wraps back to index 0 (`/resume`).
+    key(&mut app, KeyCode::Down);
+    let wrapped_to_resume = render_app(&mut app, 100, 16).backend().to_string();
+    assert!(wrapped_to_resume.contains("/resume"), "{wrapped_to_resume}");
 }
 
 #[test]
@@ -114,11 +163,24 @@ fn zero_learning_home_shortcuts_and_bare_command_forgiveness() {
     let tmux = offline_tmux();
     let mut app = App::new(&tmux, AppOptions::default());
 
-    // Down on empty composer opens the `/` palette immediately.
+    // Down on empty composer opens the `/` palette showing top Workspace & Studio commands.
     key(&mut app, KeyCode::Down);
     let output = render_app(&mut app, 80, 16).backend().to_string();
     assert!(output.contains("/resume"), "{output}");
-    assert!(output.contains("/theme"), "{output}");
+    assert!(output.contains("/snapshot"), "{output}");
+    assert!(output.contains("/pane"), "{output}");
+    assert!(output.contains("/split"), "{output}");
+    assert!(output.contains("/layout"), "{output}");
+    assert!(output.contains("/expose"), "{output}");
+    assert!(output.contains("/popup"), "{output}");
+
+    // Pressing `Up` once wraps to the bottom, immediately surfacing System commands.
+    key(&mut app, KeyCode::Up);
+    let wrapped = render_app(&mut app, 80, 16).backend().to_string();
+    assert!(wrapped.contains("/clients"), "{wrapped}");
+    assert!(wrapped.contains("/exit"), "{wrapped}");
+    assert!(wrapped.contains("/kill-server"), "{wrapped}");
+    assert!(wrapped.contains("/quit"), "{wrapped}");
     key(&mut app, KeyCode::Esc);
 
     // `?` on empty composer opens Help immediately (both plain and Shift+? variants).
@@ -305,7 +367,11 @@ fn micro_tributes_execute_and_autocomplete_only_at_two_plus_letters() {
     let mut matcher = FuzzyMatcher::new();
 
     // Hidden on empty `/` and single letter.
-    assert_eq!(commands::filter_commands("", &mut matcher).len(), 9);
+    assert_eq!(commands::registry().len(), 19);
+    assert_eq!(
+        commands::filter_commands("", &mut matcher).len(),
+        commands::registry().len()
+    );
     assert!(
         commands::filter_commands("c", &mut matcher)
             .iter()
@@ -438,7 +504,7 @@ fn split_renders_visual_wireframe_preview_and_rich_picker_shows_badges() {
 }
 
 fn wait_for_pane_text(client: &TmuxClient, target: &Target, needle: &str) {
-    for _ in 0..80 {
+    for _ in 0..200 {
         if client
             .capture_pane(target, 20)
             .ok()
@@ -1483,6 +1549,7 @@ fn spacious_fullscreen_home_shows_active_preview_and_respects_live_preview_flag(
 
     // Unified subview chrome wraps overlay commands inside `◫ JustMux` with lower-right Hydra.
     let ring_row_subview = hydra_top_ring_row(32, 13, &app_on.theme());
+    let ring_row_compact = hydra_top_ring_row(32, 8, &app_on.theme());
     for (cmd, pill, needle) in [
         ("/new", "NEW SESSION", "Session name"),
         ("/theme", "THEME", "Aurora"),
@@ -1498,7 +1565,10 @@ fn spacious_fullscreen_home_shows_active_preview_and_respects_live_preview_flag(
         assert!(screen.contains(pill), "{cmd}: {screen}");
         assert!(screen.contains(needle), "{cmd}: {screen}");
         if cmd != "/vibe" {
-            assert!(screen.contains(&ring_row_subview), "{cmd}: {screen}");
+            assert!(
+                screen.contains(&ring_row_subview) || screen.contains(&ring_row_compact),
+                "{cmd}: {screen}"
+            );
         }
         key(&mut app_on, KeyCode::Esc);
     }
@@ -1647,7 +1717,7 @@ fn emblem_spin_rotates_hydra_and_toggles_via_config() {
     let _ = render_app(&mut app, 120, 32);
     assert!(app.should_animate());
 
-    // Open /config and walk all 10 settings to verify every upper character-art + guide inspector.
+    // Open /config and walk all 11 settings to verify every upper character-art + guide inspector.
     type_text(&mut app, "/config");
     key(&mut app, KeyCode::Enter);
     let config_keys = [
@@ -1661,6 +1731,7 @@ fn emblem_spin_rotates_hydra_and_toggles_via_config() {
         "ascii",
         "no_color",
         "language",
+        "tmux_popup",
     ];
     for (idx, cfg_key) in config_keys.iter().enumerate() {
         let cfg_screen = render_app(&mut app, 120, 32).backend().to_string();
@@ -1673,9 +1744,9 @@ fn emblem_spin_rotates_hydra_and_toggles_via_config() {
         }
     }
 
-    // Move up 4 rows from Row 9 (language) to Row 5 (emblem_mode) and cycle through all 3 modes:
+    // Move up 5 rows from Row 10 (tmux_popup) to Row 5 (emblem_mode) and cycle through all 3 modes:
     // Spin -> InvertedSpin -> Static.
-    for _ in 0..4 {
+    for _ in 0..5 {
         key(&mut app, KeyCode::Up);
     }
     let row5_spin = render_app(&mut app, 120, 32).backend().to_string();
@@ -2389,4 +2460,430 @@ fn split_studio_lazy_preview_captures_beyond_initial_24_windows() {
         screen.contains("__LAZY_25_DONE__"),
         "expected lazy capture for window beyond index 24:\n{screen}"
     );
+}
+
+#[test]
+fn config_tmux_popup_manages_tmux_conf_and_live_private_server() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let cfg_path = dir.path().join("config.toml");
+    let tmux_conf_path = dir.path().join(".tmux.conf");
+    let initial_conf = "set -g mouse on\nset -g history-limit 5000\n";
+    std::fs::write(&tmux_conf_path, initial_conf).expect("seed temp tmux.conf");
+
+    let server = PrivateServer::new();
+    let _session = server
+        .client
+        .new_session("agy-work", Path::new(env!("CARGO_MANIFEST_DIR")))
+        .expect("start private server");
+
+    let mut app = App::with_config(
+        &server.client,
+        AppOptions::default(),
+        Config::default(),
+        Some(cfg_path.clone()),
+    )
+    .with_tmux_conf(
+        Some(tmux_conf_path.clone()),
+        Some(PathBuf::from("/usr/local/bin/jm")),
+    );
+    assert!(!app.config().tmux_popup);
+
+    // Navigate to Row 10 (tmux_popup) in /config and toggle ON.
+    type_text(&mut app, "/config");
+    key(&mut app, KeyCode::Enter);
+    for _ in 0..10 {
+        key(&mut app, KeyCode::Down);
+    }
+    key(&mut app, KeyCode::Char(' '));
+
+    assert!(app.config().tmux_popup);
+    assert!(
+        app.status().contains("Ctrl+b j"),
+        "expected Ctrl+b j feedback in status: {}",
+        app.status()
+    );
+    let installed_conf =
+        std::fs::read_to_string(&tmux_conf_path).expect("read installed tmux.conf");
+    assert!(installed_conf.starts_with(initial_conf), "{installed_conf}");
+    assert!(installed_conf.contains(justmux::tmux_conf::MANAGED_BLOCK_START));
+    assert!(installed_conf.contains("bind-key j run-shell"));
+    assert!(installed_conf.contains("JUSTMUX_POPUP=1"));
+    assert!(installed_conf.contains(justmux::tmux_conf::MANAGED_BLOCK_END));
+
+    // Live private tmux server should now have `prefix j` bound.
+    let live_keys = server.tmux(&["list-keys", "-T", "prefix", "j"]);
+    assert!(
+        live_keys.status.success(),
+        "expected prefix+j bound on live server: {}",
+        String::from_utf8_lossy(&live_keys.stderr)
+    );
+    let live_stdout = String::from_utf8_lossy(&live_keys.stdout);
+    assert!(live_stdout.contains("display-popup -E"), "{live_stdout}");
+    assert!(live_stdout.contains("JUSTMUX_POPUP=1"), "{live_stdout}");
+
+    // A fresh tmux server started with the generated tmux.conf must parse it cleanly.
+    let check_socket = format!("jm-conf-check-{}", std::process::id());
+    struct CheckServerCleanup(String);
+    impl Drop for CheckServerCleanup {
+        fn drop(&mut self) {
+            let _ = Command::new("tmux")
+                .args(["-L", &self.0, "kill-server"])
+                .env_remove("TMUX")
+                .env_remove("TMUX_PANE")
+                .output();
+        }
+    }
+    let _cleanup = CheckServerCleanup(check_socket.clone());
+    let booted = Command::new("tmux")
+        .arg("-L")
+        .arg(&check_socket)
+        .arg("-f")
+        .arg(&tmux_conf_path)
+        .args(["new-session", "-d", "-s", "boot-ok", "sleep 10"])
+        .env_remove("TMUX")
+        .env_remove("TMUX_PANE")
+        .output()
+        .expect("boot fresh tmux server with generated conf");
+    assert!(
+        booted.status.success(),
+        "tmux failed to load generated conf: {}",
+        String::from_utf8_lossy(&booted.stderr)
+    );
+    let fresh_keys = Command::new("tmux")
+        .args(["-L", &check_socket, "list-keys", "-T", "prefix", "j"])
+        .env_remove("TMUX")
+        .env_remove("TMUX_PANE")
+        .output()
+        .expect("list-keys on booted server");
+    assert!(fresh_keys.status.success());
+    assert!(String::from_utf8_lossy(&fresh_keys.stdout).contains("JUSTMUX_POPUP=1"));
+
+    // Save config.toml while enabled and verify round-trip + tmux_conf auto-detection.
+    key(&mut app, KeyCode::Char('s'));
+    let saved_on = config::load(&CliOverrides {
+        config_path: Some(cfg_path.clone()),
+        screen_mode: None,
+        theme: None,
+    })
+    .expect("reload saved config");
+    assert!(saved_on.config.tmux_popup);
+
+    let detected_app = App::with_config(
+        &server.client,
+        AppOptions::default(),
+        Config::default(),
+        None,
+    )
+    .with_tmux_conf(Some(tmux_conf_path.clone()), None);
+    assert!(detected_app.config().tmux_popup);
+
+    // Toggle OFF and verify clean file restoration + live unbind.
+    key(&mut app, KeyCode::Char(' '));
+    assert!(!app.config().tmux_popup);
+    let restored_conf = std::fs::read_to_string(&tmux_conf_path).expect("read restored tmux.conf");
+    assert_eq!(restored_conf, initial_conf);
+    let live_after_unbind = server.tmux(&["list-keys", "-T", "prefix", "j"]);
+    assert!(
+        !live_after_unbind.status.success(),
+        "expected prefix+j unbound on live server: {}",
+        String::from_utf8_lossy(&live_after_unbind.stdout)
+    );
+
+    // Re-enable, replace live `j` with a custom non-JustMux binding, then toggle OFF:
+    // file block is removed, but user's custom live `j` binding is preserved!
+    key(&mut app, KeyCode::Char(' '));
+    assert!(app.config().tmux_popup);
+    let custom_bind = server.tmux(&[
+        "bind-key",
+        "-T",
+        "prefix",
+        "j",
+        "display-message",
+        "custom-user-bind",
+    ]);
+    assert!(custom_bind.status.success());
+    key(&mut app, KeyCode::Char(' '));
+    assert!(!app.config().tmux_popup);
+    assert_eq!(
+        std::fs::read_to_string(&tmux_conf_path).expect("read after custom"),
+        initial_conf
+    );
+    let custom_keys = server.tmux(&["list-keys", "-T", "prefix", "j"]);
+    assert!(custom_keys.status.success());
+    assert!(String::from_utf8_lossy(&custom_keys.stdout).contains("custom-user-bind"));
+}
+
+#[test]
+fn circular_wrap_around_navigation_for_home_palette_mentions_radar_theme_config_and_split() {
+    let highlighted_mention_line = |term: &Terminal<TestBackend>| -> Option<String> {
+        let buf = term.backend().buffer();
+        let area = buf.area;
+        for y in 0..area.height {
+            let line: String = (0..area.width).map(|x| buf[(x, y)].symbol()).collect();
+            let trimmed = line.trim_start();
+            if trimmed.starts_with('@')
+                && (0..area.width).any(|x| {
+                    let cell = &buf[(x, y)];
+                    cell.symbol() == "@"
+                        && (cell.bg != Color::Reset || cell.modifier.contains(Modifier::REVERSED))
+                })
+            {
+                return Some(trimmed.split_whitespace().next().unwrap_or("").to_owned());
+            }
+        }
+        None
+    };
+
+    let server = PrivateServer::new();
+    let cwd = Path::new(env!("CARGO_MANIFEST_DIR"));
+    assert!(
+        server
+            .tmux(&[
+                "new-session",
+                "-d",
+                "-s",
+                "alpha",
+                "-n",
+                "main",
+                "-c",
+                cwd.to_str().expect("cwd"),
+                "sh -c 'sleep 30'",
+            ])
+            .status
+            .success()
+    );
+    assert!(
+        server
+            .tmux(&[
+                "new-window",
+                "-d",
+                "-t",
+                "alpha",
+                "-n",
+                "logs",
+                "-c",
+                cwd.to_str().expect("cwd"),
+                "sh -c 'sleep 30'",
+            ])
+            .status
+            .success()
+    );
+    assert!(
+        server
+            .tmux(&[
+                "new-session",
+                "-d",
+                "-s",
+                "beta",
+                "-n",
+                "core",
+                "-c",
+                cwd.to_str().expect("cwd"),
+                "sh -c 'sleep 30'",
+            ])
+            .status
+            .success()
+    );
+    assert!(
+        server
+            .tmux(&[
+                "new-window",
+                "-d",
+                "-t",
+                "beta",
+                "-n",
+                "api",
+                "-c",
+                cwd.to_str().expect("cwd"),
+                "sh -c 'sleep 30'",
+            ])
+            .status
+            .success()
+    );
+
+    let cfg = Config {
+        inline_height: 8,
+        ..Config::default()
+    };
+    let mut app = App::with_config(&server.client, AppOptions::default(), cfg, None);
+    let _ = render_app(&mut app, 100, 26);
+
+    // 1. Home Matrix column wrap: `Left` from col 0 wraps to `+ New session`, `Right` wraps back.
+    key(&mut app, KeyCode::Left);
+    key(&mut app, KeyCode::Enter);
+    let new_sess_screen = render_app(&mut app, 100, 26).backend().to_string();
+    assert!(
+        new_sess_screen.contains("New session"),
+        "Left from col 0 should wrap to + New session:\n{new_sess_screen}"
+    );
+    key(&mut app, KeyCode::Esc);
+    key(&mut app, KeyCode::Right);
+    let back_col0 = render_app(&mut app, 100, 26).backend().to_string();
+    assert!(back_col0.contains("alpha"), "{back_col0}");
+
+    // Home Matrix row wrap: from Window(0), `Up` -> SessionHeader, `Up` -> wraps to `+ New window`.
+    key(&mut app, KeyCode::Up);
+    key(&mut app, KeyCode::Up);
+    key(&mut app, KeyCode::Enter);
+    let new_win_screen = render_app(&mut app, 100, 26).backend().to_string();
+    assert!(
+        new_win_screen.contains("New window"),
+        "Up from SessionHeader should wrap to + New window:\n{new_win_screen}"
+    );
+    key(&mut app, KeyCode::Esc);
+    // Mouse wheel down from `+ New window` wraps to SessionHeader, then back into `+ New window`.
+    app.handle_event(mouse_event(MouseEventKind::ScrollDown, 10, 18));
+    app.handle_event(mouse_event(MouseEventKind::ScrollUp, 10, 18));
+    key(&mut app, KeyCode::Enter);
+    let wheel_wrapped = render_app(&mut app, 100, 26).backend().to_string();
+    assert!(
+        wheel_wrapped.contains("New window"),
+        "Mouse wheel Up from SessionHeader should wrap back to + New window:\n{wheel_wrapped}"
+    );
+    key(&mut app, KeyCode::Esc);
+
+    // 2. `/` palette wrap with keyboard & mouse wheel.
+    type_text(&mut app, "/");
+    app.handle_event(mouse_event(MouseEventKind::ScrollUp, 10, 10));
+    let pal_up = render_app(&mut app, 100, 18).backend().to_string();
+    assert!(pal_up.contains("/quit"), "{pal_up}");
+    app.handle_event(mouse_event(MouseEventKind::ScrollDown, 10, 10));
+    let pal_down = render_app(&mut app, 100, 18).backend().to_string();
+    assert!(pal_down.contains("/resume"), "{pal_down}");
+    key(&mut app, KeyCode::Esc);
+
+    // 3. `@` mentions wrap with keyboard & mouse wheel (checking highlighted target row).
+    type_text(&mut app, "@");
+    let mentions_0 = highlighted_mention_line(&render_app(&mut app, 100, 24));
+    key(&mut app, KeyCode::Up);
+    let mentions_last = highlighted_mention_line(&render_app(&mut app, 100, 24));
+    assert!(mentions_0.is_some() && mentions_last.is_some());
+    assert_ne!(
+        mentions_0, mentions_last,
+        "Up from index 0 in @ mentions should wrap to last candidate"
+    );
+    key(&mut app, KeyCode::Down);
+    assert_eq!(
+        highlighted_mention_line(&render_app(&mut app, 100, 24)),
+        mentions_0,
+        "Down from last @ mention should wrap back to index 0"
+    );
+    app.handle_event(mouse_event(MouseEventKind::ScrollUp, 10, 10));
+    assert_eq!(
+        highlighted_mention_line(&render_app(&mut app, 100, 24)),
+        mentions_last
+    );
+    app.handle_event(mouse_event(MouseEventKind::ScrollDown, 10, 10));
+    assert_eq!(
+        highlighted_mention_line(&render_app(&mut app, 100, 24)),
+        mentions_0
+    );
+    key(&mut app, KeyCode::Esc);
+
+    // 4. Live Radar (`Shift+Tab`) wraps across sessions on keyboard & mouse wheel.
+    key(&mut app, KeyCode::BackTab);
+    let radar_0 = render_app(&mut app, 100, 24).backend().to_string();
+    key(&mut app, KeyCode::Up);
+    let radar_1 = render_app(&mut app, 100, 24).backend().to_string();
+    assert_ne!(
+        radar_0, radar_1,
+        "Up in Live Radar should wrap to last session"
+    );
+    key(&mut app, KeyCode::Down);
+    assert_eq!(render_app(&mut app, 100, 24).backend().to_string(), radar_0);
+    app.handle_event(mouse_event(MouseEventKind::ScrollUp, 10, 12));
+    assert_eq!(render_app(&mut app, 100, 24).backend().to_string(), radar_1);
+    app.handle_event(mouse_event(MouseEventKind::ScrollDown, 10, 12));
+    assert_eq!(render_app(&mut app, 100, 24).backend().to_string(), radar_0);
+    // LiveRadar -> QuickLaunch -> CommandJump
+    key(&mut app, KeyCode::BackTab);
+    key(&mut app, KeyCode::BackTab);
+
+    // 5. `/theme` picker wraps from first preset <-> last preset via keys & mouse wheel.
+    app.set_theme(Theme::default().with_preset(ThemePreset::AntigravityAurora));
+    type_text(&mut app, "/theme");
+    key(&mut app, KeyCode::Enter);
+    assert_eq!(app.theme().preset, ThemePreset::AntigravityAurora);
+    key(&mut app, KeyCode::Up);
+    assert_eq!(
+        app.theme().preset,
+        *ThemePreset::ALL.last().expect("last theme")
+    );
+    key(&mut app, KeyCode::Down);
+    assert_eq!(app.theme().preset, ThemePreset::AntigravityAurora);
+    app.handle_event(mouse_event(MouseEventKind::ScrollUp, 10, 10));
+    assert_eq!(
+        app.theme().preset,
+        *ThemePreset::ALL.last().expect("last theme")
+    );
+    app.handle_event(mouse_event(MouseEventKind::ScrollDown, 10, 10));
+    assert_eq!(app.theme().preset, ThemePreset::AntigravityAurora);
+    key(&mut app, KeyCode::Esc);
+
+    // 6. `/config` list wraps (`Up`/`Down` + wheel) AND `inline_height` wraps `8 <-> 40`.
+    type_text(&mut app, "/config");
+    key(&mut app, KeyCode::Enter);
+    let cfg_top = render_app(&mut app, 108, 28).backend().to_string();
+    key(&mut app, KeyCode::Up);
+    let cfg_bottom = render_app(&mut app, 108, 28).backend().to_string();
+    assert!(
+        cfg_bottom.contains("live_stream") || cfg_bottom.contains("tmux_reload"),
+        "Up from row 0 in /config should wrap to last item:\n{cfg_bottom}"
+    );
+    key(&mut app, KeyCode::Down);
+    assert_eq!(render_app(&mut app, 108, 28).backend().to_string(), cfg_top);
+    app.handle_event(mouse_event(MouseEventKind::ScrollUp, 10, 10));
+    assert_eq!(
+        render_app(&mut app, 108, 28).backend().to_string(),
+        cfg_bottom
+    );
+    app.handle_event(mouse_event(MouseEventKind::ScrollDown, 10, 10));
+    assert_eq!(render_app(&mut app, 108, 28).backend().to_string(), cfg_top);
+
+    // Move to row 6 (`inline_height`), verify `Left` wraps `8 -> 40` and `Right` wraps `40 -> 8`.
+    for _ in 0..6 {
+        key(&mut app, KeyCode::Down);
+    }
+    assert_eq!(app.config().inline_height, 8);
+    key(&mut app, KeyCode::Left);
+    assert_eq!(app.config().inline_height, 40);
+    key(&mut app, KeyCode::Right);
+    assert_eq!(app.config().inline_height, 8);
+    key(&mut app, KeyCode::Esc);
+
+    // 7. `/split` Studio window list wraps on `Up`/`Down` and mouse wheel.
+    // Move off `+ New window` onto `0* main` (`Down` -> SessionHeader, `Down` -> `0* main`),
+    // open `/split` mode and press `Enter` on `0* main` to enter Split Studio.
+    key(&mut app, KeyCode::Down);
+    key(&mut app, KeyCode::Down);
+    type_text(&mut app, "/split");
+    key(&mut app, KeyCode::Enter);
+    key(&mut app, KeyCode::Enter);
+    key(&mut app, KeyCode::Char('h'));
+    let split_bottom = render_app(&mut app, 112, 28).backend().to_string();
+    assert!(split_bottom.contains("Fill Pane #2"), "{split_bottom}");
+    assert!(split_bottom.contains("› + + New shell"), "{split_bottom}");
+    // Cursor starts on last row (`+ New shell`): `Down` wraps to row 0 (`alpha:0 main`), `Up` wraps back.
+    key(&mut app, KeyCode::Down);
+    let split_top = render_app(&mut app, 112, 28).backend().to_string();
+    assert!(
+        split_top.contains("› ● alpha:0 main"),
+        "Down from last row in Split Studio window list should wrap to row 0:\n{split_top}"
+    );
+    key(&mut app, KeyCode::Up);
+    assert_eq!(
+        render_app(&mut app, 112, 28).backend().to_string(),
+        split_bottom
+    );
+    app.handle_event(mouse_event(MouseEventKind::ScrollDown, 5, 18));
+    assert_eq!(
+        render_app(&mut app, 112, 28).backend().to_string(),
+        split_top
+    );
+    app.handle_event(mouse_event(MouseEventKind::ScrollUp, 5, 18));
+    assert_eq!(
+        render_app(&mut app, 112, 28).backend().to_string(),
+        split_bottom
+    );
+    key(&mut app, KeyCode::Esc);
 }

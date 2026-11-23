@@ -15,16 +15,20 @@
 //! config     TOML configuration loading, validation, precedence, and persistence
 //! fuzzy      fuzzy matching / ranking
 //! tmux       typed adapter over the tmux CLI (the only module that spawns tmux)
+//! tmux_conf  opt-in ~/.tmux.conf managed popup keybind helper
 //! terminal   inline/fullscreen lifecycle, restoration, and exec hand-off to tmux
 //! tributes   celebration cards, micro-tributes, and session badges
 //! ```
 
 pub mod app;
 pub mod cli;
+pub mod clipboard;
 pub mod commands;
 pub mod config;
 pub mod fuzzy;
+pub mod snapshot;
 pub mod terminal;
 pub mod tmux;
+pub mod tmux_conf;
 pub mod tributes;
 pub mod ui;

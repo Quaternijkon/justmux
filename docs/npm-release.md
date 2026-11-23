@@ -162,13 +162,12 @@ configuration, pushes Git commits, or publishes a package. Package names must
 remain available until the first publication; a successful availability check
 does not reserve them.
 
-## Optional GitHub Actions build
+## GitHub Actions build and automated OIDC release
 
-`.github/workflows/npm-release.yml` is optional. It runs only through
-`workflow_dispatch`; pushing code or a tag does not trigger it. The default
-`publish=false` builds and tests on two native runners, then uploads a complete
-distribution artifact. No npm credentials or GitHub Releases are needed for
-this build-only path.
+`.github/workflows/npm-release.yml` runs automatically when a `v*` version tag
+is pushed, and can also be triggered manually via `workflow_dispatch`. Manual
+runs default to `publish=false`, which builds and tests on two native runners
+and uploads a complete distribution artifact without npm credentials.
 
 The runner matrix uses macOS 15 ARM64 and Ubuntu 24.04 x64. Each runner executes
 the Rust tests and actual PTY smoke
@@ -177,20 +176,20 @@ also reject a dynamic ELF interpreter. The build logs record the OS, Rust,
 Node.js, npm, and tmux versions. Runner availability and quotas are governed by
 the GitHub repository/account; the local release path does not require them.
 
-For example, after pushing the workflow to the repository, a build-only run is:
+For example, after pushing the workflow to the repository, a manual build-only
+run is:
 
 ```sh
 gh workflow run npm-release.yml --repo Quaternijkon/justmux -f publish=false
 ```
 
 This command is an explicit external action, not part of local preparation.
-The workflow has not been exercised on GitHub merely because its YAML has
-been validated locally. The checked-in terminal demo is not overwritten.
+The checked-in terminal demo is not overwritten.
 
-## Optional trusted npm publication from GitHub
+## Trusted npm publication from GitHub
 
-After the initial package publications, configure an npm trusted publisher on
-each of the three current packages. Use these exact values:
+Configure an npm trusted publisher on each of the three current packages. Use
+these exact values:
 
 | npm trusted publisher setting | Value |
 | --- | --- |
@@ -206,15 +205,14 @@ no long-lived npm token in the repository. A new package cannot rely on its
 per-package trusted-publisher configuration before that package exists, so
 bootstrap the first version with a permitted local npm account.
 
-Publishing through this workflow additionally requires explicitly setting
-`publish=true`, selecting the exact `v<Cargo version>` Git tag, and passing the
-`npm` environment's protections. For example, after a reviewed `v0.1.0` tag
-has been pushed:
+Pushing an annotated `v<Cargo version>` tag automatically verifies the matching
+version, builds both platforms, and publishes with npm provenance through OIDC.
+You can also manually trigger a publish on an existing tag:
 
 ```sh
 gh workflow run npm-release.yml --repo Quaternijkon/justmux --ref v0.1.0 -f publish=true
 ```
 
 It builds and verifies the distribution first and uses npm provenance for the
-publication. GitHub publication is optional; the same packages can continue to
-be built, checked, and published locally.
+publication. Local publication remains available as an alternative, but use only
+one publication channel per release version.

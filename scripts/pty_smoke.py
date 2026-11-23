@@ -308,7 +308,7 @@ def inline_terminal(sock):
         p.send("/")
         p.read(.2)
         before = len(p.out)
-        os.write(p.fd, b"\x1b[B" * 10)
+        os.write(p.fd, b"\x1b[B" * 18)
         p.read(.2)
         navigation_bytes = len(p.out) - before
         require("/quit" in p.screen.text(), "inline navigation did not make the selected command visible")
@@ -330,7 +330,7 @@ def inline_terminal(sock):
         p.assert_restored(bracketed_paste=True)
         shell_rows = [i for i, row in enumerate(p.screen.cells) if "JM_SHELL_RETURN:0" in "".join(row)]
         require(shell_rows and min(shell_rows) > ui_bottom, "shell resumed over the inline UI instead of below it")
-    print(f"PASS inline: native history + non-top cursor + resize + shell placement; idle 0 bytes, 10-key burst {navigation_bytes} bytes")
+    print(f"PASS inline: native history + non-top cursor + resize + shell placement; idle 0 bytes, 18-key burst {navigation_bytes} bytes")
 
 
 def fullscreen(sock):

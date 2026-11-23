@@ -10,9 +10,10 @@ use ratatui::{
 use unicode_width::UnicodeWidthStr;
 
 use super::{
-    EmblemMode, Theme, WorkspaceSubviewLayout, parse_ansi_preview_line, pill_span,
-    render_horizontal_divider_line, render_hydra_emblem_if_some, single_line,
-    split_lower_band_for_hydra, truncate_to_width,
+    DockZone, EmblemMode, SashId, Theme, WorkspaceSubviewLayout, parse_ansi_preview_line,
+    pill_span, render_dock_zone_overlay, render_horizontal_divider_line,
+    render_hydra_emblem_if_some, render_sash_divider, single_line, split_lower_band_for_hydra,
+    truncate_to_width,
 };
 
 /// Clickable action pill displayed inside the interactive 2x2 Split Studio toolbar.
@@ -21,6 +22,10 @@ pub enum SplitToolbarButton {
     SplitHorizontal,
     SplitVertical,
     FlipDirection,
+    RatioPreset,
+    SyncToggle,
+    PresetGrid,
+    BreakOut,
     RemoveSlot,
     Reset,
     ApplyAndEnter,
@@ -45,6 +50,8 @@ pub enum SplitCanvasNode<'a> {
     Pane(SplitCanvasPaneView<'a>),
     Split {
         horizontal: bool,
+        /// Percentage of space allocated to `first` child (`20..=80`; `0` defaults to `50`).
+        ratio: u16,
         first: Box<SplitCanvasNode<'a>>,
         second: Box<SplitCanvasNode<'a>>,
     },
@@ -71,8 +78,21 @@ pub struct SplitStudioView<'a> {
     pub can_split_v: bool,
     pub can_flip: bool,
     pub can_remove: bool,
+    /// Active split ratio percentage (`20..=80`, e.g. `50`, `70`, `30`; `0` displays `50`).
+    pub active_ratio: u16,
+    /// Whether ratio presets/adjustments can be applied (`slot_count >= 2`).
+    pub can_adjust_ratio: bool,
+    /// Whether `synchronize-panes` is currently toggled ON for this split layout.
+    pub sync_panes: bool,
+    /// Whether the selected pane can be broken out into its own window.
+    pub can_break_out: bool,
+    /// True when editing an existing multi-pane window instead of composing a new split.
+    pub editing_existing: bool,
     pub window_rows: &'a [SplitWindowRowView],
     pub window_cursor: usize,
+    pub hovered_sash: Option<SashId>,
+    pub dragging_sash: Option<SashId>,
+    pub hovered_dock: Option<(usize, DockZone)>,
 }
 
 pub(super) fn render_subview_split(
@@ -97,11 +117,56 @@ pub(super) fn render_subview_split(
         Constraint::Length(lower_h),
     ])
     .areas(card_inner);
-    let [canvas_area, toolbar_area] =
-        Layout::vertical([Constraint::Min(4), Constraint::Length(1)]).areas(upper_band);
+    let show_sync_banner = studio.sync_panes && upper_band.height >= 7;
+    let (canvas_area, toolbar_area) = if show_sync_banner {
+        let [banner_area, c_area, t_area] = Layout::vertical([
+            Constraint::Length(1),
+            Constraint::Min(4),
+            Constraint::Length(1),
+        ])
+        .areas(upper_band);
+        let zh = theme.language.is_zh() && !theme.ascii;
+        let banner_text = if theme.ascii {
+            " [!SYNC ON] Typing broadcasts simultaneously to EVERY pane in this window "
+        } else if zh {
+            " ⚡ 同步输入已开启 — 按键将同时广播到本窗口的所有窗格 "
+        } else {
+            " ⚡ SYNC PANES ON — typing broadcasts simultaneously to EVERY pane in this window "
+        };
+        let banner_span = if theme.no_color {
+            Span::styled(
+                truncate_to_width(banner_text, usize::from(banner_area.width)),
+                Style::default().add_modifier(Modifier::REVERSED | Modifier::BOLD),
+            )
+        } else {
+            pill_span(
+                truncate_to_width(banner_text, usize::from(banner_area.width)),
+                theme.warning,
+                theme.pill_bg(),
+                theme,
+                true,
+            )
+        };
+        frame.render_widget(Paragraph::new(Line::from(banner_span)), banner_area);
+        (c_area, t_area)
+    } else {
+        let [c_area, t_area] =
+            Layout::vertical([Constraint::Min(4), Constraint::Length(1)]).areas(upper_band);
+        (c_area, t_area)
+    };
 
     let mut slot_hits = Vec::new();
-    render_split_canvas_node(frame, canvas_area, &studio.root, &mut slot_hits, theme);
+    let mut sash_hits = Vec::new();
+    render_split_canvas_node(
+        frame,
+        canvas_area,
+        &studio.root,
+        0,
+        studio,
+        &mut slot_hits,
+        &mut sash_hits,
+        theme,
+    );
     let toolbar_hits = render_split_toolbar(frame, toolbar_area, studio, theme);
 
     render_horizontal_divider_line(frame, rule_area, theme);
@@ -112,11 +177,11 @@ pub(super) fn render_subview_split(
 
     WorkspaceSubviewLayout {
         list_rect: Some(list_rect),
-        preview_area: None,
         hydra_rendered,
-        confirm_scroll: 0,
         split_slot_hits: slot_hits,
         split_toolbar_hits: toolbar_hits,
+        sash_hits,
+        ..WorkspaceSubviewLayout::default()
     }
 }
 
@@ -130,13 +195,23 @@ pub(super) fn render_compact_split_studio(
         return WorkspaceSubviewLayout::default();
     }
     let mut slot_hits = Vec::new();
+    let mut sash_hits = Vec::new();
     let (list_rect, toolbar_hits) = if area.width >= 54 && area.height >= 7 {
         let [left_col, right_col] =
             Layout::horizontal([Constraint::Percentage(52), Constraint::Percentage(48)])
                 .areas(area);
         let [canvas_area, toolbar_area] =
             Layout::vertical([Constraint::Min(4), Constraint::Length(1)]).areas(left_col);
-        render_split_canvas_node(frame, canvas_area, &studio.root, &mut slot_hits, theme);
+        render_split_canvas_node(
+            frame,
+            canvas_area,
+            &studio.root,
+            0,
+            studio,
+            &mut slot_hits,
+            &mut sash_hits,
+            theme,
+        );
         let toolbar_hits = render_split_toolbar(frame, toolbar_area, studio, theme);
         let list_rect = render_split_window_list(frame, right_col, studio, theme);
         (list_rect, toolbar_hits)
@@ -147,7 +222,16 @@ pub(super) fn render_compact_split_studio(
             Constraint::Min(2),
         ])
         .areas(area);
-        render_split_canvas_node(frame, canvas_area, &studio.root, &mut slot_hits, theme);
+        render_split_canvas_node(
+            frame,
+            canvas_area,
+            &studio.root,
+            0,
+            studio,
+            &mut slot_hits,
+            &mut sash_hits,
+            theme,
+        );
         let toolbar_hits = render_split_toolbar(frame, toolbar_area, studio, theme);
         let list_rect = render_split_window_list(frame, list_band, studio, theme);
         (list_rect, toolbar_hits)
@@ -158,49 +242,126 @@ pub(super) fn render_compact_split_studio(
             Constraint::Min(2),
         ])
         .areas(area);
-        render_split_canvas_node(frame, canvas_area, &studio.root, &mut slot_hits, theme);
+        render_split_canvas_node(
+            frame,
+            canvas_area,
+            &studio.root,
+            0,
+            studio,
+            &mut slot_hits,
+            &mut sash_hits,
+            theme,
+        );
         let toolbar_hits = render_split_toolbar(frame, toolbar_area, studio, theme);
         let list_rect = render_split_window_list(frame, list_band, studio, theme);
         (list_rect, toolbar_hits)
     };
     WorkspaceSubviewLayout {
         list_rect: Some(list_rect),
-        preview_area: None,
-        hydra_rendered: false,
-        confirm_scroll: 0,
         split_slot_hits: slot_hits,
         split_toolbar_hits: toolbar_hits,
+        sash_hits,
+        ..WorkspaceSubviewLayout::default()
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn render_split_canvas_node(
     frame: &mut Frame<'_>,
     area: Rect,
     node: &SplitCanvasNode<'_>,
+    node_idx: usize,
+    studio: &SplitStudioView<'_>,
     slot_hits: &mut Vec<(Rect, usize)>,
+    sash_hits: &mut Vec<(Rect, SashId)>,
     theme: Theme,
 ) {
     match node {
         SplitCanvasNode::Split {
             horizontal,
+            ratio,
             first,
             second,
         } => {
-            let dir = if *horizontal {
-                Direction::Horizontal
+            let first_pct = if *ratio == 0 {
+                50
             } else {
-                Direction::Vertical
+                (*ratio).clamp(20, 80)
             };
-            let [a, b] = Layout::default()
-                .direction(dir)
-                .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+            let sash_id = SashId::SplitNode(node_idx);
+            let hovered = studio.hovered_sash == Some(sash_id);
+            let dragging = studio.dragging_sash == Some(sash_id);
+            let first_idx = node_idx.saturating_mul(2).saturating_add(1);
+            let second_idx = node_idx.saturating_mul(2).saturating_add(2);
+
+            if *horizontal && area.width >= 11 {
+                let avail = area.width.saturating_sub(1);
+                let first_w = (((u32::from(avail) * u32::from(first_pct) + 50) / 100) as u16)
+                    .clamp(4, avail.saturating_sub(4).max(4));
+                let second_w = avail.saturating_sub(first_w);
+                let [a, sash, b] = Layout::horizontal([
+                    Constraint::Length(first_w),
+                    Constraint::Length(1),
+                    Constraint::Length(second_w),
+                ])
                 .areas(area);
-            render_split_canvas_node(frame, a, first, slot_hits, theme);
-            render_split_canvas_node(frame, b, second, slot_hits, theme);
+                render_split_canvas_node(
+                    frame, a, first, first_idx, studio, slot_hits, sash_hits, theme,
+                );
+                render_split_canvas_node(
+                    frame, b, second, second_idx, studio, slot_hits, sash_hits, theme,
+                );
+                render_sash_divider(frame, sash, true, first_pct, hovered, dragging, theme);
+                sash_hits.push((sash, sash_id));
+            } else if !*horizontal && area.height >= 7 {
+                let avail = area.height.saturating_sub(1);
+                let first_h = (((u32::from(avail) * u32::from(first_pct) + 50) / 100) as u16)
+                    .clamp(3, avail.saturating_sub(3).max(3));
+                let second_h = avail.saturating_sub(first_h);
+                let [a, sash, b] = Layout::vertical([
+                    Constraint::Length(first_h),
+                    Constraint::Length(1),
+                    Constraint::Length(second_h),
+                ])
+                .areas(area);
+                render_split_canvas_node(
+                    frame, a, first, first_idx, studio, slot_hits, sash_hits, theme,
+                );
+                render_split_canvas_node(
+                    frame, b, second, second_idx, studio, slot_hits, sash_hits, theme,
+                );
+                render_sash_divider(frame, sash, false, first_pct, hovered, dragging, theme);
+                sash_hits.push((sash, sash_id));
+            } else {
+                let dir = if *horizontal {
+                    Direction::Horizontal
+                } else {
+                    Direction::Vertical
+                };
+                let second_pct = 100_u16.saturating_sub(first_pct);
+                let [a, b] = Layout::default()
+                    .direction(dir)
+                    .constraints([
+                        Constraint::Percentage(first_pct),
+                        Constraint::Percentage(second_pct),
+                    ])
+                    .areas(area);
+                render_split_canvas_node(
+                    frame, a, first, first_idx, studio, slot_hits, sash_hits, theme,
+                );
+                render_split_canvas_node(
+                    frame, b, second, second_idx, studio, slot_hits, sash_hits, theme,
+                );
+            }
         }
         SplitCanvasNode::Pane(pane) => {
             slot_hits.push((area, pane.slot_id));
             render_split_canvas_pane(frame, area, pane, theme);
+            if let Some((target_slot, zone)) = studio.hovered_dock
+                && target_slot == pane.slot_id
+            {
+                render_dock_zone_overlay(frame, area, zone, theme);
+            }
         }
     }
 }
@@ -403,51 +564,157 @@ fn render_split_toolbar(
     }
     let zh = theme.language.is_zh() && !theme.ascii;
     let total_w = usize::from(area.width);
-    let left_specs = [
-        (
-            SplitToolbarButton::SplitHorizontal,
-            studio.can_split_h,
-            theme.accent,
-            if zh {
+    let ratio = if studio.active_ratio == 0 {
+        50
+    } else {
+        studio.active_ratio.clamp(20, 80)
+    };
+    let ratio_full = format!(" [p] {ratio}/{} ", 100 - ratio);
+    let ratio_med = format!("[p]{ratio}/{}", 100 - ratio);
+    let ratio_short = format!(" [p]{ratio}% ");
+
+    let sync_full = if studio.sync_panes {
+        if theme.ascii {
+            " [y] !SYNC ON ".to_owned()
+        } else if zh {
+            " [y] ⚡同步开 ".to_owned()
+        } else {
+            " [y] ⚡SYNC ON ".to_owned()
+        }
+    } else if zh {
+        " [y] 同步关 ".to_owned()
+    } else {
+        " [y] Sync ".to_owned()
+    };
+    let sync_med = if studio.sync_panes {
+        if theme.ascii {
+            "[y]!SYNC".to_owned()
+        } else if zh {
+            "[y]⚡同步".to_owned()
+        } else {
+            "[y]⚡SYNC".to_owned()
+        }
+    } else if zh {
+        "[y]同步".to_owned()
+    } else {
+        "[y]Sync".to_owned()
+    };
+    let sync_short = if studio.sync_panes {
+        if theme.ascii { " [y]!S " } else { " [y]⚡ " }
+    } else {
+        " [y] "
+    };
+
+    struct Spec {
+        btn: SplitToolbarButton,
+        enabled: bool,
+        emphasized: bool,
+        color: ratatui::style::Color,
+        full: String,
+        med: String,
+        short: String,
+    }
+
+    let mut left_specs = vec![
+        Spec {
+            btn: SplitToolbarButton::SplitHorizontal,
+            enabled: studio.can_split_h,
+            emphasized: false,
+            color: theme.accent,
+            full: if zh {
                 " [h] 左右分 "
             } else {
                 " [h] Split H "
-            },
-            " [h] H ",
-        ),
-        (
-            SplitToolbarButton::SplitVertical,
-            studio.can_split_v,
-            theme.accent,
-            if zh {
+            }
+            .into(),
+            med: if zh { "[h]左右分" } else { "[h] Split H" }.into(),
+            short: " [h] H ".into(),
+        },
+        Spec {
+            btn: SplitToolbarButton::SplitVertical,
+            enabled: studio.can_split_v,
+            emphasized: false,
+            color: theme.accent,
+            full: if zh {
                 " [v] 上下分 "
             } else {
                 " [v] Split V "
+            }
+            .into(),
+            med: if zh { "[v]上下分" } else { "[v] Split V" }.into(),
+            short: " [v] V ".into(),
+        },
+        Spec {
+            btn: SplitToolbarButton::FlipDirection,
+            enabled: studio.can_flip,
+            emphasized: false,
+            color: theme.accent,
+            full: if zh { " [t] 翻转 " } else { " [t] Flip " }.into(),
+            med: if zh { "[t] 翻转" } else { "[t] Flip" }.into(),
+            short: " [t] ".into(),
+        },
+        Spec {
+            btn: SplitToolbarButton::RatioPreset,
+            enabled: studio.can_adjust_ratio,
+            emphasized: false,
+            color: theme.secondary,
+            full: ratio_full,
+            med: ratio_med,
+            short: ratio_short,
+        },
+        Spec {
+            btn: SplitToolbarButton::SyncToggle,
+            enabled: true,
+            emphasized: studio.sync_panes,
+            color: if studio.sync_panes {
+                theme.warning
+            } else {
+                theme.secondary
             },
-            " [v] V ",
-        ),
-        (
-            SplitToolbarButton::FlipDirection,
-            studio.can_flip,
-            theme.accent,
-            if zh { " [t] 翻转 " } else { " [t] Flip " },
-            " [t] ",
-        ),
-        (
-            SplitToolbarButton::RemoveSlot,
-            studio.can_remove,
-            theme.warning,
-            if zh { " [x] 移除 " } else { " [x] Remove " },
-            if zh { " [x] 删 " } else { " [x] Del " },
-        ),
-        (
-            SplitToolbarButton::Reset,
-            true,
-            theme.secondary,
-            if zh { " [r] 重置 " } else { " [r] Reset " },
-            " [r] ",
-        ),
+            full: sync_full,
+            med: sync_med,
+            short: sync_short.into(),
+        },
+        Spec {
+            btn: SplitToolbarButton::PresetGrid,
+            enabled: true,
+            emphasized: false,
+            color: theme.secondary,
+            full: if zh { " [g] 预设 " } else { " [g] Grid " }.into(),
+            med: if zh { "[g]预设" } else { "[g]Grid" }.into(),
+            short: " [g] ".into(),
+        },
     ];
+    if studio.editing_existing {
+        left_specs.push(Spec {
+            btn: SplitToolbarButton::BreakOut,
+            enabled: studio.can_break_out,
+            emphasized: false,
+            color: theme.warning,
+            full: if zh { " [b] 拆出 " } else { " [b] Break " }.into(),
+            med: if zh { "[b]拆出" } else { "[b]Break" }.into(),
+            short: " [b] ".into(),
+        });
+    }
+    left_specs.push(Spec {
+        btn: SplitToolbarButton::RemoveSlot,
+        enabled: studio.can_remove,
+        emphasized: false,
+        color: theme.warning,
+        full: if zh { " [x] 移除 " } else { " [x] Remove " }.into(),
+        med: if zh { "[x]移除" } else { "[x]Del" }.into(),
+        short: if zh { " [x] 删 " } else { " [x] Del " }.into(),
+    });
+    left_specs.push(Spec {
+        btn: SplitToolbarButton::Reset,
+        enabled: true,
+        emphasized: false,
+        color: theme.secondary,
+        full: if zh { " [r] 重置 " } else { " [r] Reset " }.into(),
+        med: if zh { "[r]重置" } else { "[r]Reset" }.into(),
+        short: " [r] ".into(),
+    });
+
     let cta_full = if zh {
         " [Enter] 确认进入 tmux "
     } else {
@@ -460,25 +727,23 @@ fn render_split_toolbar(
     };
     let cta_micro = " [Enter] ";
 
-    let full_left_w: usize = left_specs
-        .iter()
-        .map(|(_, _, _, f, _)| f.width())
-        .sum::<usize>()
+    let full_left_w: usize = left_specs.iter().map(|s| s.full.width()).sum::<usize>()
         + left_specs.len().saturating_sub(1);
-    let short_left_w: usize = left_specs
-        .iter()
-        .map(|(_, _, _, _, s)| s.width())
-        .sum::<usize>()
+    let med_left_w: usize = left_specs.iter().map(|s| s.med.width()).sum::<usize>()
+        + left_specs.len().saturating_sub(1);
+    let short_left_w: usize = left_specs.iter().map(|s| s.short.width()).sum::<usize>()
         + left_specs.len().saturating_sub(1);
 
-    let (use_short_left, cta_label) = if full_left_w + 1 + cta_full.width() <= total_w {
-        (false, cta_full)
+    let (tier, cta_label) = if full_left_w + 1 + cta_full.width() <= total_w {
+        (0_u8, cta_full)
+    } else if med_left_w + 1 + cta_full.width() <= total_w {
+        (1_u8, cta_full)
     } else if short_left_w + 1 + cta_full.width() <= total_w {
-        (true, cta_full)
+        (2_u8, cta_full)
     } else if cta_compact.width() <= total_w {
-        (true, cta_compact)
+        (2_u8, cta_compact)
     } else {
-        (true, cta_micro)
+        (2_u8, cta_micro)
     };
     let cta_w = cta_label.width();
 
@@ -494,8 +759,12 @@ fn render_split_toolbar(
         0
     };
 
-    for (btn, enabled, color, full, short) in left_specs {
-        let label = if use_short_left { short } else { full };
+    for spec in left_specs {
+        let label = match tier {
+            0 => spec.full.as_str(),
+            1 => spec.med.as_str(),
+            _ => spec.short.as_str(),
+        };
         let w = label.width();
         let gap = usize::from(col > 0);
         if col + gap + w > max_left_col {
@@ -505,10 +774,15 @@ fn render_split_toolbar(
             spans.push(Span::raw(" "));
             col += 1;
         }
-        spans.push(if enabled {
-            pill_span(label, color, bg, theme, false)
-        } else {
+        spans.push(if !spec.enabled {
             Span::styled(theme.adapt(label), theme.style(theme.muted))
+        } else if spec.emphasized && theme.no_color {
+            Span::styled(
+                theme.adapt(label),
+                Style::default().add_modifier(Modifier::REVERSED | Modifier::BOLD),
+            )
+        } else {
+            pill_span(label, spec.color, bg, theme, spec.emphasized)
         });
         hits.push((
             Rect {
@@ -517,7 +791,7 @@ fn render_split_toolbar(
                 width: u16::try_from(w).unwrap_or(0),
                 height: 1,
             },
-            btn,
+            spec.btn,
         ));
         col += w;
     }
@@ -788,9 +1062,18 @@ mod tests {
                             can_split_v: can_v,
                             can_flip: slot_count >= 2,
                             can_remove: slot_count > 1,
+                            active_ratio: 50,
+                            can_adjust_ratio: slot_count >= 2,
+                            sync_panes: false,
+                            can_break_out: false,
+                            editing_existing: false,
                             window_rows: &window_rows,
                             window_cursor: 0,
+                            hovered_sash: None,
+                            dragging_sash: None,
+                            hovered_dock: None,
                         }),
+                        ..WorkspaceSubviewSpec::default()
                     },
                     theme,
                 );
@@ -825,6 +1108,7 @@ mod tests {
         let (_, l2) = render_case(
             SplitCanvasNode::Split {
                 horizontal: true,
+                ratio: 50,
                 first: Box::new(pane_view(
                     1,
                     1,
@@ -854,6 +1138,7 @@ mod tests {
         let (_, l3) = render_case(
             SplitCanvasNode::Split {
                 horizontal: true,
+                ratio: 50,
                 first: Box::new(pane_view(
                     1,
                     1,
@@ -865,6 +1150,7 @@ mod tests {
                 )),
                 second: Box::new(SplitCanvasNode::Split {
                     horizontal: false,
+                    ratio: 50,
                     first: Box::new(pane_view(
                         2,
                         2,
@@ -894,8 +1180,10 @@ mod tests {
 
         let grid_2x2 = || SplitCanvasNode::Split {
             horizontal: true,
+            ratio: 50,
             first: Box::new(SplitCanvasNode::Split {
                 horizontal: false,
+                ratio: 50,
                 first: Box::new(pane_view(
                     1,
                     1,
@@ -917,6 +1205,7 @@ mod tests {
             }),
             second: Box::new(SplitCanvasNode::Split {
                 horizontal: false,
+                ratio: 50,
                 first: Box::new(pane_view(
                     3,
                     3,
@@ -1036,6 +1325,7 @@ mod tests {
         let make_studio = |can_flip: bool| SplitStudioView {
             root: SplitCanvasNode::Split {
                 horizontal: true,
+                ratio: 50,
                 first: Box::new(pane_view(
                     1,
                     1,
@@ -1054,8 +1344,16 @@ mod tests {
             can_split_v: true,
             can_flip,
             can_remove: true,
+            active_ratio: 50,
+            can_adjust_ratio: true,
+            sync_panes: false,
+            can_break_out: false,
+            editing_existing: false,
             window_rows: &window_rows,
             window_cursor: 0,
+            hovered_sash: None,
+            dragging_sash: None,
+            hovered_dock: None,
         };
 
         let mut term36 = Terminal::new(TestBackend::new(36, 12)).expect("36 col term");
@@ -1072,6 +1370,7 @@ mod tests {
                         emblem_mode: EmblemMode::Spin,
                         footer_hint: "",
                         content: SubviewContent::Split(make_studio(true)),
+                        ..WorkspaceSubviewSpec::default()
                     },
                     aurora,
                 );
@@ -1122,6 +1421,7 @@ mod tests {
                         emblem_mode: EmblemMode::Spin,
                         footer_hint: "",
                         content: SubviewContent::Split(make_studio(false)),
+                        ..WorkspaceSubviewSpec::default()
                     },
                     aurora,
                 );
@@ -1228,9 +1528,18 @@ mod tests {
                             can_split_v: true,
                             can_flip: false,
                             can_remove: false,
+                            active_ratio: 50,
+                            can_adjust_ratio: false,
+                            sync_panes: false,
+                            can_break_out: false,
+                            editing_existing: false,
                             window_rows: &window_rows,
                             window_cursor: 0,
+                            hovered_sash: None,
+                            dragging_sash: None,
+                            hovered_dock: None,
                         }),
+                        ..WorkspaceSubviewSpec::default()
                     },
                     theme,
                 );
@@ -1320,5 +1629,244 @@ mod tests {
                 "non-key spans altered style: {spans:?}"
             );
         }
+    }
+
+    #[test]
+    fn split_studio_renders_asymmetric_ratios_sync_warning_and_new_toolbar_buttons() {
+        let aurora = Theme::default().with_preset(ThemePreset::AntigravityAurora);
+        let window_rows = sample_window_rows();
+        let edit_lines = vec!["EDIT_LINE_1".into()];
+        let srv_lines = vec!["SRV_LINE_1".into()];
+
+        let make_studio = |ratio: u16, sync_panes: bool, editing_existing: bool| SplitStudioView {
+            root: SplitCanvasNode::Split {
+                horizontal: true,
+                ratio,
+                first: Box::new(pane_view(
+                    1,
+                    1,
+                    "dev:0 editor",
+                    "nvim",
+                    &edit_lines,
+                    true,
+                    false,
+                )),
+                second: Box::new(pane_view(
+                    2,
+                    2,
+                    "dev:1 server",
+                    "cargo",
+                    &srv_lines,
+                    false,
+                    false,
+                )),
+            },
+            selected_slot: 1,
+            selected_ordinal: 1,
+            slot_count: 2,
+            can_split_h: false,
+            can_split_v: true,
+            can_flip: true,
+            can_remove: true,
+            active_ratio: ratio,
+            can_adjust_ratio: true,
+            sync_panes,
+            can_break_out: editing_existing,
+            editing_existing,
+            window_rows: &window_rows,
+            window_cursor: 0,
+            hovered_sash: None,
+            dragging_sash: None,
+            hovered_dock: None,
+        };
+
+        let mut term = Terminal::new(TestBackend::new(126, 32)).expect("ratio term");
+        let mut layout = WorkspaceSubviewLayout::default();
+        term.draw(|frame| {
+            layout = render_workspace_subview(
+                frame,
+                frame.area(),
+                &WorkspaceSubviewSpec {
+                    details: HomeDetails::default(),
+                    telemetry: HomeTelemetry::default(),
+                    emblem_step: 0,
+                    emblem_mode: EmblemMode::Spin,
+                    footer_hint: "",
+                    content: SubviewContent::Split(make_studio(70, true, true)),
+                    ..WorkspaceSubviewSpec::default()
+                },
+                aurora,
+            );
+        })
+        .expect("draw 70/30 split");
+
+        assert_eq!(layout.split_slot_hits.len(), 2);
+        let left_w = layout.split_slot_hits[0].0.width;
+        let right_w = layout.split_slot_hits[1].0.width;
+        assert!(
+            left_w > right_w + 20,
+            "expected 70/30 split left ({left_w}) much wider than right ({right_w})"
+        );
+        for btn in [
+            SplitToolbarButton::RatioPreset,
+            SplitToolbarButton::SyncToggle,
+            SplitToolbarButton::PresetGrid,
+            SplitToolbarButton::BreakOut,
+            SplitToolbarButton::ApplyAndEnter,
+        ] {
+            assert!(
+                layout.split_toolbar_hits.iter().any(|(_, b)| *b == btn),
+                "missing toolbar button {btn:?}"
+            );
+        }
+        let text = buffer_logical_text(term.backend().buffer());
+        for needle in ["70/30", "SYNC", "Break", "Grid"] {
+            assert!(text.contains(needle), "missing {needle}:\n{text}");
+        }
+
+        // Verify ZH + ASCII/NO_COLOR with sync ON.
+        let zh = Theme {
+            language: Language::Zh,
+            ..aurora
+        };
+        term.draw(|frame| {
+            render_workspace_subview(
+                frame,
+                frame.area(),
+                &WorkspaceSubviewSpec {
+                    details: HomeDetails::default(),
+                    telemetry: HomeTelemetry::default(),
+                    emblem_step: 0,
+                    emblem_mode: EmblemMode::Spin,
+                    footer_hint: "",
+                    content: SubviewContent::Split(make_studio(30, true, true)),
+                    ..WorkspaceSubviewSpec::default()
+                },
+                zh,
+            );
+        })
+        .expect("draw zh 30/70 split");
+        let zh_text = buffer_logical_text(term.backend().buffer());
+        assert!(zh_text.contains("30/70"));
+        assert!(zh_text.contains("同步输入已开启"));
+        assert!(zh_text.contains("拆出"));
+
+        let ascii_nc = Theme {
+            ascii: true,
+            no_color: true,
+            truecolor: false,
+            ..aurora
+        };
+        let mut nc_term = Terminal::new(TestBackend::new(126, 32)).expect("nc split term");
+        nc_term
+            .draw(|frame| {
+                render_workspace_subview(
+                    frame,
+                    frame.area(),
+                    &WorkspaceSubviewSpec {
+                        details: HomeDetails::default(),
+                        telemetry: HomeTelemetry::default(),
+                        emblem_step: 0,
+                        emblem_mode: EmblemMode::Spin,
+                        footer_hint: "",
+                        content: SubviewContent::Split(make_studio(70, true, true)),
+                        ..WorkspaceSubviewSpec::default()
+                    },
+                    ascii_nc,
+                );
+            })
+            .expect("draw ascii sync split");
+        let asc_text = nc_term.backend().to_string();
+        assert!(
+            asc_text
+                .chars()
+                .all(|c| c.is_ascii() || matches!(c, '┌' | '┐' | '└' | '┘' | '─' | '│')),
+            "non-ASCII in sync split:\n{asc_text}"
+        );
+        assert!(
+            nc_term
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .all(|c| c.fg == Color::Reset && c.bg == Color::Reset)
+        );
+    }
+
+    #[test]
+    fn split_studio_exposes_sash_hits_ratio_badge_and_dock_overlay() {
+        let aurora = Theme::default().with_preset(ThemePreset::AntigravityAurora);
+        let window_rows = sample_window_rows();
+        let edit_lines = vec!["EDIT_LINE_1".into()];
+        let srv_lines = vec!["SRV_LINE_1".into()];
+
+        let studio = SplitStudioView {
+            root: SplitCanvasNode::Split {
+                horizontal: true,
+                ratio: 64,
+                first: Box::new(pane_view(
+                    1,
+                    1,
+                    "dev:0 editor",
+                    "nvim",
+                    &edit_lines,
+                    true,
+                    false,
+                )),
+                second: Box::new(pane_view(
+                    2,
+                    2,
+                    "dev:1 server",
+                    "cargo",
+                    &srv_lines,
+                    false,
+                    false,
+                )),
+            },
+            selected_slot: 1,
+            selected_ordinal: 1,
+            slot_count: 2,
+            can_split_h: false,
+            can_split_v: true,
+            can_flip: true,
+            can_remove: true,
+            active_ratio: 64,
+            can_adjust_ratio: true,
+            sync_panes: false,
+            can_break_out: false,
+            editing_existing: false,
+            window_rows: &window_rows,
+            window_cursor: 0,
+            hovered_sash: Some(SashId::SplitNode(0)),
+            dragging_sash: Some(SashId::SplitNode(0)),
+            hovered_dock: Some((2, DockZone::Right)),
+        };
+
+        let mut term = Terminal::new(TestBackend::new(120, 32)).expect("sash term");
+        let mut layout = WorkspaceSubviewLayout::default();
+        term.draw(|frame| {
+            layout = render_workspace_subview(
+                frame,
+                frame.area(),
+                &WorkspaceSubviewSpec {
+                    content: SubviewContent::Split(studio),
+                    ..WorkspaceSubviewSpec::default()
+                },
+                aurora,
+            );
+        })
+        .expect("draw sash split");
+
+        assert!(
+            layout
+                .sash_hits
+                .iter()
+                .any(|(r, id)| *id == SashId::SplitNode(0) && r.width == 1 && r.height >= 4),
+            "expected SplitNode(0) sash hit, got {:?}",
+            layout.sash_hits
+        );
+        let text = buffer_logical_text(term.backend().buffer());
+        assert!(text.contains("64% │ 36%"), "missing ratio badge:\n{text}");
+        assert!(text.contains("Right 50%"), "missing dock overlay:\n{text}");
     }
 }

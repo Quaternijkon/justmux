@@ -21,12 +21,19 @@ pub struct Config {
     pub theme: ThemePreset,
     pub composer_mode: ComposerMode,
     pub live_preview: bool,
+    pub live_stream: bool,
     pub emblem_mode: EmblemMode,
     pub mouse: bool,
     pub inline_height: u16,
     pub no_color: bool,
     pub ascii: bool,
     pub language: Language,
+    pub tmux_popup: bool,
+    pub tmux_mouse: bool,
+    pub tmux_history_limit: u32,
+    pub tmux_base_index_one: bool,
+    pub tmux_renumber_windows: bool,
+    pub tmux_zero_escape_time: bool,
 }
 
 impl Default for Config {
@@ -36,12 +43,19 @@ impl Default for Config {
             theme: ThemePreset::AntigravityAurora,
             composer_mode: ComposerMode::CommandJump,
             live_preview: true,
+            live_stream: true,
             emblem_mode: EmblemMode::Spin,
             mouse: true,
             inline_height: INLINE_HEIGHT,
             no_color: false,
             ascii: false,
             language: Language::En,
+            tmux_popup: false,
+            tmux_mouse: false,
+            tmux_history_limit: 0,
+            tmux_base_index_one: false,
+            tmux_renumber_windows: false,
+            tmux_zero_escape_time: false,
         }
     }
 }
@@ -78,6 +92,9 @@ impl Config {
         if let Some(live_preview) = partial.live_preview {
             self.live_preview = live_preview;
         }
+        if let Some(live_stream) = partial.live_stream {
+            self.live_stream = live_stream;
+        }
         if let Some(emblem_mode) = partial.emblem_mode {
             self.emblem_mode = emblem_mode;
         }
@@ -96,6 +113,44 @@ impl Config {
         if let Some(language) = partial.language {
             self.language = language;
         }
+        if let Some(tmux_popup) = partial.tmux_popup {
+            self.tmux_popup = tmux_popup;
+        }
+        if let Some(tmux_mouse) = partial.tmux_mouse {
+            self.tmux_mouse = tmux_mouse;
+        }
+        if let Some(tmux_history_limit) = partial.tmux_history_limit {
+            self.tmux_history_limit = tmux_history_limit;
+        }
+        if let Some(tmux_base_index_one) = partial.tmux_base_index_one {
+            self.tmux_base_index_one = tmux_base_index_one;
+        }
+        if let Some(tmux_renumber_windows) = partial.tmux_renumber_windows {
+            self.tmux_renumber_windows = tmux_renumber_windows;
+        }
+        if let Some(tmux_zero_escape_time) = partial.tmux_zero_escape_time {
+            self.tmux_zero_escape_time = tmux_zero_escape_time;
+        }
+    }
+
+    /// Extract the opt-in `~/.tmux.conf` comfort settings managed by JustMux.
+    pub fn tmux_comfort_options(&self) -> crate::tmux_conf::TmuxComfortOptions {
+        crate::tmux_conf::TmuxComfortOptions {
+            mouse: self.tmux_mouse,
+            history_limit: self.tmux_history_limit,
+            base_index_one: self.tmux_base_index_one,
+            renumber_windows: self.tmux_renumber_windows,
+            zero_escape_time: self.tmux_zero_escape_time,
+        }
+    }
+
+    /// Update the opt-in `~/.tmux.conf` comfort fields from [`crate::tmux_conf::TmuxComfortOptions`].
+    pub fn set_tmux_comfort_options(&mut self, opts: crate::tmux_conf::TmuxComfortOptions) {
+        self.tmux_mouse = opts.mouse;
+        self.tmux_history_limit = opts.history_limit;
+        self.tmux_base_index_one = opts.base_index_one;
+        self.tmux_renumber_windows = opts.renumber_windows;
+        self.tmux_zero_escape_time = opts.zero_escape_time;
     }
 
     /// Serialize this configuration as clean, round-trippable TOML.
@@ -109,6 +164,7 @@ impl Config {
              theme = \"{}\"\n\
              composer_mode = \"{}\"\n\
              live_preview = {}\n\
+             live_stream = {}\n\
              emblem_mode = \"{}\"\n\
              no_color = {}\n\
              ascii = {}\n\
@@ -116,10 +172,18 @@ impl Config {
              [terminal]\n\
              screen_mode = \"{}\"\n\
              mouse = {}\n\
-             inline_height = {}\n",
+             inline_height = {}\n\n\
+             [tmux]\n\
+             tmux_popup = {}\n\
+             tmux_mouse = {}\n\
+             tmux_history_limit = {}\n\
+             tmux_base_index_one = {}\n\
+             tmux_renumber_windows = {}\n\
+             tmux_zero_escape_time = {}\n",
             self.theme.slug(),
             composer_mode_slug(self.composer_mode),
             self.live_preview,
+            self.live_stream,
             self.emblem_mode.as_str(),
             self.no_color,
             self.ascii,
@@ -127,6 +191,12 @@ impl Config {
             self.screen_mode.as_str(),
             self.mouse,
             inline_height,
+            self.tmux_popup,
+            self.tmux_mouse,
+            self.tmux_history_limit,
+            self.tmux_base_index_one,
+            self.tmux_renumber_windows,
+            self.tmux_zero_escape_time,
         )
     }
 
@@ -156,12 +226,19 @@ pub struct PartialConfig {
     pub theme: Option<ThemePreset>,
     pub composer_mode: Option<ComposerMode>,
     pub live_preview: Option<bool>,
+    pub live_stream: Option<bool>,
     pub emblem_mode: Option<EmblemMode>,
     pub mouse: Option<bool>,
     pub inline_height: Option<u16>,
     pub no_color: Option<bool>,
     pub ascii: Option<bool>,
     pub language: Option<Language>,
+    pub tmux_popup: Option<bool>,
+    pub tmux_mouse: Option<bool>,
+    pub tmux_history_limit: Option<u32>,
+    pub tmux_base_index_one: Option<bool>,
+    pub tmux_renumber_windows: Option<bool>,
+    pub tmux_zero_escape_time: Option<bool>,
 }
 
 /// CLI arguments that take highest precedence over env vars and `config.toml`.
@@ -241,6 +318,8 @@ pub fn starter_config_toml() -> &'static str {
      composer_mode = \"command-jump\"\n\n\
      # Show live tmux pane previews in Fullscreen studio, Live Radar, /list, and /resume\n\
      live_preview = true\n\n\
+     # Auto-refresh live previews & Mission Control tiles in Fullscreen mode (off in inline mode)\n\
+     live_stream = true\n\n\
      # Home Hydra emblem mode: \"static\" | \"spin\" | \"inverted-spin\"\n\
      emblem_mode = \"spin\"\n\n\
      # Disable ANSI colors (also activated by NO_COLOR or TERM=dumb)\n\
@@ -255,7 +334,21 @@ pub fn starter_config_toml() -> &'static str {
      # Enable mouse wheel & clicks in Fullscreen mode (disabled automatically before tmux attach)\n\
      mouse = true\n\n\
      # Reserved viewport height in rows for inline mode (8..=40)\n\
-     inline_height = 16\n"
+     inline_height = 16\n\n\
+     [tmux]\n\
+     # Manage a Ctrl+b j popup keybind in ~/.tmux.conf (toggled interactively in /config)\n\
+     tmux_popup = false\n\n\
+     # Opt-in ~/.tmux.conf comfort defaults (all off/unmanaged unless enabled):\n\
+     # Enable tmux mouse scroll, click-to-focus, and drag-to-resize (`set -g mouse on`)\n\
+     tmux_mouse = false\n\n\
+     # Scrollback buffer lines (`0` = unmanaged; e.g. 10000, 50000, 100000 -> `set -g history-limit <N>`)\n\
+     tmux_history_limit = 0\n\n\
+     # Start window and pane numbering at 1 (`set -g base-index 1`, `set -gw pane-base-index 1`)\n\
+     tmux_base_index_one = false\n\n\
+     # Automatically renumber windows when one closes (`set -g renumber-windows on`)\n\
+     tmux_renumber_windows = false\n\n\
+     # Eliminate Esc key lag for Vim/Neovim (`set -sg escape-time 0`)\n\
+     tmux_zero_escape_time = false\n"
 }
 
 /// Resolve the active config path following:
@@ -335,6 +428,7 @@ struct EnvSnapshot {
     justmux_emblem_mode: Option<String>,
     justmux_language: Option<String>,
     justmux_lang: Option<String>,
+    justmux_live_stream: Option<String>,
 }
 
 impl EnvSnapshot {
@@ -358,6 +452,7 @@ impl EnvSnapshot {
             justmux_emblem_mode: std::env::var("JUSTMUX_EMBLEM_MODE").ok(),
             justmux_language: std::env::var("JUSTMUX_LANGUAGE").ok(),
             justmux_lang: std::env::var("JUSTMUX_LANG").ok(),
+            justmux_live_stream: std::env::var("JUSTMUX_LIVE_STREAM").ok(),
         }
     }
 
@@ -516,6 +611,15 @@ fn load_with_env(overrides: &CliOverrides, env: &EnvSnapshot) -> Result<LoadedCo
     {
         config.language = language;
     }
+    if let Some(raw_stream) = env
+        .justmux_live_stream
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        && let Some(enabled) = parse_env_bool(raw_stream)
+    {
+        config.live_stream = enabled;
+    }
 
     if let Some(mode) = overrides.screen_mode {
         config.screen_mode = mode;
@@ -590,7 +694,7 @@ fn parse_section_header(trimmed: &str, line_no: usize) -> Result<(), ConfigError
     }
     let inner = trimmed[1..trimmed.len() - 1].trim();
     match inner {
-        "ui" | "general" | "display" | "terminal" => Ok(()),
+        "ui" | "general" | "display" | "terminal" | "tmux" => Ok(()),
         "" => Err(ConfigError::at_line(line_no, "empty section header `[]`")),
         _ => Err(ConfigError::at_line(
             line_no,
@@ -643,6 +747,9 @@ fn apply_kv(
         "live_preview" | "preview" => {
             partial.live_preview = Some(parse_toml_bool(val, key, line_no)?);
         }
+        "live_stream" | "auto_refresh" | "stream_preview" => {
+            partial.live_stream = Some(parse_toml_bool(val, key, line_no)?);
+        }
         "emblem_mode" | "hydra_mode" | "emblem_spin" | "hydra_spin" | "rotate_emblem"
         | "animate_emblem" => {
             if val.starts_with('"') || val.starts_with('\'') {
@@ -685,6 +792,24 @@ fn apply_kv(
                     format!("invalid language `{parsed_str}` (expected en or zh)"),
                 )
             })?);
+        }
+        "tmux_popup" | "tmux_keybind" | "popup_keybind" => {
+            partial.tmux_popup = Some(parse_toml_bool(val, key, line_no)?);
+        }
+        "tmux_mouse" => {
+            partial.tmux_mouse = Some(parse_toml_bool(val, key, line_no)?);
+        }
+        "tmux_history_limit" => {
+            partial.tmux_history_limit = Some(parse_toml_u32(val, key, line_no)?);
+        }
+        "tmux_base_index_one" => {
+            partial.tmux_base_index_one = Some(parse_toml_bool(val, key, line_no)?);
+        }
+        "tmux_renumber_windows" => {
+            partial.tmux_renumber_windows = Some(parse_toml_bool(val, key, line_no)?);
+        }
+        "tmux_zero_escape_time" => {
+            partial.tmux_zero_escape_time = Some(parse_toml_bool(val, key, line_no)?);
         }
         _ => {
             return Err(ConfigError::at_line(
@@ -777,6 +902,14 @@ fn parse_unicode_escape(
     })
 }
 
+fn parse_env_bool(raw: &str) -> Option<bool> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "true" | "1" | "on" | "yes" => Some(true),
+        "false" | "0" | "off" | "no" => Some(false),
+        _ => None,
+    }
+}
+
 fn parse_toml_bool(raw: &str, key: &str, line_no: usize) -> Result<bool, ConfigError> {
     match raw {
         "true" => Ok(true),
@@ -839,6 +972,45 @@ fn parse_toml_inline_height(raw: &str, line_no: usize) -> Result<u16, ConfigErro
     })
 }
 
+fn parse_toml_u32(raw: &str, key: &str, line_no: usize) -> Result<u32, ConfigError> {
+    if raw.is_empty() || raw.starts_with('_') || raw.ends_with('_') || raw.contains("__") {
+        return Err(ConfigError::at_line(
+            line_no,
+            format!("invalid integer for `{key}`: `{raw}` (expected non-negative integer)"),
+        ));
+    }
+
+    let digits_part = if raw.starts_with('-') {
+        return Err(ConfigError::at_line(
+            line_no,
+            format!("`{key}` cannot be negative: `{raw}`"),
+        ));
+    } else if let Some(rest) = raw.strip_prefix('+') {
+        rest
+    } else {
+        raw
+    };
+
+    if digits_part.is_empty()
+        || digits_part.starts_with('_')
+        || digits_part.ends_with('_')
+        || !digits_part.chars().all(|c| c.is_ascii_digit() || c == '_')
+    {
+        return Err(ConfigError::at_line(
+            line_no,
+            format!("invalid integer for `{key}`: `{raw}` (expected non-negative integer)"),
+        ));
+    }
+
+    let compact: String = digits_part.chars().filter(|&c| c != '_').collect();
+    compact.parse::<u32>().map_err(|_| {
+        ConfigError::at_line(
+            line_no,
+            format!("`{key}` out of range: `{raw}` (expected 0..={})", u32::MAX),
+        )
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -851,21 +1023,28 @@ mod tests {
         assert_eq!(def.language, Language::En);
         assert_eq!(def.composer_mode, ComposerMode::CommandJump);
         assert!(def.live_preview);
+        assert!(def.live_stream);
         assert_eq!(def.emblem_mode, EmblemMode::Spin);
         assert!(def.mouse);
         assert_eq!(def.inline_height, 16);
         assert!(!def.no_color);
         assert!(!def.ascii);
+        assert!(!def.tmux_popup);
+        assert!(!def.tmux_mouse);
+        assert_eq!(def.tmux_history_limit, 0);
+        assert!(!def.tmux_base_index_one);
+        assert!(!def.tmux_renumber_windows);
+        assert!(!def.tmux_zero_escape_time);
 
         let starter_partial = parse_config_str(starter_config_toml()).expect("parse starter toml");
         let mut from_starter = Config::default();
         from_starter.apply(&starter_partial);
         assert_eq!(from_starter, def);
 
-        for (mode, language) in [
-            (EmblemMode::InvertedSpin, Language::Zh),
-            (EmblemMode::Static, Language::En),
-            (EmblemMode::Spin, Language::Zh),
+        for (mode, language, tmux_popup) in [
+            (EmblemMode::InvertedSpin, Language::Zh, true),
+            (EmblemMode::Static, Language::En, false),
+            (EmblemMode::Spin, Language::Zh, true),
         ] {
             let custom = Config {
                 screen_mode: ScreenMode::Inline,
@@ -873,11 +1052,18 @@ mod tests {
                 language,
                 composer_mode: ComposerMode::LiveRadar,
                 live_preview: false,
+                live_stream: false,
                 emblem_mode: mode,
                 mouse: false,
                 inline_height: 24,
                 no_color: true,
                 ascii: true,
+                tmux_popup,
+                tmux_mouse: tmux_popup,
+                tmux_history_limit: if tmux_popup { 50_000 } else { 0 },
+                tmux_base_index_one: tmux_popup,
+                tmux_renumber_windows: !tmux_popup,
+                tmux_zero_escape_time: tmux_popup,
             };
             let toml = custom.to_toml();
             assert!(
@@ -889,6 +1075,17 @@ mod tests {
                 toml.contains(&format!("language = \"{}\"", language.as_str())),
                 "to_toml missing language = {:?}: {toml}",
                 language.as_str()
+            );
+            assert!(
+                toml.contains(&format!("tmux_popup = {tmux_popup}")),
+                "to_toml missing tmux_popup = {tmux_popup}: {toml}",
+            );
+            assert!(
+                toml.contains(&format!(
+                    "tmux_history_limit = {}",
+                    custom.tmux_history_limit
+                )),
+                "to_toml missing tmux_history_limit: {toml}",
             );
             let reparsed = parse_config_str(&toml).expect("reparse to_toml");
             let mut round_tripped = Config::default();
@@ -912,6 +1109,8 @@ mod tests {
                    display_mode = \"compact\" # alias for inline\n\
                    mouse = false\n\
                    inline_height = 2_8\n\
+                   [tmux]\n\
+                   tmux_popup = true\n\
                    [general]\n\
                    [display]\n";
 
@@ -925,6 +1124,20 @@ mod tests {
         assert_eq!(parsed.screen_mode, Some(ScreenMode::Inline));
         assert_eq!(parsed.mouse, Some(false));
         assert_eq!(parsed.inline_height, Some(28));
+        assert_eq!(parsed.tmux_popup, Some(true));
+
+        assert_eq!(
+            parse_config_str("tmux_keybind = true\n")
+                .expect("tmux_keybind alias")
+                .tmux_popup,
+            Some(true)
+        );
+        assert_eq!(
+            parse_config_str("popup_keybind = false\n")
+                .expect("popup_keybind alias")
+                .tmux_popup,
+            Some(false)
+        );
 
         let lang_alias = parse_config_str("lang = 'zh-CN'\n").expect("lang alias");
         assert_eq!(lang_alias.language, Some(Language::Zh));
@@ -998,6 +1211,7 @@ mod tests {
             ("emblem_mode = spin\n", 1),
             ("pixel_glyphs = \"auto\"\n", 1),
             ("mouse = \"yes\"\n", 1),
+            ("tmux_popup = \"yes\"\n", 1),
             ("inline_height = 7\n", 1),
             ("inline_height = 41\n", 1),
             ("inline_height = -3\n", 1),
@@ -1140,11 +1354,18 @@ mod tests {
             language: Language::Zh,
             composer_mode: ComposerMode::QuickLaunch,
             live_preview: false,
+            live_stream: false,
             emblem_mode: EmblemMode::Static,
             mouse: false,
             inline_height: 22,
             no_color: false,
             ascii: false,
+            tmux_popup: true,
+            tmux_mouse: true,
+            tmux_history_limit: 50_000,
+            tmux_base_index_one: true,
+            tmux_renumber_windows: true,
+            tmux_zero_escape_time: true,
         };
         file_cfg.save(&cfg_path).expect("save config");
         assert!(cfg_path.exists());
@@ -1359,5 +1580,161 @@ mod tests {
         let parsed = parse_config_str(&content).expect("parse saved");
         assert_eq!(parsed.theme, Some(ThemePreset::CyberMatrix));
         assert_eq!(parsed.inline_height, Some(40));
+    }
+
+    #[test]
+    fn tmux_comfort_config_parses_underscores_errors_and_converts() {
+        let toml = "\
+            [tmux]\n\
+            tmux_mouse = true\n\
+            tmux_history_limit = 50_000\n\
+            tmux_base_index_one = true\n\
+            tmux_renumber_windows = true\n\
+            tmux_zero_escape_time = true\n";
+        let partial = parse_config_str(toml).expect("parse comfort toml");
+        assert_eq!(partial.tmux_mouse, Some(true));
+        assert_eq!(partial.tmux_history_limit, Some(50_000));
+        assert_eq!(partial.tmux_base_index_one, Some(true));
+        assert_eq!(partial.tmux_renumber_windows, Some(true));
+        assert_eq!(partial.tmux_zero_escape_time, Some(true));
+
+        let mut cfg = Config::default();
+        cfg.apply(&partial);
+        let opts = cfg.tmux_comfort_options();
+        assert!(opts.is_any_enabled());
+        assert!(opts.mouse);
+        assert_eq!(opts.history_limit, 50_000);
+        assert!(opts.base_index_one);
+        assert!(opts.renumber_windows);
+        assert!(opts.zero_escape_time);
+
+        let mut reset_cfg = cfg.clone();
+        reset_cfg.set_tmux_comfort_options(crate::tmux_conf::TmuxComfortOptions::default());
+        assert!(!reset_cfg.tmux_comfort_options().is_any_enabled());
+        assert_eq!(reset_cfg.tmux_history_limit, 0);
+
+        for bad in [
+            "tmux_mouse = \"on\"\n",
+            "tmux_history_limit = -10\n",
+            "tmux_history_limit = \"50000\"\n",
+            "tmux_history_limit = 999999999999999\n",
+            "tmux_base_index_one = 1\n",
+            "tmux_renumber_windows = \"yes\"\n",
+            "tmux_zero_escape_time = 0\n",
+        ] {
+            let err = parse_config_str(bad).expect_err(&format!("should reject {bad:?}"));
+            assert_eq!(err.line(), Some(1), "error was: {err}");
+        }
+    }
+
+    #[test]
+    fn live_stream_parsing_aliases_env_precedence_and_round_trip() {
+        assert!(Config::default().live_stream);
+
+        // Canonical key and aliases under [ui].
+        for (raw, expected) in [
+            ("[ui]\nlive_stream = false\n", false),
+            ("[ui]\nlive_stream = true\n", true),
+            ("auto_refresh = false\n", false),
+            ("auto_refresh = true\n", true),
+            ("stream_preview = false\n", false),
+            ("stream_preview = true\n", true),
+        ] {
+            let parsed = parse_config_str(raw).expect(raw);
+            assert_eq!(parsed.live_stream, Some(expected), "{raw}");
+        }
+
+        // Invalid TOML value fails with line number.
+        let err = parse_config_str("live_stream = \"on\"\n").expect_err("reject non-bool");
+        assert_eq!(err.line(), Some(1));
+
+        // TOML round-trip for both false and true.
+        for enabled in [false, true] {
+            let cfg = Config {
+                live_stream: enabled,
+                ..Config::default()
+            };
+            let toml = cfg.to_toml();
+            assert!(
+                toml.contains(&format!("live_stream = {enabled}")),
+                "to_toml missing live_stream = {enabled}: {toml}"
+            );
+            let partial = parse_config_str(&toml).expect("reparse");
+            let mut restored = Config::default();
+            restored.apply(&partial);
+            assert_eq!(restored, cfg);
+        }
+
+        // Env override parsing (`true`/`false`/`1`/`0`/`on`/`off`, case-insensitive & trimmed; invalid ignored).
+        for (raw, expected) in [
+            ("true", true),
+            ("TRUE", true),
+            ("1", true),
+            ("on", true),
+            (" On ", true),
+            ("false", false),
+            ("FALSE", false),
+            ("0", false),
+            ("off", false),
+            (" Off ", false),
+            ("invalid", true),
+            ("", true),
+        ] {
+            let loaded = load_with_env(
+                &CliOverrides::default(),
+                &EnvSnapshot {
+                    justmux_live_stream: Some(raw.into()),
+                    ..EnvSnapshot::default()
+                },
+            )
+            .expect("JUSTMUX_LIVE_STREAM parsing");
+            assert_eq!(
+                loaded.config.live_stream, expected,
+                "JUSTMUX_LIVE_STREAM={raw:?}"
+            );
+        }
+
+        // Env overrides config.toml in both directions.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cfg_path = dir.path().join("stream.toml");
+        Config {
+            live_stream: false,
+            ..Config::default()
+        }
+        .save(&cfg_path)
+        .expect("save stream=false");
+
+        let env_enables = load_with_env(
+            &CliOverrides {
+                config_path: Some(cfg_path.clone()),
+                ..CliOverrides::default()
+            },
+            &EnvSnapshot {
+                justmux_live_stream: Some("on".into()),
+                ..EnvSnapshot::default()
+            },
+        )
+        .expect("env overrides false -> true");
+        assert!(env_enables.config.live_stream);
+
+        Config {
+            live_stream: true,
+            ..Config::default()
+        }
+        .save(&cfg_path)
+        .expect("save stream=true");
+
+        let env_disables = load_with_env(
+            &CliOverrides {
+                config_path: Some(cfg_path),
+                ..CliOverrides::default()
+            },
+            &EnvSnapshot {
+                justmux_live_stream: Some("0".into()),
+                ..EnvSnapshot::default()
+            },
+        )
+        .expect("env overrides true -> false");
+        assert!(!env_disables.config.live_stream);
     }
 }

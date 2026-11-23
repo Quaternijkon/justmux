@@ -92,15 +92,13 @@ Keep the local release state and prepared packages until the release completes.
 
 ## GitHub and duplicate publication
 
-The npm workflow remains manually dispatched. Pushing the release commit or
-tag does not trigger a second npm release. Ordinary GitHub CI may still run
-after the push to check the source.
-
-Tag-triggered GitHub publication can be added later, with npm Trusted
-Publishing configured for every package. Choose one publisher for a release:
-local publication or GitHub publication. Running both can build different
-tarballs for the same immutable npm version. npm's integrity checks will reject
-that mismatch rather than replace the public package.
+Pushing a `v<version>` tag now triggers `.github/workflows/npm-release.yml` to
+build and publish to npm automatically via GitHub Actions OIDC Trusted
+Publishing. Choose one publisher for a release: either tag-triggered GitHub
+publication or local publication (`./scripts/release` without pushing until
+ready, or without tag-triggered CI). Running both can build different tarballs
+for the same immutable npm version. npm's integrity checks will reject that
+mismatch rather than replace the public package.
 
 After publication, users install or update both command names with:
 

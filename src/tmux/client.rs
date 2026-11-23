@@ -2,13 +2,15 @@
 use super::error::TmuxError;
 use super::parser;
 use super::{
-    Context, InsideContext, Pane, PaneId, Session, SessionId, SocketSpec, SplitDirection, Target,
-    Tmux, TmuxResult, TmuxVersion, Window, WindowId,
+    ClientInfo, Context, InsideContext, LayoutPreset, Pane, PaneId, PaneTargetSize, PasteBuffer,
+    ResizeDirection, Session, SessionId, SocketSpec, SplitDirection, Target, Tmux, TmuxResult,
+    TmuxVersion, Window, WindowId,
 };
 use std::env;
 use std::ffi::OsString;
+use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
 
 #[derive(Debug, Clone)]
 pub struct TmuxClient {
@@ -71,8 +73,38 @@ impl TmuxClient {
             }
         })
     }
+    fn run_with_stdin(&self, args: &[&str], stdin_data: &[u8]) -> TmuxResult<Output> {
+        let mut child = self
+            .command(args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|e| {
+                if e.kind() == std::io::ErrorKind::NotFound {
+                    TmuxError::NotInstalled
+                } else {
+                    e.into()
+                }
+            })?;
+        if let Some(mut stdin) = child.stdin.take()
+            && let Err(e) = stdin.write_all(stdin_data)
+            && e.kind() != std::io::ErrorKind::BrokenPipe
+        {
+            return Err(e.into());
+        }
+        Ok(child.wait_with_output()?)
+    }
     fn checked(&self, args: &[&str]) -> TmuxResult<Output> {
         let o = self.run(args)?;
+        if o.status.success() {
+            Ok(o)
+        } else {
+            Err(self.map_error(args.first().copied().unwrap_or("command"), &o))
+        }
+    }
+    fn checked_with_stdin(&self, args: &[&str], stdin_data: &[u8]) -> TmuxResult<Output> {
+        let o = self.run_with_stdin(args, stdin_data)?;
         if o.status.success() {
             Ok(o)
         } else {
@@ -99,7 +131,10 @@ impl TmuxClient {
             TmuxError::WindowNotFound
         } else if low.contains("pane") && low.contains("can't find") {
             TmuxError::PaneNotFound
-        } else if low.contains("no current client") || low.contains("no client") {
+        } else if low.contains("no current client")
+            || low.contains("no client")
+            || (low.contains("client") && low.contains("can't find"))
+        {
             TmuxError::NoCurrentClient
         } else {
             TmuxError::CommandFailed {
@@ -111,6 +146,32 @@ impl TmuxClient {
                 },
             }
         }
+    }
+    fn attach_command_impl(&self, target: &Target, readonly: bool) -> Command {
+        let target = target.to_string();
+        let args: &[&str] = if readonly {
+            &["attach-session", "-r", "-t", &target]
+        } else {
+            &["attach-session", "-t", &target]
+        };
+        let mut cmd = self.command(args);
+        if let SocketSpec::Default = &self.socket
+            && let Some(val) = env::var_os("TMUX")
+        {
+            let text = val.to_string_lossy();
+            if let Some(path) = text.split(',').next() {
+                cmd = self.command(&[]);
+                cmd.arg("-S").arg(path).args(args);
+            }
+        }
+        cmd.env_remove("TMUX")
+            .env_remove("TMUX_PANE")
+            .env_remove("JUSTMUX_CLIENT")
+            .env_remove("JUSTMUX_PANE")
+            .env_remove("JUSTMUX_POPUP")
+            .env_remove("JUSTMUX_INVOKED_AS")
+            .env_remove("TMUX_POPUP");
+        cmd
     }
     fn list_with(&self, args: &[&str]) -> TmuxResult<String> {
         match self.run(args)? {
@@ -160,8 +221,10 @@ impl TmuxClient {
     }
 }
 const SESSION_FORMAT: &str = "#{session_id}\t#{q:session_name}\t#{session_windows}\t#{session_attached}\t#{session_created}\t#{session_last_attached}\t#{session_activity}\t#{q:session_path}";
-const WINDOW_FORMAT: &str = "#{window_id}\t#{session_id}\t#{q:session_name}\t#{window_index}\t#{q:window_name}\t#{window_active}\t#{window_panes}";
-const PANE_FORMAT: &str = "#{pane_id}\t#{window_id}\t#{window_index}\t#{q:window_name}\t#{session_id}\t#{q:session_name}\t#{pane_index}\t#{pane_active}\t#{q:pane_current_command}\t#{q:pane_current_path}\t#{q:pane_title}\t#{pane_pid}\t#{pane_dead}\t#{pane_in_mode}";
+const WINDOW_FORMAT: &str = "#{window_id}\t#{session_id}\t#{q:session_name}\t#{window_index}\t#{q:window_name}\t#{window_active}\t#{window_panes}\t#{window_zoomed_flag}\t#{pane_synchronized}\t#{window_activity_flag}\t#{window_bell_flag}\t#{window_silence_flag}\t#{?monitor-activity,1,0}\t#{monitor-silence}\t#{window_layout}";
+const PANE_FORMAT: &str = "#{pane_id}\t#{window_id}\t#{window_index}\t#{q:window_name}\t#{session_id}\t#{q:session_name}\t#{pane_index}\t#{pane_active}\t#{q:pane_current_command}\t#{q:pane_current_path}\t#{q:pane_title}\t#{pane_pid}\t#{pane_dead}\t#{pane_in_mode}\t#{pane_width}\t#{pane_height}\t#{pane_left}\t#{pane_top}\t#{window_zoomed_flag}\t#{pane_synchronized}";
+const CLIENT_FORMAT: &str = "#{q:client_name}\t#{q:client_session}\t#{session_id}\t#{client_width}\t#{client_height}\t#{q:client_tty}\t#{client_readonly}\t#{client_control_mode}\t#{client_activity}";
+const BUFFER_FORMAT: &str = "#{q:buffer_name}\t#{buffer_size}\t#{buffer_sample}";
 impl Tmux for TmuxClient {
     fn version(&self) -> TmuxResult<TmuxVersion> {
         parser::parse_version(&String::from_utf8_lossy(&self.checked(&["-V"])?.stdout))
@@ -323,6 +386,9 @@ impl Tmux for TmuxClient {
             a.extend(["-n", n]);
         }
         if let Some(p) = cwd {
+            if !p.is_dir() {
+                return Err(TmuxError::DirectoryNotFound(p.to_path_buf()));
+            }
             a.extend([
                 "-c",
                 p.to_str().ok_or_else(|| {
@@ -344,6 +410,67 @@ impl Tmux for TmuxClient {
         self.checked(&["kill-window", "-t", id.as_str()])
             .map(|_| ())
     }
+    fn move_window(&self, source: &WindowId, target_session: &SessionId) -> TmuxResult<()> {
+        let target = format!("{target_session}:");
+        self.checked(&["move-window", "-d", "-s", source.as_str(), "-t", &target])
+            .map(|_| ())
+    }
+    fn swap_window(&self, source: &WindowId, target: &WindowId) -> TmuxResult<()> {
+        self.checked(&[
+            "swap-window",
+            "-d",
+            "-s",
+            source.as_str(),
+            "-t",
+            target.as_str(),
+        ])
+        .map(|_| ())
+    }
+    fn link_window(&self, source: &WindowId, target_session: &SessionId) -> TmuxResult<()> {
+        let target = format!("{target_session}:");
+        self.checked(&["link-window", "-d", "-s", source.as_str(), "-t", &target])
+            .map(|_| ())
+    }
+    fn select_layout(&self, window: &WindowId, layout: LayoutPreset) -> TmuxResult<()> {
+        self.select_layout_raw(window, layout.as_tmux_str())
+    }
+    fn select_layout_raw(&self, window: &WindowId, layout: &str) -> TmuxResult<()> {
+        self.checked(&["select-layout", "-t", window.as_str(), layout])
+            .map(|_| ())
+    }
+    fn set_synchronize_panes(&self, window: &WindowId, enabled: bool) -> TmuxResult<()> {
+        let val = if enabled { "on" } else { "off" };
+        self.checked(&[
+            "set-window-option",
+            "-t",
+            window.as_str(),
+            "synchronize-panes",
+            val,
+        ])
+        .map(|_| ())
+    }
+    fn set_monitor_activity(&self, window: &WindowId, enabled: bool) -> TmuxResult<()> {
+        let val = if enabled { "on" } else { "off" };
+        self.checked(&[
+            "set-window-option",
+            "-t",
+            window.as_str(),
+            "monitor-activity",
+            val,
+        ])
+        .map(|_| ())
+    }
+    fn set_monitor_silence(&self, window: &WindowId, seconds: u64) -> TmuxResult<()> {
+        let val = seconds.to_string();
+        self.checked(&[
+            "set-window-option",
+            "-t",
+            window.as_str(),
+            "monitor-silence",
+            &val,
+        ])
+        .map(|_| ())
+    }
     fn list_panes(&self, window: Option<&WindowId>) -> TmuxResult<Vec<Pane>> {
         let mut a = vec!["list-panes", "-F", PANE_FORMAT];
         if let Some(w) = window {
@@ -354,9 +481,30 @@ impl Tmux for TmuxClient {
         parser::parse_panes(&self.list_with(&a)?)
     }
     fn split_pane(&self, target: &PaneId, direction: SplitDirection) -> TmuxResult<Pane> {
+        self.split_pane_in(target, direction, None)
+    }
+    fn split_pane_in(
+        &self,
+        target: &PaneId,
+        direction: SplitDirection,
+        cwd: Option<&Path>,
+    ) -> TmuxResult<Pane> {
         let flag = match direction {
             SplitDirection::SideBySide => "-h",
             SplitDirection::Stacked => "-v",
+        };
+        let cwd_arg = match cwd {
+            Some(dir) => {
+                if !dir.is_dir() {
+                    return Err(TmuxError::DirectoryNotFound(dir.to_path_buf()));
+                }
+                dir.to_str().ok_or_else(|| {
+                    TmuxError::InvalidName("working directory is not valid UTF-8".into())
+                })?
+            }
+            // This is already one argv entry. Shell escaping would become a
+            // literal part of the directory and tmux would fall back to HOME.
+            None => "#{pane_current_path}",
         };
         let a = vec![
             "split-window",
@@ -365,9 +513,7 @@ impl Tmux for TmuxClient {
             "-t",
             target.as_str(),
             "-c",
-            // This is already one argv entry. Shell escaping would become a
-            // literal part of the directory and tmux would fall back to HOME.
-            "#{pane_current_path}",
+            cwd_arg,
             "-P",
             "-F",
             PANE_FORMAT,
@@ -382,14 +528,56 @@ impl Tmux for TmuxClient {
         target: &PaneId,
         direction: SplitDirection,
     ) -> TmuxResult<()> {
+        self.join_pane_ordered(source, target, direction, false)
+    }
+    fn join_pane_ordered(
+        &self,
+        source: &PaneId,
+        target: &PaneId,
+        direction: SplitDirection,
+        before: bool,
+    ) -> TmuxResult<()> {
         let flag = match direction {
             SplitDirection::SideBySide => "-h",
             SplitDirection::Stacked => "-v",
         };
-        self.checked(&[
-            "join-pane",
+        let mut a = vec!["join-pane", "-d"];
+        if before {
+            a.push("-b");
+        }
+        a.extend([flag, "-s", source.as_str(), "-t", target.as_str()]);
+        self.checked(&a).map(|_| ())
+    }
+    fn kill_pane(&self, id: &PaneId) -> TmuxResult<()> {
+        self.checked(&["kill-pane", "-t", id.as_str()]).map(|_| ())
+    }
+    fn toggle_zoom_pane(&self, id: &PaneId) -> TmuxResult<()> {
+        self.checked(&["resize-pane", "-Z", "-t", id.as_str()])
+            .map(|_| ())
+    }
+    fn break_pane(&self, id: &PaneId, name: Option<&str>) -> TmuxResult<Window> {
+        let mut a = vec![
+            "break-pane",
             "-d",
-            flag,
+            "-P",
+            "-F",
+            WINDOW_FORMAT,
+            "-s",
+            id.as_str(),
+        ];
+        if let Some(n) = name {
+            a.extend(["-n", n]);
+        }
+        let text = self.text(&a)?;
+        parser::parse_windows(&text)?
+            .into_iter()
+            .next()
+            .ok_or(TmuxError::WindowNotFound)
+    }
+    fn swap_pane(&self, source: &PaneId, target: &PaneId) -> TmuxResult<()> {
+        self.checked(&[
+            "swap-pane",
+            "-d",
             "-s",
             source.as_str(),
             "-t",
@@ -397,8 +585,118 @@ impl Tmux for TmuxClient {
         ])
         .map(|_| ())
     }
-    fn kill_pane(&self, id: &PaneId) -> TmuxResult<()> {
-        self.checked(&["kill-pane", "-t", id.as_str()]).map(|_| ())
+    fn resize_pane(&self, id: &PaneId, direction: ResizeDirection, amount: u16) -> TmuxResult<()> {
+        if amount == 0 {
+            return Ok(());
+        }
+        let amt = amount.to_string();
+        self.checked(&["resize-pane", "-t", id.as_str(), direction.flag(), &amt])
+            .map(|_| ())
+    }
+    fn resize_pane_percent(
+        &self,
+        id: &PaneId,
+        width_pct: Option<u8>,
+        height_pct: Option<u8>,
+    ) -> TmuxResult<()> {
+        self.resize_pane_to(id, PaneTargetSize::percent(width_pct, height_pct))
+    }
+    fn resize_pane_to(&self, id: &PaneId, size: PaneTargetSize) -> TmuxResult<()> {
+        if size.is_empty() {
+            return Ok(());
+        }
+        let width_arg = size.width.map(super::PaneDimension::to_tmux_arg);
+        let height_arg = size.height.map(super::PaneDimension::to_tmux_arg);
+        let mut a = vec!["resize-pane", "-t", id.as_str()];
+        if let Some(ref w) = width_arg {
+            a.extend(["-x", w.as_str()]);
+        }
+        if let Some(ref h) = height_arg {
+            a.extend(["-y", h.as_str()]);
+        }
+        self.checked(&a).map(|_| ())
+    }
+    fn respawn_pane(&self, id: &PaneId, kill_existing: bool) -> TmuxResult<()> {
+        if kill_existing {
+            self.checked(&["respawn-pane", "-k", "-t", id.as_str()])
+                .map(|_| ())
+        } else {
+            self.checked(&["respawn-pane", "-t", id.as_str()])
+                .map(|_| ())
+        }
+    }
+    fn clear_pane_history(&self, id: &PaneId) -> TmuxResult<()> {
+        self.checked(&["clear-history", "-t", id.as_str()])
+            .map(|_| ())
+    }
+    fn send_keys(&self, id: &PaneId, keys: &[&str], literal: bool) -> TmuxResult<()> {
+        if keys.is_empty() {
+            return Ok(());
+        }
+        let mut a = Vec::with_capacity(keys.len() + 5);
+        a.extend(["send-keys", "-t", id.as_str()]);
+        if literal {
+            a.push("-l");
+        }
+        a.push("--");
+        a.extend_from_slice(keys);
+        self.checked(&a).map(|_| ())
+    }
+    fn send_paste(&self, id: &PaneId, text: &str) -> TmuxResult<()> {
+        if text.is_empty() {
+            return Ok(());
+        }
+        static PIP_PASTE_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let seq = PIP_PASTE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let buf_name = format!("justmux-pip-{}-{seq}", std::process::id());
+        let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
+        self.checked_with_stdin(
+            &["load-buffer", "-b", &buf_name, "-"],
+            normalized.as_bytes(),
+        )?;
+        match self.checked(&[
+            "paste-buffer",
+            "-d",
+            "-p",
+            "-b",
+            &buf_name,
+            "-t",
+            id.as_str(),
+        ]) {
+            Ok(_) => Ok(()),
+            Err(err) => {
+                let _ = self.delete_buffer(&buf_name);
+                Err(err)
+            }
+        }
+    }
+    fn rename_pane_title(&self, id: &PaneId, title: &str) -> TmuxResult<()> {
+        self.checked(&["select-pane", "-t", id.as_str(), "-T", title])
+            .map(|_| ())
+    }
+    fn toggle_pipe_pane(&self, id: &PaneId, log_path: Option<&Path>) -> TmuxResult<()> {
+        match log_path {
+            Some(path) => {
+                if let Some(parent) = path.parent()
+                    && !parent.as_os_str().is_empty()
+                    && !parent.is_dir()
+                {
+                    return Err(TmuxError::DirectoryNotFound(parent.to_path_buf()));
+                }
+                let raw = path.to_str().ok_or_else(|| {
+                    TmuxError::InvalidName("log file path is not valid UTF-8".into())
+                })?;
+                if raw.is_empty() || raw.contains(['\0', '\n', '\r']) {
+                    return Err(TmuxError::InvalidName(
+                        "log file path cannot be empty or contain line breaks".into(),
+                    ));
+                }
+                let cmd = format!("cat >> {}", shell_single_quote(raw));
+                self.checked(&["pipe-pane", "-o", "-t", id.as_str(), &cmd])
+                    .map(|_| ())
+            }
+            None => self.checked(&["pipe-pane", "-t", id.as_str()]).map(|_| ()),
+        }
     }
     fn capture_pane(&self, target: &Target, max_lines: usize) -> TmuxResult<Vec<String>> {
         if max_lines == 0 {
@@ -408,6 +706,32 @@ impl Tmux for TmuxClient {
         let start = format!("-{}", max_lines.min(2_000));
         let stdout = self.text(&["capture-pane", "-p", "-e", "-S", &start, "-t", &target])?;
         Ok(sanitize_captured_sgr_lines(&stdout, max_lines))
+    }
+    fn capture_pane_plain(&self, target: &Target, max_lines: usize) -> TmuxResult<Vec<String>> {
+        if max_lines == 0 {
+            return Ok(Vec::new());
+        }
+        let target = target.to_string();
+        let start = format!("-{}", max_lines.min(2_000));
+        let stdout = self.text(&["capture-pane", "-p", "-S", &start, "-t", &target])?;
+        Ok(sanitize_captured_lines(&stdout, max_lines))
+    }
+    fn list_buffers(&self) -> TmuxResult<Vec<PasteBuffer>> {
+        parser::parse_buffers(&self.list_with(&["list-buffers", "-F", BUFFER_FORMAT])?)
+    }
+    fn show_buffer(&self, name: &str) -> TmuxResult<String> {
+        self.text(&["show-buffer", "-b", name])
+    }
+    fn set_buffer(&self, content: &str) -> TmuxResult<()> {
+        self.checked_with_stdin(&["load-buffer", "-"], content.as_bytes())
+            .map(|_| ())
+    }
+    fn paste_buffer(&self, name: &str, target: &PaneId) -> TmuxResult<()> {
+        self.checked(&["paste-buffer", "-b", name, "-t", target.as_str()])
+            .map(|_| ())
+    }
+    fn delete_buffer(&self, name: &str) -> TmuxResult<()> {
+        self.checked(&["delete-buffer", "-b", name]).map(|_| ())
     }
     fn select(&self, target: &Target) -> TmuxResult<()> {
         match target {
@@ -452,28 +776,133 @@ impl Tmux for TmuxClient {
     fn detach_client(&self, client: &str) -> TmuxResult<()> {
         self.checked(&["detach-client", "-t", client]).map(|_| ())
     }
-    fn attach_command(&self, target: &Target) -> Command {
-        let target = target.to_string();
-        let mut cmd = self.command(&["attach-session", "-t", &target]);
-        if let SocketSpec::Default = &self.socket
-            && let Some(val) = env::var_os("TMUX")
-        {
-            let text = val.to_string_lossy();
-            if let Some(path) = text.split(',').next() {
-                cmd = self.command(&[]);
-                cmd.arg("-S")
-                    .arg(path)
-                    .args(["attach-session", "-t", &target]);
+    fn list_clients(&self) -> TmuxResult<Vec<ClientInfo>> {
+        parser::parse_clients(&self.list_with(&["list-clients", "-F", CLIENT_FORMAT])?)
+    }
+    fn detach_other_clients(
+        &self,
+        session: Option<&SessionId>,
+        keep_client: Option<&str>,
+    ) -> TmuxResult<usize> {
+        let keep_owned = match keep_client {
+            Some(client) => Some(client.to_owned()),
+            None => match self.context() {
+                Context::Inside(InsideContext {
+                    client_name: Some(current),
+                    ..
+                }) => Some(current),
+                _ => None,
+            },
+        };
+        let clients = self.list_clients()?;
+        let mut detached = 0;
+        for client in clients {
+            if let Some(sid) = session
+                && client.session_id.as_ref() != Some(sid)
+            {
+                continue;
+            }
+            if keep_owned.as_deref() == Some(client.name.as_str()) {
+                continue;
+            }
+            match self.detach_client(&client.name) {
+                Ok(()) => detached += 1,
+                Err(TmuxError::NoCurrentClient) => {}
+                Err(e) => return Err(e),
             }
         }
-        cmd.env_remove("TMUX")
-            .env_remove("TMUX_PANE")
-            .env_remove("JUSTMUX_CLIENT")
-            .env_remove("JUSTMUX_PANE")
-            .env_remove("JUSTMUX_POPUP")
-            .env_remove("JUSTMUX_INVOKED_AS")
-            .env_remove("TMUX_POPUP");
-        cmd
+        Ok(detached)
+    }
+    fn attach_command(&self, target: &Target) -> Command {
+        self.attach_command_impl(target, false)
+    }
+    fn attach_command_readonly(&self, target: &Target) -> Command {
+        self.attach_command_impl(target, true)
+    }
+    fn source_file(&self, path: &Path) -> TmuxResult<()> {
+        let raw = path
+            .to_str()
+            .ok_or_else(|| TmuxError::InvalidName("config file path is not valid UTF-8".into()))?;
+        self.checked(&["source-file", raw]).map(|_| ())
+    }
+    fn kill_server(&self) -> TmuxResult<()> {
+        self.checked(&["kill-server"]).map(|_| ())
+    }
+    fn display_popup_shell(&self, cwd: Option<&Path>) -> TmuxResult<()> {
+        let Context::Inside(InsideContext {
+            client_name: Some(client),
+            ..
+        }) = self.context()
+        else {
+            return Err(TmuxError::NoCurrentClient);
+        };
+        if !self.version()?.supports_popup() {
+            return Err(TmuxError::CommandFailed {
+                command: "display-popup".into(),
+                message: "tmux 3.2 or newer is required for display-popup".into(),
+            });
+        }
+        let mut a = vec![
+            "display-popup",
+            "-E",
+            "-c",
+            client.as_str(),
+            "-w",
+            "80%",
+            "-h",
+            "80%",
+        ];
+        if let Some(dir) = cwd {
+            if !dir.is_dir() {
+                return Err(TmuxError::DirectoryNotFound(dir.to_path_buf()));
+            }
+            let raw = dir.to_str().ok_or_else(|| {
+                TmuxError::InvalidName("working directory is not valid UTF-8".into())
+            })?;
+            a.extend(["-d", raw]);
+        }
+        self.checked(&a).map(|_| ())
+    }
+    fn set_global_option(&self, option: &str, value: &str) -> TmuxResult<()> {
+        self.checked(&["set-option", "-g", option, value])
+            .map(|_| ())
+    }
+    fn set_global_window_option(&self, option: &str, value: &str) -> TmuxResult<()> {
+        self.checked(&["set-window-option", "-g", option, value])
+            .map(|_| ())
+    }
+    fn set_server_option(&self, option: &str, value: &str) -> TmuxResult<()> {
+        self.checked(&["set-option", "-sg", option, value])
+            .map(|_| ())
+    }
+    fn bind_popup_key(&self, run_shell_command: &str) -> TmuxResult<bool> {
+        if !self.server_running()? {
+            return Ok(false);
+        }
+        self.checked(&[
+            "bind-key",
+            "-T",
+            "prefix",
+            crate::tmux_conf::POPUP_KEY,
+            "run-shell",
+            run_shell_command,
+        ])?;
+        Ok(true)
+    }
+    fn unbind_popup_key(&self) -> TmuxResult<bool> {
+        if !self.server_running()? {
+            return Ok(false);
+        }
+        let out = self.run(&["list-keys", "-T", "prefix", crate::tmux_conf::POPUP_KEY])?;
+        if !out.status.success() {
+            return Ok(false);
+        }
+        let keys = String::from_utf8_lossy(&out.stdout);
+        if !keys.contains("JUSTMUX_POPUP=1") {
+            return Ok(false);
+        }
+        self.checked(&["unbind-key", "-T", "prefix", crate::tmux_conf::POPUP_KEY])?;
+        Ok(true)
     }
 }
 
@@ -482,6 +911,22 @@ fn same_socket(a: &Path, b: &Path) -> bool {
         (Ok(a), Ok(b)) => a == b,
         _ => a == b,
     }
+}
+
+/// POSIX single-quote escaping for the command string tmux `pipe-pane` passes
+/// to `/bin/sh -c` internally.
+fn shell_single_quote(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len() + 2);
+    out.push('\'');
+    for ch in raw.chars() {
+        if ch == '\'' {
+            out.push_str("'\\''");
+        } else {
+            out.push(ch);
+        }
+    }
+    out.push('\'');
+    out
 }
 
 /// Strip ANSI escape sequences and control characters from captured terminal
@@ -1004,5 +1449,854 @@ mod tests {
         );
         assert!(line.contains("GREEN_OK"), "missing GREEN_OK in {line:?}");
         assert!(line.contains("RGB_OK"), "missing RGB_OK in {line:?}");
+    }
+
+    #[test]
+    fn shell_single_quote_escapes_metacharacters_safely() {
+        assert_eq!(shell_single_quote("/tmp/simple.log"), "'/tmp/simple.log'");
+        assert_eq!(
+            shell_single_quote("/tmp/a'b $HOME `id`; rm -rf /"),
+            "'/tmp/a'\\''b $HOME `id`; rm -rf /'"
+        );
+    }
+
+    #[test]
+    fn attach_command_readonly_sets_readonly_flag_and_clears_env() {
+        let client = TmuxClient::new(SocketSpec::Name("jm-ro-test".into()));
+        let cmd =
+            client.attach_command_readonly(&Target::Session(SessionId::new("$2").expect("id")));
+        let args: Vec<&std::ffi::OsStr> = cmd.get_args().collect();
+        assert!(
+            args.windows(4)
+                .any(|w| w == ["attach-session", "-r", "-t", "$2"]),
+            "expected attach-session -r -t $2 in {args:?}"
+        );
+        let removed: Vec<&std::ffi::OsStr> = cmd
+            .get_envs()
+            .filter_map(|(key, value)| value.is_none().then_some(key))
+            .collect();
+        for var in [
+            "TMUX",
+            "TMUX_PANE",
+            "JUSTMUX_CLIENT",
+            "JUSTMUX_PANE",
+            "JUSTMUX_POPUP",
+            "JUSTMUX_INVOKED_AS",
+            "TMUX_POPUP",
+        ] {
+            assert!(
+                removed.contains(&std::ffi::OsStr::new(var)),
+                "attach_command_readonly should remove {var}"
+            );
+        }
+    }
+
+    #[test]
+    fn zoom_break_swap_resize_and_layouts_on_private_socket() {
+        let server = PrivateTmuxServer::new();
+        let out = server.tmux(&[
+            "new-session",
+            "-d",
+            "-s",
+            "layout-demo",
+            "-n",
+            "main",
+            "-x",
+            "100",
+            "-y",
+            "30",
+            "sh -c 'sleep 30'",
+        ]);
+        assert!(
+            out.status.success(),
+            "new-session failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+
+        let sessions = server.client.list_sessions().expect("sessions");
+        let sid = sessions[0].id.clone();
+        let windows = server.client.list_windows(Some(&sid)).expect("windows");
+        assert_eq!(windows.len(), 1);
+        let wid = windows[0].id.clone();
+        assert!(!windows[0].zoomed);
+        assert!(!windows[0].synchronized);
+        assert!(!windows[0].layout.is_empty());
+
+        let panes = server.client.list_panes(Some(&wid)).expect("panes");
+        assert_eq!(panes.len(), 1);
+        assert_eq!(
+            (panes[0].width, panes[0].height, panes[0].left, panes[0].top),
+            (100, 30, 0, 0)
+        );
+        let p0 = panes[0].id.clone();
+
+        // Split with explicit cwd via split_pane_in.
+        let p1 = server
+            .client
+            .split_pane_in(&p0, SplitDirection::SideBySide, Some(Path::new("/tmp")))
+            .expect("split_pane_in");
+        assert!(p1.left > 0, "right split should have left > 0: {p1:?}");
+
+        // Rename pane titles and swap panes.
+        server
+            .client
+            .rename_pane_title(&p0, "left-pane")
+            .expect("title p0");
+        server
+            .client
+            .rename_pane_title(&p1.id, "right-pane")
+            .expect("title p1");
+        let before_swap = server.client.list_panes(Some(&wid)).expect("before swap");
+        let p0_before = before_swap.iter().find(|p| p.id == p0).expect("p0 before");
+        assert_eq!(p0_before.title, "left-pane");
+        let p0_left_before = p0_before.left;
+
+        server.client.swap_pane(&p0, &p1.id).expect("swap_pane");
+        let after_swap = server.client.list_panes(Some(&wid)).expect("after swap");
+        let p0_after = after_swap.iter().find(|p| p.id == p0).expect("p0 after");
+        assert_ne!(p0_after.left, p0_left_before, "swap_pane should move p0");
+
+        // Zoom toggle on window and pane flags.
+        server.client.toggle_zoom_pane(&p0).expect("zoom on");
+        let w_zoomed = server.client.list_windows(Some(&sid)).expect("w zoomed");
+        assert!(w_zoomed[0].zoomed);
+        let p_zoomed = server.client.list_panes(Some(&wid)).expect("p zoomed");
+        assert!(p_zoomed.iter().all(|p| p.zoomed));
+        server.client.toggle_zoom_pane(&p0).expect("zoom off");
+        let w_unzoomed = server.client.list_windows(Some(&sid)).expect("w unzoomed");
+        assert!(!w_unzoomed[0].zoomed);
+
+        // Save layout, switch to EvenVertical, then restore raw layout.
+        let saved_layout = w_unzoomed[0].layout.clone();
+        server
+            .client
+            .select_layout(&wid, LayoutPreset::EvenVertical)
+            .expect("even-vertical");
+        let stacked = server.client.list_panes(Some(&wid)).expect("stacked");
+        assert!(
+            stacked.iter().any(|p| p.top > 0),
+            "even-vertical should stack panes vertically: {stacked:?}"
+        );
+        server
+            .client
+            .select_layout_raw(&wid, &saved_layout)
+            .expect("restore raw layout");
+        let restored = server.client.list_panes(Some(&wid)).expect("restored");
+        assert!(
+            restored.iter().all(|p| p.top == 0),
+            "restored horizontal layout should put panes on top=0: {restored:?}"
+        );
+
+        // Percentage resize and incremental resize.
+        server
+            .client
+            .resize_pane_percent(&p0, Some(70), None)
+            .expect("resize 70%");
+        let after_pct = server.client.list_panes(Some(&wid)).expect("after pct");
+        let w_pct = after_pct.iter().find(|p| p.id == p0).expect("p0").width;
+        assert!(
+            (65..=75).contains(&w_pct),
+            "expected ~70% width of 100 cols, got {w_pct}"
+        );
+        server
+            .client
+            .resize_pane(&p0, ResizeDirection::Left, 5)
+            .expect("resize step");
+        let after_step = server.client.list_panes(Some(&wid)).expect("after step");
+        let w_step = after_step.iter().find(|p| p.id == p0).expect("p0").width;
+        assert_ne!(w_step, w_pct, "incremental resize should adjust pane width");
+
+        // Break pane out into a new named window.
+        let broken = server
+            .client
+            .break_pane(&p1.id, Some("broken-out"))
+            .expect("break_pane");
+        assert_eq!(broken.name, "broken-out");
+        assert_eq!(broken.panes, 1);
+        assert_eq!(
+            server
+                .client
+                .list_panes(Some(&wid))
+                .expect("remaining panes")
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn window_move_swap_link_sync_and_monitoring_on_private_socket() {
+        let server = PrivateTmuxServer::new();
+        let s1 = server
+            .client
+            .new_session("alpha", Path::new("/tmp"))
+            .expect("s1");
+        let s2 = server
+            .client
+            .new_session("beta", Path::new("/tmp"))
+            .expect("s2");
+        let w_first = server.client.list_windows(Some(&s1.id)).expect("w1")[0].clone();
+        let w_second = server
+            .client
+            .new_window(&s1.id, Some("second"), None)
+            .expect("w2");
+
+        // Synchronize-panes + activity/silence monitoring flags.
+        server
+            .client
+            .set_synchronize_panes(&w_second.id, true)
+            .expect("sync on");
+        server
+            .client
+            .set_monitor_activity(&w_second.id, true)
+            .expect("monitor-activity on");
+        server
+            .client
+            .set_monitor_silence(&w_second.id, 45)
+            .expect("monitor-silence 45");
+        let wins = server.client.list_windows(Some(&s1.id)).expect("wins");
+        let updated = wins.iter().find(|w| w.id == w_second.id).expect("updated");
+        assert!(updated.synchronized);
+        assert!(updated.monitor_activity);
+        assert_eq!(updated.monitor_silence, 45);
+        let panes = server.client.list_panes(Some(&w_second.id)).expect("panes");
+        assert!(panes[0].synchronized);
+
+        server
+            .client
+            .set_synchronize_panes(&w_second.id, false)
+            .expect("sync off");
+        server
+            .client
+            .set_monitor_activity(&w_second.id, false)
+            .expect("monitor-activity off");
+        server
+            .client
+            .set_monitor_silence(&w_second.id, 0)
+            .expect("monitor-silence 0");
+        let wins = server.client.list_windows(Some(&s1.id)).expect("wins off");
+        let updated = wins.iter().find(|w| w.id == w_second.id).expect("updated");
+        assert!(!updated.synchronized);
+        assert!(!updated.monitor_activity);
+        assert_eq!(updated.monitor_silence, 0);
+
+        // Swap window positions inside s1.
+        let idx_first_before = w_first.index;
+        let idx_second_before = w_second.index;
+        server
+            .client
+            .swap_window(&w_first.id, &w_second.id)
+            .expect("swap_window");
+        let wins = server
+            .client
+            .list_windows(Some(&s1.id))
+            .expect("after swap");
+        assert_eq!(
+            wins.iter().find(|w| w.id == w_first.id).expect("w1").index,
+            idx_second_before
+        );
+        assert_eq!(
+            wins.iter().find(|w| w.id == w_second.id).expect("w2").index,
+            idx_first_before
+        );
+
+        // Move w_second to s2, then link it back into s1.
+        server
+            .client
+            .move_window(&w_second.id, &s2.id)
+            .expect("move_window");
+        assert!(
+            server
+                .client
+                .list_windows(Some(&s2.id))
+                .expect("s2 wins")
+                .iter()
+                .any(|w| w.id == w_second.id)
+        );
+        assert!(
+            !server
+                .client
+                .list_windows(Some(&s1.id))
+                .expect("s1 wins")
+                .iter()
+                .any(|w| w.id == w_second.id)
+        );
+
+        server
+            .client
+            .link_window(&w_second.id, &s1.id)
+            .expect("link_window");
+        assert!(
+            server
+                .client
+                .list_windows(Some(&s1.id))
+                .expect("s1 after link")
+                .iter()
+                .any(|w| w.id == w_second.id)
+        );
+        assert!(
+            server
+                .client
+                .list_windows(Some(&s2.id))
+                .expect("s2 after link")
+                .iter()
+                .any(|w| w.id == w_second.id)
+        );
+    }
+
+    #[test]
+    fn pane_plain_capture_send_keys_history_respawn_and_pipe_pane() {
+        let server = PrivateTmuxServer::new();
+        let out = server.tmux(&[
+            "new-session",
+            "-d",
+            "-s",
+            "pane-ops",
+            "-x",
+            "80",
+            "-y",
+            "8",
+            "sh",
+        ]);
+        assert!(
+            out.status.success(),
+            "new-session failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let pane = server.client.list_panes(None).expect("panes")[0].clone();
+        let target = Target::Pane(pane.id.clone());
+
+        // Emit colored output and verify capture_pane_plain strips SGR codes.
+        server
+            .client
+            .send_keys(
+                &pane.id,
+                &[r#"printf '\033[1;31mPLAIN_MARKER\033[0m\n'"#],
+                true,
+            )
+            .expect("send literal");
+        server
+            .client
+            .send_keys(&pane.id, &["Enter"], false)
+            .expect("send enter");
+        let _ = server.wait_for_capture(&target, "PLAIN_MARKER");
+        let plain = server
+            .client
+            .capture_pane_plain(&target, 50)
+            .expect("plain capture");
+        let marker_line = plain
+            .iter()
+            .find(|l| l.contains("PLAIN_MARKER"))
+            .expect("plain marker");
+        assert!(
+            !marker_line.contains("\x1b["),
+            "plain capture must not include ANSI escapes: {marker_line:?}"
+        );
+
+        // Pipe-pane to a filename with spaces and single quote inside a temp dir.
+        let dir = std::env::temp_dir().join(format!("jm-pipe-test-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let log_path = dir.join("pane's log.txt");
+        let _ = std::fs::remove_file(&log_path);
+
+        assert!(matches!(
+            server
+                .client
+                .toggle_pipe_pane(&pane.id, Some(Path::new("/nonexistent-jm-dir-xyz/a.log"))),
+            Err(TmuxError::DirectoryNotFound(_))
+        ));
+        assert!(matches!(
+            server
+                .client
+                .toggle_pipe_pane(&pane.id, Some(&dir.join("bad\nname.log"))),
+            Err(TmuxError::InvalidName(_))
+        ));
+
+        server
+            .client
+            .toggle_pipe_pane(&pane.id, Some(&log_path))
+            .expect("pipe start");
+        server
+            .client
+            .send_keys(&pane.id, &["echo PIPE_CAPTURED_987"], true)
+            .expect("send pipe marker");
+        server
+            .client
+            .send_keys(&pane.id, &["Enter"], false)
+            .expect("send enter");
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            if let Ok(content) = std::fs::read_to_string(&log_path)
+                && content.contains("PIPE_CAPTURED_987")
+            {
+                break;
+            }
+            assert!(Instant::now() < deadline, "timed out waiting for pipe log");
+            thread::sleep(Duration::from_millis(25));
+        }
+        server
+            .client
+            .toggle_pipe_pane(&pane.id, None)
+            .expect("pipe stop");
+        let _ = std::fs::remove_file(&log_path);
+        let _ = std::fs::remove_dir(&dir);
+
+        // Scrollback clear-history.
+        server
+            .client
+            .send_keys(
+                &pane.id,
+                &["i=1; while [ $i -le 30 ]; do echo HIST_ROW_$i; i=$((i+1)); done"],
+                true,
+            )
+            .expect("emit scrollback");
+        server
+            .client
+            .send_keys(&pane.id, &["Enter"], false)
+            .expect("enter");
+        let _ = server.wait_for_capture_lines(&target, 100, "HIST_ROW_30");
+        assert!(
+            server
+                .client
+                .capture_pane_plain(&target, 100)
+                .expect("before clear")
+                .iter()
+                .any(|l| l.contains("HIST_ROW_1"))
+        );
+        server
+            .client
+            .clear_pane_history(&pane.id)
+            .expect("clear_pane_history");
+        assert!(
+            !server
+                .client
+                .capture_pane_plain(&target, 100)
+                .expect("after clear")
+                .iter()
+                .any(|l| l.contains("HIST_ROW_1")),
+            "HIST_ROW_1 should be cleared from scrollback"
+        );
+
+        // Respawn pane with kill_existing=true changes PID.
+        let old_pid = pane.pid;
+        server
+            .client
+            .respawn_pane(&pane.id, true)
+            .expect("respawn_pane");
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            let refreshed = server.client.list_panes(None).expect("panes after respawn");
+            if refreshed[0].pid != old_pid {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "pane pid did not change after respawn"
+            );
+            thread::sleep(Duration::from_millis(25));
+        }
+    }
+
+    #[test]
+    fn paste_buffers_crud_and_paste_on_private_socket() {
+        let server = PrivateTmuxServer::new();
+        assert!(
+            server
+                .client
+                .list_buffers()
+                .expect("empty on no server")
+                .is_empty()
+        );
+
+        let out = server.tmux(&["new-session", "-d", "-s", "bufs", "sh"]);
+        assert!(out.status.success());
+        let pane_id = server.client.list_panes(None).expect("panes")[0].id.clone();
+
+        let payload = "-n hello\t世界\nsecond line";
+        server.client.set_buffer(payload).expect("set_buffer");
+        let buffers = server.client.list_buffers().expect("list_buffers");
+        assert_eq!(buffers.len(), 1);
+        assert_eq!(buffers[0].size, payload.len());
+        let buf_name = buffers[0].name.clone();
+        assert_eq!(
+            server.client.show_buffer(&buf_name).expect("show_buffer"),
+            payload
+        );
+
+        // Push a simple command buffer and paste into pane without deleting buffer.
+        server
+            .client
+            .set_buffer("echo PASTED_BUFFER_OK\n")
+            .expect("set cmd buffer");
+        let buffers = server.client.list_buffers().expect("list 2 buffers");
+        assert_eq!(buffers.len(), 2);
+        let cmd_buf = buffers[0].name.clone();
+        server
+            .client
+            .paste_buffer(&cmd_buf, &pane_id)
+            .expect("paste_buffer");
+        let _ = server.wait_for_capture(&Target::Pane(pane_id), "PASTED_BUFFER_OK");
+        assert_eq!(
+            server.client.list_buffers().expect("preserved").len(),
+            2,
+            "paste_buffer must preserve the buffer"
+        );
+
+        server
+            .client
+            .delete_buffer(&cmd_buf)
+            .expect("delete_buffer");
+        assert_eq!(server.client.list_buffers().expect("after delete").len(), 1);
+    }
+
+    #[test]
+    fn clients_options_source_file_popup_and_kill_server_on_private_socket() {
+        struct ControlClient(std::process::Child);
+        impl Drop for ControlClient {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+
+        let server = PrivateTmuxServer::new();
+        assert!(
+            server
+                .client
+                .list_clients()
+                .expect("clients on no server")
+                .is_empty()
+        );
+        assert!(matches!(
+            server.client.display_popup_shell(None),
+            Err(TmuxError::NoCurrentClient)
+        ));
+
+        let s1 = server
+            .client
+            .new_session("one", Path::new("/tmp"))
+            .expect("s1");
+        let s2 = server
+            .client
+            .new_session("two", Path::new("/tmp"))
+            .expect("s2");
+
+        let spawn_client = |target: &SessionId, readonly: bool| -> ControlClient {
+            let mut cmd = Command::new("tmux");
+            cmd.arg("-L")
+                .arg(&server.socket)
+                .args(["-f", "/dev/null", "-C", "attach-session"]);
+            if readonly {
+                cmd.arg("-r");
+            }
+            cmd.args(["-t", target.as_str()])
+                .env_remove("TMUX")
+                .env_remove("TMUX_PANE")
+                .stdin(Stdio::piped())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null());
+            ControlClient(cmd.spawn().expect("spawn control client"))
+        };
+
+        let _c1 = spawn_client(&s1.id, false);
+        let _c2 = spawn_client(&s1.id, true);
+        let _c3 = spawn_client(&s2.id, false);
+
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let clients = loop {
+            let list = server.client.list_clients().expect("list_clients");
+            if list.len() == 3 {
+                break list;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for 3 clients: {list:?}"
+            );
+            thread::sleep(Duration::from_millis(20));
+        };
+        assert!(
+            clients
+                .iter()
+                .any(|c| c.readonly && c.session_id.as_ref() == Some(&s1.id))
+        );
+        assert!(clients.iter().all(|c| c.control_mode));
+
+        let keep_name = clients
+            .iter()
+            .find(|c| !c.readonly && c.session_id.as_ref() == Some(&s1.id))
+            .expect("rw client on s1")
+            .name
+            .clone();
+        let detached = server
+            .client
+            .detach_other_clients(Some(&s1.id), Some(&keep_name))
+            .expect("detach_other_clients");
+        assert_eq!(detached, 1);
+
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            let remaining = server.client.list_clients().expect("remaining clients");
+            if remaining.len() == 2 {
+                assert!(remaining.iter().any(|c| c.name == keep_name));
+                assert!(
+                    remaining
+                        .iter()
+                        .any(|c| c.session_id.as_ref() == Some(&s2.id))
+                );
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "expected 2 clients left: {remaining:?}"
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+
+        // Global, window, and server options + source_file.
+        server
+            .client
+            .set_global_option("mouse", "on")
+            .expect("set -g mouse");
+        server
+            .client
+            .set_global_window_option("pane-base-index", "1")
+            .expect("set -gw pane-base-index");
+        server
+            .client
+            .set_server_option("escape-time", "0")
+            .expect("set -sg escape-time");
+        assert_eq!(
+            String::from_utf8_lossy(&server.tmux(&["show-options", "-gv", "mouse"]).stdout).trim(),
+            "on"
+        );
+        assert_eq!(
+            String::from_utf8_lossy(
+                &server
+                    .tmux(&["show-window-options", "-gv", "pane-base-index"])
+                    .stdout
+            )
+            .trim(),
+            "1"
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&server.tmux(&["show-options", "-sgv", "escape-time"]).stdout)
+                .trim(),
+            "0"
+        );
+
+        let conf_path =
+            std::env::temp_dir().join(format!("jm-source-test-{}.conf", std::process::id()));
+        std::fs::write(&conf_path, "set -g history-limit 12345\n").expect("write temp conf");
+        server.client.source_file(&conf_path).expect("source_file");
+        let _ = std::fs::remove_file(&conf_path);
+        assert_eq!(
+            String::from_utf8_lossy(
+                &server
+                    .tmux(&["show-options", "-gv", "history-limit"])
+                    .stdout
+            )
+            .trim(),
+            "12345"
+        );
+
+        // kill_server shuts down the private server cleanly.
+        server.client.kill_server().expect("kill_server");
+        assert!(!server.client.server_running().expect("server_running"));
+        assert!(matches!(
+            server.client.kill_server(),
+            Err(TmuxError::NoServer)
+        ));
+    }
+
+    #[test]
+    fn join_pane_ordered_places_before_left_top_and_after_right_bottom_on_private_socket() {
+        let server = PrivateTmuxServer::new();
+        let out = server.tmux(&[
+            "new-session",
+            "-d",
+            "-s",
+            "dock-test",
+            "-n",
+            "anchor",
+            "-x",
+            "120",
+            "-y",
+            "40",
+            "sh -c 'sleep 30'",
+        ]);
+        assert!(out.status.success());
+        let sid = server.client.list_sessions().expect("s")[0].id.clone();
+        let anchor_win = server.client.list_windows(Some(&sid)).expect("w")[0]
+            .id
+            .clone();
+        let anchor_pane = server.client.list_panes(Some(&anchor_win)).expect("p")[0]
+            .id
+            .clone();
+
+        let new_detached_pane = |name: &str| -> PaneId {
+            let win = server
+                .client
+                .new_window(&sid, Some(name), None)
+                .expect("new win");
+            server.client.list_panes(Some(&win.id)).expect("pane")[0]
+                .id
+                .clone()
+        };
+
+        let left_pane = new_detached_pane("left");
+        let right_pane = new_detached_pane("right");
+        let top_pane = new_detached_pane("top");
+        let bottom_pane = new_detached_pane("bottom");
+
+        // Dock `left_pane` BEFORE anchor horizontally -> left_pane.left < anchor.left.
+        server
+            .client
+            .join_pane_ordered(&left_pane, &anchor_pane, SplitDirection::SideBySide, true)
+            .expect("join left");
+        let panes = server
+            .client
+            .list_panes(Some(&anchor_win))
+            .expect("after left");
+        let p_left = panes.iter().find(|p| p.id == left_pane).expect("left");
+        let p_anchor = panes.iter().find(|p| p.id == anchor_pane).expect("anchor");
+        assert!(
+            p_left.left < p_anchor.left,
+            "before=true horizontal should dock left: left={p_left:?} anchor={p_anchor:?}"
+        );
+
+        // Dock `right_pane` AFTER anchor horizontally -> right_pane.left > anchor.left.
+        server
+            .client
+            .join_pane_ordered(&right_pane, &anchor_pane, SplitDirection::SideBySide, false)
+            .expect("join right");
+        let panes = server
+            .client
+            .list_panes(Some(&anchor_win))
+            .expect("after right");
+        let p_right = panes.iter().find(|p| p.id == right_pane).expect("right");
+        let p_anchor = panes.iter().find(|p| p.id == anchor_pane).expect("anchor");
+        assert!(
+            p_right.left > p_anchor.left,
+            "before=false horizontal should dock right: right={p_right:?} anchor={p_anchor:?}"
+        );
+
+        // Dock `top_pane` BEFORE anchor vertically -> top_pane.top < anchor.top.
+        server
+            .client
+            .join_pane_ordered(&top_pane, &anchor_pane, SplitDirection::Stacked, true)
+            .expect("join top");
+        let panes = server
+            .client
+            .list_panes(Some(&anchor_win))
+            .expect("after top");
+        let p_top = panes.iter().find(|p| p.id == top_pane).expect("top");
+        let p_anchor = panes.iter().find(|p| p.id == anchor_pane).expect("anchor");
+        assert!(
+            p_top.top < p_anchor.top,
+            "before=true vertical should dock above: top={p_top:?} anchor={p_anchor:?}"
+        );
+
+        // Dock `bottom_pane` AFTER anchor vertically -> bottom_pane.top > anchor.top.
+        server
+            .client
+            .join_pane_ordered(&bottom_pane, &anchor_pane, SplitDirection::Stacked, false)
+            .expect("join bottom");
+        let panes = server
+            .client
+            .list_panes(Some(&anchor_win))
+            .expect("after bottom");
+        let p_bottom = panes.iter().find(|p| p.id == bottom_pane).expect("bottom");
+        let p_anchor = panes.iter().find(|p| p.id == anchor_pane).expect("anchor");
+        assert!(
+            p_bottom.top > p_anchor.top,
+            "before=false vertical should dock below: bottom={p_bottom:?} anchor={p_anchor:?}"
+        );
+    }
+
+    #[test]
+    fn send_key_event_and_send_paste_execute_live_pip_input_without_polluting_buffers() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        let server = PrivateTmuxServer::new();
+        let out = server.tmux(&[
+            "new-session",
+            "-d",
+            "-s",
+            "pip-live",
+            "-x",
+            "80",
+            "-y",
+            "16",
+            "sh",
+        ]);
+        assert!(out.status.success());
+        let pane_id = server.client.list_panes(None).expect("pane")[0].id.clone();
+        let target = Target::Pane(pane_id.clone());
+
+        // Seed a user paste buffer and verify `send_paste` leaves it untouched.
+        server
+            .client
+            .set_buffer("KEEP_USER_BUFFER")
+            .expect("seed user buffer");
+
+        // Type a command containing `;` and UTF-8 via `send_key_event` char-by-char + Enter.
+        for ch in "echo PIP_KEY_OK; echo 中文_OK".chars() {
+            server
+                .client
+                .send_key_event(
+                    &pane_id,
+                    KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE),
+                )
+                .expect("send char");
+        }
+        server
+            .client
+            .send_key_event(&pane_id, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .expect("send enter");
+        let lines = server.wait_for_capture(&target, "中文_OK");
+        assert!(lines.iter().any(|l| l.contains("PIP_KEY_OK")));
+
+        // Verify Ctrl+C interrupts a running command via `send_key_event`.
+        server
+            .client
+            .send_paste(&pane_id, "sleep 30\n")
+            .expect("paste sleep");
+        thread::sleep(Duration::from_millis(80));
+        server
+            .client
+            .send_key_event(
+                &pane_id,
+                KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
+            )
+            .expect("send ctrl-c");
+
+        // Multi-line `send_paste` executes both lines and preserves user's paste buffers.
+        server
+            .client
+            .send_paste(&pane_id, "echo PASTE_ONE\r\necho PASTE_TWO\n")
+            .expect("send multi-line paste");
+        let lines = server.wait_for_capture(&target, "PASTE_TWO");
+        assert!(lines.iter().any(|l| l.contains("PASTE_ONE")));
+
+        let bufs = server.client.list_buffers().expect("buffers intact");
+        assert_eq!(bufs.len(), 1);
+        assert_eq!(
+            server.client.show_buffer(&bufs[0].name).expect("show"),
+            "KEEP_USER_BUFFER"
+        );
+
+        // Sending paste to a missing pane cleans up its ephemeral buffer on error.
+        let missing = PaneId::new("%99999").expect("id");
+        assert!(matches!(
+            server.client.send_paste(&missing, "hello"),
+            Err(TmuxError::PaneNotFound)
+        ));
+        assert_eq!(
+            server
+                .client
+                .list_buffers()
+                .expect("no leaked temp buffer")
+                .len(),
+            1
+        );
     }
 }

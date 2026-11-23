@@ -115,6 +115,22 @@ pub struct Window {
     pub active: bool,
     /// Number of panes.
     pub panes: usize,
+    /// Whether the window's active pane is currently zoomed (`#{window_zoomed_flag}`).
+    pub zoomed: bool,
+    /// Whether `synchronize-panes` is enabled on this window (`#{pane_synchronized}`).
+    pub synchronized: bool,
+    /// Whether tmux flagged unseen activity on this window (`#{window_activity_flag}`).
+    pub activity_flag: bool,
+    /// Whether tmux flagged a bell on this window (`#{window_bell_flag}`).
+    pub bell_flag: bool,
+    /// Whether tmux flagged silence on this window (`#{window_silence_flag}`).
+    pub silence_flag: bool,
+    /// tmux layout descriptor (`#{window_layout}`), restorable via `select-layout`.
+    pub layout: String,
+    /// Whether `monitor-activity` is enabled (`#{?monitor-activity,1,0}`).
+    pub monitor_activity: bool,
+    /// `monitor-silence` interval in seconds (`0` means disabled, `#{monitor-silence}`).
+    pub monitor_silence: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -139,6 +155,165 @@ pub struct Pane {
     /// Whether something other than an idle shell appears to be running.
     /// Closing a busy pane needs a stronger confirmation.
     pub busy: bool,
+    /// Pane width in terminal columns (`#{pane_width}`).
+    pub width: u32,
+    /// Pane height in terminal rows (`#{pane_height}`).
+    pub height: u32,
+    /// Pane left x-coordinate within its window (`#{pane_left}`).
+    pub left: u32,
+    /// Pane top y-coordinate within its window (`#{pane_top}`).
+    pub top: u32,
+    /// Whether the pane's window is currently zoomed (`#{window_zoomed_flag}`).
+    pub zoomed: bool,
+    /// Whether `synchronize-panes` is enabled on this pane (`#{pane_synchronized}`).
+    pub synchronized: bool,
+}
+
+/// An attached tmux client reported by `list-clients`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClientInfo {
+    pub name: String,
+    pub session_name: String,
+    pub session_id: Option<SessionId>,
+    pub width: u32,
+    pub height: u32,
+    pub tty: String,
+    pub readonly: bool,
+    pub control_mode: bool,
+    pub activity: u64,
+}
+
+/// A tmux paste buffer reported by `list-buffers`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PasteBuffer {
+    pub name: String,
+    pub size: usize,
+    pub sample: String,
+}
+
+/// Built-in tmux window layout presets (`select-layout`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum LayoutPreset {
+    EvenHorizontal,
+    EvenVertical,
+    MainHorizontal,
+    MainVertical,
+    Tiled,
+}
+
+impl LayoutPreset {
+    pub const ALL: [Self; 5] = [
+        Self::EvenHorizontal,
+        Self::EvenVertical,
+        Self::MainHorizontal,
+        Self::MainVertical,
+        Self::Tiled,
+    ];
+
+    pub const fn as_tmux_str(self) -> &'static str {
+        match self {
+            Self::EvenHorizontal => "even-horizontal",
+            Self::EvenVertical => "even-vertical",
+            Self::MainHorizontal => "main-horizontal",
+            Self::MainVertical => "main-vertical",
+            Self::Tiled => "tiled",
+        }
+    }
+
+    pub const fn label_en(self) -> &'static str {
+        match self {
+            Self::EvenHorizontal => "Even Horizontal",
+            Self::EvenVertical => "Even Vertical",
+            Self::MainHorizontal => "Main Horizontal",
+            Self::MainVertical => "Main Vertical",
+            Self::Tiled => "Tiled",
+        }
+    }
+
+    pub const fn label_zh(self) -> &'static str {
+        match self {
+            Self::EvenHorizontal => "水平均分",
+            Self::EvenVertical => "垂直均分",
+            Self::MainHorizontal => "主上副下",
+            Self::MainVertical => "主左副右",
+            Self::Tiled => "网格平铺",
+        }
+    }
+
+    pub const fn label(self, zh: bool) -> &'static str {
+        if zh { self.label_zh() } else { self.label_en() }
+    }
+}
+
+impl fmt::Display for LayoutPreset {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_tmux_str())
+    }
+}
+
+/// Direction for incremental `tmux resize-pane`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ResizeDirection {
+    Left,
+    Right,
+    Up,
+    Down,
+}
+
+impl ResizeDirection {
+    pub const fn flag(self) -> &'static str {
+        match self {
+            Self::Left => "-L",
+            Self::Right => "-R",
+            Self::Up => "-U",
+            Self::Down => "-D",
+        }
+    }
+}
+
+/// Target pane dimension for `tmux resize-pane -x / -y`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PaneDimension {
+    /// Percentage of the window (`1..=100`).
+    Percent(u8),
+    /// Exact terminal cell count (`>= 1`).
+    Cells(u16),
+}
+
+impl PaneDimension {
+    pub fn to_tmux_arg(self) -> String {
+        match self {
+            Self::Percent(pct) => format!("{}%", pct.clamp(1, 100)),
+            Self::Cells(cells) => cells.max(1).to_string(),
+        }
+    }
+}
+
+/// Target width and/or height for resizing a pane (`resize-pane -x/-y`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Hash)]
+pub struct PaneTargetSize {
+    pub width: Option<PaneDimension>,
+    pub height: Option<PaneDimension>,
+}
+
+impl PaneTargetSize {
+    pub fn percent(width_pct: Option<u8>, height_pct: Option<u8>) -> Self {
+        Self {
+            width: width_pct.map(PaneDimension::Percent),
+            height: height_pct.map(PaneDimension::Percent),
+        }
+    }
+
+    pub fn cells(width: Option<u16>, height: Option<u16>) -> Self {
+        Self {
+            width: width.map(PaneDimension::Cells),
+            height: height.map(PaneDimension::Cells),
+        }
+    }
+
+    pub fn is_empty(self) -> bool {
+        self.width.is_none() && self.height.is_none()
+    }
 }
 
 /// How to split a pane. Named after the resulting layout because tmux's own
@@ -255,5 +430,34 @@ mod tests {
         assert!(v("3.2", Some((3, 2))).supports_popup());
         assert!(v("4.0", Some((4, 0))).supports_popup());
         assert!(v("master", None).supports_popup());
+    }
+
+    #[test]
+    fn layout_presets_and_resize_helpers_format_cleanly() {
+        assert_eq!(LayoutPreset::ALL.len(), 5);
+        assert_eq!(
+            LayoutPreset::EvenHorizontal.as_tmux_str(),
+            "even-horizontal"
+        );
+        assert_eq!(LayoutPreset::Tiled.to_string(), "tiled");
+        assert_eq!(LayoutPreset::MainVertical.label(false), "Main Vertical");
+        assert_eq!(LayoutPreset::MainVertical.label(true), "主左副右");
+
+        assert_eq!(ResizeDirection::Left.flag(), "-L");
+        assert_eq!(ResizeDirection::Right.flag(), "-R");
+        assert_eq!(ResizeDirection::Up.flag(), "-U");
+        assert_eq!(ResizeDirection::Down.flag(), "-D");
+
+        assert_eq!(PaneDimension::Percent(0).to_tmux_arg(), "1%");
+        assert_eq!(PaneDimension::Percent(70).to_tmux_arg(), "70%");
+        assert_eq!(PaneDimension::Percent(150).to_tmux_arg(), "100%");
+        assert_eq!(PaneDimension::Cells(0).to_tmux_arg(), "1");
+        assert_eq!(PaneDimension::Cells(42).to_tmux_arg(), "42");
+
+        assert!(PaneTargetSize::default().is_empty());
+        let target = PaneTargetSize::percent(Some(70), None);
+        assert!(!target.is_empty());
+        assert_eq!(target.width, Some(PaneDimension::Percent(70)));
+        assert_eq!(target.height, None);
     }
 }

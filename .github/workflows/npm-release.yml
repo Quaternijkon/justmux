@@ -1,8 +1,12 @@
 name: npm distribution
 
-# Local builds are the primary release path. This optional workflow runs only
-# when explicitly dispatched, and building never publishes by default.
+# Pushing a v* version tag triggers automated verification, native builds, and
+# npm Trusted Publishing (OIDC). Manual workflow_dispatch remains available
+# with publish=false by default for build-only checks or manual re-runs.
 on:
+  push:
+    tags:
+      - 'v*'
   workflow_dispatch:
     inputs:
       publish:
@@ -15,7 +19,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: npm-distribution-${{ inputs.publish && 'publish' || github.ref }}
+  group: npm-distribution-${{ (github.event_name == 'push' || inputs.publish) && 'publish' || github.ref }}
   cancel-in-progress: false
 
 defaults:
@@ -40,7 +44,7 @@ jobs:
       - name: Check matching package and tag versions
         id: version
         env:
-          PUBLISH: ${{ inputs.publish }}
+          PUBLISH: ${{ github.event_name == 'push' || inputs.publish }}
         run: |
           python3 - <<'PY'
           import json, os, tomllib
@@ -51,7 +55,7 @@ jobs:
               raise SystemExit('Cargo and npm package versions must match')
           if os.environ['PUBLISH'] == 'true':
               if os.environ['GITHUB_REF_TYPE'] != 'tag' or os.environ['GITHUB_REF_NAME'] != 'v' + version:
-                  raise SystemExit('Publishing requires dispatch on the exact v' + version + ' tag')
+                  raise SystemExit('Publishing requires the exact v' + version + ' tag')
           with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
               output.write('version=' + version + '\n')
           PY
@@ -174,7 +178,7 @@ jobs:
 
   publish:
     name: Publish to npm
-    if: inputs.publish
+    if: github.event_name == 'push' || inputs.publish
     needs: [verify, assemble]
     runs-on: ubuntu-24.04
     timeout-minutes: 15
@@ -187,9 +191,10 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: '24'
-          registry-url: https://registry.npmjs.org
       - name: Use an npm CLI with trusted-publishing support
-        run: npm install --global npm@11
+        run: |
+          npm install --global npm@11
+          npm --version
       - uses: actions/download-artifact@v4
         with:
           name: justmux-npm-${{ needs.verify.outputs.version }}
