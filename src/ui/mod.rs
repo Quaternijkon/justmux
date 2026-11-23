@@ -3586,7 +3586,7 @@ fn config_art_composer_mode(
                             theme.adapt(if zh { " ⌂ 目录   " } else { " ⌂ CWD    " }),
                             border,
                         ),
-                        Span::styled("~/project/justmux-codex", text_st),
+                        Span::styled("~/project/justmux", text_st),
                     ]),
                     Line::from(Span::styled(
                         if zh {
@@ -11847,7 +11847,7 @@ pub(super) mod tests {
 
         let preview_lines = vec!["cargo test --lib ui".to_owned(), "24 passed".to_owned()];
         let details = HomeDetails {
-            directory: Some("/Users/demo/justmux-codex"),
+            directory: Some("/Users/demo/justmux"),
             context: "default",
             session: Some("work"),
             status: None,
@@ -12517,7 +12517,7 @@ pub(super) mod tests {
     fn workspace_subview_chrome_renders_config_theme_help_confirm_and_tribute_ascii() {
         let theme = Theme::default().with_preset(ThemePreset::AntigravityAurora);
         let details = HomeDetails {
-            directory: Some("/Users/demo/justmux-codex"),
+            directory: Some("/Users/demo/justmux"),
             context: "popup",
             session: Some("work"),
             status: None,
