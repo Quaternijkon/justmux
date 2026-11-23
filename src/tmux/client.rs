@@ -376,6 +376,27 @@ impl Tmux for TmuxClient {
         let mut p = parser::parse_panes(&String::from_utf8_lossy(&out.stdout))?;
         p.pop().ok_or(TmuxError::PaneNotFound)
     }
+    fn join_pane(
+        &self,
+        source: &PaneId,
+        target: &PaneId,
+        direction: SplitDirection,
+    ) -> TmuxResult<()> {
+        let flag = match direction {
+            SplitDirection::SideBySide => "-h",
+            SplitDirection::Stacked => "-v",
+        };
+        self.checked(&[
+            "join-pane",
+            "-d",
+            flag,
+            "-s",
+            source.as_str(),
+            "-t",
+            target.as_str(),
+        ])
+        .map(|_| ())
+    }
     fn kill_pane(&self, id: &PaneId) -> TmuxResult<()> {
         self.checked(&["kill-pane", "-t", id.as_str()]).map(|_| ())
     }

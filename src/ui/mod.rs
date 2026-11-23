@@ -2,6 +2,8 @@
 
 mod palette;
 pub use palette::*;
+mod split;
+pub use split::*;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::{
@@ -581,7 +583,7 @@ fn workspace_card_inner_area(area: Rect) -> Option<Rect> {
     Some(padded_card_inner(raw_inner))
 }
 
-fn split_lower_band_for_hydra(lower_band: Rect) -> (Rect, Option<Rect>) {
+pub(super) fn split_lower_band_for_hydra(lower_band: Rect) -> (Rect, Option<Rect>) {
     if lower_band.width >= 60 {
         let max_hydra_w = lower_band.width.saturating_sub(44).min(32);
         if let Some((hydra_w, _)) = hydra_target_dimensions(max_hydra_w, lower_band.height) {
@@ -597,7 +599,7 @@ fn split_lower_band_for_hydra(lower_band: Rect) -> (Rect, Option<Rect>) {
     (lower_band, None)
 }
 
-fn render_hydra_emblem_if_some(
+pub(super) fn render_hydra_emblem_if_some(
     frame: &mut Frame<'_>,
     hydra_box: Option<Rect>,
     emblem_step: usize,
@@ -614,7 +616,7 @@ fn render_hydra_emblem_if_some(
     false
 }
 
-fn render_horizontal_divider_line(frame: &mut Frame<'_>, rule_area: Rect, theme: Theme) {
+pub(super) fn render_horizontal_divider_line(frame: &mut Frame<'_>, rule_area: Rect, theme: Theme) {
     if rule_area.width == 0 || rule_area.height == 0 {
         return;
     }
@@ -1277,12 +1279,14 @@ fn render_home_drawers(
 }
 
 /// Result geometry and interaction metadata returned by [`render_workspace_subview`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct WorkspaceSubviewLayout {
     pub list_rect: Option<Rect>,
     pub preview_area: Option<Rect>,
     pub hydra_rendered: bool,
     pub confirm_scroll: u16,
+    pub split_slot_hits: Vec<(Rect, usize)>,
+    pub split_toolbar_hits: Vec<(Rect, SplitToolbarButton)>,
 }
 
 /// Interactive view payload rendered inside the unified [`render_workspace_subview`] chrome.
@@ -1309,10 +1313,7 @@ pub enum SubviewContent<'a> {
         empty: &'a str,
         preview: Option<PanePreview<'a>>,
     },
-    Split {
-        target_label: &'a str,
-        selected: usize,
-    },
+    Split(SplitStudioView<'a>),
     Form {
         title: &'a str,
         label: &'a str,
@@ -1412,11 +1413,11 @@ impl SubviewContent<'_> {
                     "↑↓ Select · Enter Actions · PgUp/PgDn Scroll Preview · Esc Back"
                 }
             }
-            Self::Split { .. } => {
+            Self::Split(..) => {
                 if zh {
-                    "↑↓ / ←→ / Tab 选择布局 · Enter 分屏 · Esc 返回"
+                    "1-4/Tab 选窗格 · h/v 分屏 · t 翻转 · x 移除 · r 重置 · ↑↓ 选窗口 · Space 交换 · Enter 进入 · Esc 返回"
                 } else {
-                    "↑↓ / ←→ / Tab Choose Layout · Enter Split · Esc Back"
+                    "1-4/Tab Pane · h/v Split · t Flip · x Del · r Reset · ↑↓ Window · Space Swap · Enter Launch · Esc Back"
                 }
             }
             Self::Form { .. } => {
@@ -1545,10 +1546,9 @@ fn render_compact_subview_fallback(
             *preview,
             theme,
         ),
-        SubviewContent::Split {
-            target_label,
-            selected,
-        } => render_split_selector(frame, area, target_label, *selected, theme),
+        SubviewContent::Split(studio) => {
+            layout = render_compact_split_studio(frame, area, studio, theme)
+        }
         SubviewContent::Form {
             title,
             label,
@@ -1688,14 +1688,10 @@ fn render_subview_card_body(
             spec.emblem_mode,
             theme,
         ),
-        SubviewContent::Split {
-            target_label,
-            selected,
-        } => render_subview_split(
+        SubviewContent::Split(studio) => render_subview_split(
             frame,
             card_inner,
-            target_label,
-            *selected,
+            studio,
             spec.emblem_step,
             spec.emblem_mode,
             theme,
@@ -1869,6 +1865,8 @@ fn render_subview_config(
             preview_area: None,
             hydra_rendered,
             confirm_scroll: 0,
+            split_slot_hits: Vec::new(),
+            split_toolbar_hits: Vec::new(),
         };
     }
 
@@ -1881,6 +1879,8 @@ fn render_subview_config(
         preview_area: None,
         hydra_rendered: false,
         confirm_scroll: 0,
+        split_slot_hits: Vec::new(),
+        split_toolbar_hits: Vec::new(),
     }
 }
 
@@ -3453,9 +3453,9 @@ fn config_art_composer_mode(
                     ]),
                     Line::from(Span::styled(
                         theme.adapt(if zh {
-                            " ▸/split   拆分窗格 (-h / -v)        窗格"
+                            " ▸/split   2x2 可视化分屏工作台      窗格"
                         } else {
-                            " ▸/split   Split pane (-h / -v)     PANE "
+                            " ▸/split   2x2 visual Split Studio  PANE "
                         }),
                         theme.selected_style(),
                     )),
@@ -5766,6 +5766,8 @@ fn render_subview_theme(
             preview_area: None,
             hydra_rendered,
             confirm_scroll: 0,
+            split_slot_hits: Vec::new(),
+            split_toolbar_hits: Vec::new(),
         };
     }
 
@@ -5783,6 +5785,8 @@ fn render_subview_theme(
         preview_area: None,
         hydra_rendered: false,
         confirm_scroll: 0,
+        split_slot_hits: Vec::new(),
+        split_toolbar_hits: Vec::new(),
     }
 }
 
@@ -5822,7 +5826,7 @@ fn render_subview_help(
             ),
             (
                 "/split",
-                "左右或上下拆分窗格",
+                "2x2 可视化分屏工作台",
                 "/help",
                 "命令与快捷键速查指南",
             ),
@@ -5861,7 +5865,7 @@ fn render_subview_help(
             ),
             (
                 "/split",
-                "side-by-side or stacked pane",
+                "2x2 visual Split Studio",
                 "/help",
                 "commands & shortcuts guide",
             ),
@@ -6027,6 +6031,8 @@ fn render_subview_help(
             preview_area: None,
             hydra_rendered,
             confirm_scroll: 0,
+            split_slot_hits: Vec::new(),
+            split_toolbar_hits: Vec::new(),
         };
     }
 
@@ -6134,6 +6140,8 @@ fn render_subview_picker(
             preview_area,
             hydra_rendered,
             confirm_scroll: 0,
+            split_slot_hits: Vec::new(),
+            split_toolbar_hits: Vec::new(),
         };
     }
 
@@ -6150,6 +6158,8 @@ fn render_subview_picker(
             preview_area: Some(preview_box),
             hydra_rendered: false,
             confirm_scroll: 0,
+            split_slot_hits: Vec::new(),
+            split_toolbar_hits: Vec::new(),
         };
     }
 
@@ -6162,98 +6172,8 @@ fn render_subview_picker(
         preview_area: None,
         hydra_rendered: false,
         confirm_scroll: 0,
-    }
-}
-
-fn render_subview_split(
-    frame: &mut Frame<'_>,
-    card_inner: Rect,
-    target_label: &str,
-    selected: usize,
-    emblem_step: usize,
-    emblem_mode: EmblemMode,
-    theme: Theme,
-) -> WorkspaceSubviewLayout {
-    if card_inner.height < 14 {
-        render_split_selector(frame, card_inner, target_label, selected, theme);
-        return WorkspaceSubviewLayout::default();
-    }
-    let zh = theme.language.is_zh() && !theme.ascii;
-    let clamped = selected.min(1);
-    let (upper_band, rule_area, lower_band) = split_subview_bands(card_inner, 7, true);
-    let [title_area, wire_area] =
-        Layout::vertical([Constraint::Length(1), Constraint::Min(5)]).areas(upper_band);
-    let split_title = if zh { "拆分窗格" } else { "Split pane" };
-    let mut title_spans = vec![Span::styled(
-        split_title,
-        theme.style(theme.accent).add_modifier(Modifier::BOLD),
-    )];
-    if !target_label.is_empty() {
-        let label = format!("  {}", single_line(target_label));
-        if split_title.width() + label.width() <= usize::from(title_area.width) {
-            title_spans.push(Span::styled(theme.adapt(&label), theme.style(theme.muted)));
-        }
-    }
-    frame.render_widget(Paragraph::new(Line::from(title_spans)), title_area);
-    if wire_area.width >= 36 && wire_area.height >= 5 {
-        let [left, right] =
-            Layout::horizontal([Constraint::Length(19), Constraint::Min(17)]).areas(wire_area);
-        frame.render_widget(
-            Paragraph::new(side_by_side_wireframe(clamped == 0, theme)),
-            left,
-        );
-        frame.render_widget(
-            Paragraph::new(stacked_wireframe(clamped == 1, theme)),
-            right,
-        );
-    } else if wire_area.width >= 16 && wire_area.height >= 4 {
-        let lines = if clamped == 0 {
-            side_by_side_wireframe(true, theme)
-        } else {
-            stacked_wireframe(true, theme)
-        };
-        frame.render_widget(Paragraph::new(lines), wire_area);
-    }
-    render_horizontal_divider_line(frame, rule_area, theme);
-    let (left_band, hydra_box) = split_lower_band_for_hydra(lower_band);
-    let options = if zh {
-        [
-            "左右分屏 — 在右侧新建窗格 (tmux -h)",
-            "上下分屏 — 在下方新建窗格 (tmux -v)",
-        ]
-    } else {
-        [
-            "Side by side — new pane on the right (tmux -h)",
-            "Stacked — new pane below (tmux -v)",
-        ]
-    };
-    let list_items: Vec<ListItem<'_>> = options
-        .iter()
-        .enumerate()
-        .map(|(i, label)| {
-            let is_sel = i == clamped;
-            let style = if is_sel {
-                theme.selected_style()
-            } else {
-                theme.style(theme.text)
-            };
-            let marker = if is_sel { theme.marker() } else { " " };
-            ListItem::new(Line::from(Span::styled(
-                format!("{marker} {}", theme.adapt(label)),
-                style,
-            )))
-        })
-        .collect();
-    let mut state = ListState::default();
-    state.select(Some(clamped));
-    frame.render_stateful_widget(List::new(list_items), left_band, &mut state);
-    let hydra_rendered =
-        render_hydra_emblem_if_some(frame, hydra_box, emblem_step, emblem_mode, theme);
-    WorkspaceSubviewLayout {
-        list_rect: Some(left_band),
-        preview_area: None,
-        hydra_rendered,
-        confirm_scroll: 0,
+        split_slot_hits: Vec::new(),
+        split_toolbar_hits: Vec::new(),
     }
 }
 
@@ -6338,6 +6258,8 @@ fn render_subview_form(
             preview_area: None,
             hydra_rendered,
             confirm_scroll: 0,
+            split_slot_hits: Vec::new(),
+            split_toolbar_hits: Vec::new(),
         };
     }
 
@@ -6459,6 +6381,8 @@ fn render_subview_confirm(
             preview_area: None,
             hydra_rendered,
             confirm_scroll,
+            split_slot_hits: Vec::new(),
+            split_toolbar_hits: Vec::new(),
         };
     }
 
@@ -6468,6 +6392,8 @@ fn render_subview_confirm(
         preview_area: None,
         hydra_rendered: false,
         confirm_scroll,
+        split_slot_hits: Vec::new(),
+        split_toolbar_hits: Vec::new(),
     }
 }
 
@@ -6593,6 +6519,8 @@ fn render_subview_actions(
             preview_area: None,
             hydra_rendered,
             confirm_scroll: 0,
+            split_slot_hits: Vec::new(),
+            split_toolbar_hits: Vec::new(),
         };
     }
 
@@ -6610,6 +6538,8 @@ fn render_subview_actions(
         preview_area: None,
         hydra_rendered: false,
         confirm_scroll: 0,
+        split_slot_hits: Vec::new(),
+        split_toolbar_hits: Vec::new(),
     }
 }
 
@@ -6683,6 +6613,8 @@ fn render_subview_created(
             preview_area: None,
             hydra_rendered,
             confirm_scroll: 0,
+            split_slot_hits: Vec::new(),
+            split_toolbar_hits: Vec::new(),
         };
     }
     frame.render_widget(Paragraph::new(lines), card_inner);
@@ -6787,6 +6719,8 @@ fn render_subview_tribute(
             preview_area: None,
             hydra_rendered,
             confirm_scroll: 0,
+            split_slot_hits: Vec::new(),
+            split_toolbar_hits: Vec::new(),
         };
     }
 
@@ -8164,7 +8098,7 @@ fn append_pro_tip_lines(
             "按 Ctrl+T 轮换 5 套真彩主题 · /theme 实时预览",
             "输入框为空时按 ↓ 可浏览所有斜杠命令",
             "输入 /codex、/claude、/antigravity 或 /vibe 解锁彩蛋卡片",
-            "/split 在拆分窗格前会展示实时布局线框预览",
+            "/split 打开 2x2 可视化分屏工作台并预览实时终端输出",
         ]
     } else {
         [
@@ -8174,7 +8108,7 @@ fn append_pro_tip_lines(
             "Ctrl+T cycles 5 TrueColor themes · /theme previews live",
             "Press ↓ on an empty bar to browse all slash commands",
             "Try /codex, /claude, /antigravity, or /vibe for tributes",
-            "/split shows live pane wireframes before splitting",
+            "/split opens the 2x2 visual Split Studio with live pane previews",
         ]
     };
     let tip = theme.adapt(tips[tip_step % tips.len()]);
@@ -8538,7 +8472,7 @@ fn render_footer_variants(
     );
 }
 
-fn status_style(status: &str, theme: Theme) -> Style {
+pub fn status_style(status: &str, theme: Theme) -> Style {
     let trimmed = status.trim_start();
     if trimmed.starts_with("Renamed")
         || trimmed.starts_with("Refreshed")
@@ -8563,6 +8497,10 @@ fn status_style(status: &str, theme: Theme) -> Style {
         || trimmed.starts_with(">_")
         || trimmed.starts_with("Cancelled")
         || trimmed.starts_with("已取消")
+        || trimmed.starts_with("Reset")
+        || trimmed.starts_with("Flipped")
+        || trimmed.starts_with("分屏画布")
+        || trimmed.starts_with("已翻转")
     {
         theme.style(theme.accent)
     } else {
@@ -8570,7 +8508,7 @@ fn status_style(status: &str, theme: Theme) -> Style {
     }
 }
 
-fn truncate_to_width(text: &str, max_width: usize) -> String {
+pub(super) fn truncate_to_width(text: &str, max_width: usize) -> String {
     if text.width() <= max_width {
         return text.to_owned();
     }
@@ -8607,7 +8545,7 @@ fn format_telemetry(telemetry: HomeTelemetry<'_>, theme: Theme) -> Option<String
     (!parts.is_empty()).then(|| parts.join(sep))
 }
 
-fn single_line(text: &str) -> String {
+pub(super) fn single_line(text: &str) -> String {
     text.chars()
         .map(|ch| if ch.is_control() { ' ' } else { ch })
         .collect()
@@ -9086,7 +9024,7 @@ fn push_preview_run(
     truncated
 }
 
-fn parse_ansi_preview_line(raw: &str, max_width: usize, theme: Theme) -> Line<'static> {
+pub(super) fn parse_ansi_preview_line(raw: &str, max_width: usize, theme: Theme) -> Line<'static> {
     if max_width == 0 {
         return Line::default();
     }
@@ -9559,204 +9497,6 @@ pub fn render_rich_picker_with_preview(
         )),
         footer_area,
     );
-}
-
-/// Interactive `/split` layout chooser with live GUI pane wireframe previews.
-pub fn render_split_selector(
-    frame: &mut Frame<'_>,
-    area: Rect,
-    target_label: &str,
-    selected: usize,
-    theme: Theme,
-) {
-    if area.width == 0 || area.height == 0 {
-        return;
-    }
-    let selected = selected.min(1);
-    let [title_area, list_area, preview_area, footer_area] = Layout::vertical([
-        Constraint::Length(1),
-        Constraint::Length(2),
-        Constraint::Min(0),
-        Constraint::Length(u16::from(area.height >= 4)),
-    ])
-    .areas(area);
-
-    let title_word = theme.tr("Split pane", "拆分窗格");
-    let mut title_spans = vec![Span::styled(
-        title_word,
-        theme.style(theme.accent).add_modifier(Modifier::BOLD),
-    )];
-    if !target_label.is_empty() {
-        let label = format!("  {}", single_line(target_label));
-        if title_word.width() + label.width() <= usize::from(title_area.width) {
-            title_spans.push(Span::styled(theme.adapt(&label), theme.style(theme.muted)));
-        }
-    }
-    frame.render_widget(Paragraph::new(Line::from(title_spans)), title_area);
-
-    let options = [
-        theme.tr(
-            "Side by side — new pane on the right (tmux -h)",
-            "左右分屏 — 在右侧新建窗格 (tmux -h)",
-        ),
-        theme.tr(
-            "Stacked — new pane below (tmux -v)",
-            "上下分屏 — 在下方新建窗格 (tmux -v)",
-        ),
-    ];
-    let list_lines: Vec<Line<'static>> = options
-        .iter()
-        .enumerate()
-        .map(|(i, label)| {
-            let is_sel = i == selected;
-            let style = if is_sel {
-                theme.selected_style()
-            } else {
-                theme.style(theme.text)
-            };
-            let marker = if is_sel { theme.marker() } else { " " };
-            Line::from(Span::styled(
-                format!("{marker} {}", theme.adapt(label)),
-                style,
-            ))
-        })
-        .collect();
-    frame.render_widget(Paragraph::new(list_lines), list_area);
-
-    if preview_area.height >= 5 && preview_area.width >= 16 {
-        let body = Rect {
-            y: preview_area.y + 1,
-            height: preview_area.height - 1,
-            ..preview_area
-        };
-        if body.width >= 36 {
-            let [left, right] =
-                Layout::horizontal([Constraint::Length(17), Constraint::Min(17)]).areas(body);
-            frame.render_widget(
-                Paragraph::new(side_by_side_wireframe(selected == 0, theme)),
-                left,
-            );
-            frame.render_widget(
-                Paragraph::new(stacked_wireframe(selected == 1, theme)),
-                right,
-            );
-        } else {
-            let lines = if selected == 0 {
-                side_by_side_wireframe(true, theme)
-            } else {
-                stacked_wireframe(true, theme)
-            };
-            frame.render_widget(Paragraph::new(lines), body);
-        }
-    }
-
-    frame.render_widget(
-        Paragraph::new(styled_key_hint_line(
-            theme.tr(
-                "↑↓ / ←→ / Tab Choose · Enter Split · Esc Back",
-                "↑↓ / ←→ / Tab 选择 · Enter 拆分 · Esc 返回",
-            ),
-            theme.style(theme.muted),
-            theme,
-        )),
-        footer_area,
-    );
-}
-
-fn side_by_side_wireframe(active: bool, theme: Theme) -> Vec<Line<'static>> {
-    let border = if active {
-        theme.style(theme.accent).add_modifier(Modifier::BOLD)
-    } else {
-        theme.style(theme.muted)
-    };
-    let new_style = if active {
-        theme.style(theme.success).add_modifier(Modifier::BOLD)
-    } else {
-        theme.style(theme.muted)
-    };
-    let main_style = if active {
-        theme.style(theme.text)
-    } else {
-        theme.style(theme.muted)
-    };
-    if theme.ascii {
-        vec![
-            Line::from(Span::styled("+------+------+", border)),
-            Line::from(vec![
-                Span::styled("| ", border),
-                Span::styled("main", main_style),
-                Span::styled(" | ", border),
-                Span::styled("+new", new_style),
-                Span::styled(" |", border),
-            ]),
-            Line::from(Span::styled("|      |      |", border)),
-            Line::from(Span::styled("+------+------+", border)),
-        ]
-    } else {
-        vec![
-            Line::from(Span::styled("╭──────┬──────╮", border)),
-            Line::from(vec![
-                Span::styled("│ ", border),
-                Span::styled("main", main_style),
-                Span::styled(" │ ", border),
-                Span::styled("+new", new_style),
-                Span::styled(" │", border),
-            ]),
-            Line::from(Span::styled("│      │      │", border)),
-            Line::from(Span::styled("╰──────┴──────╯", border)),
-        ]
-    }
-}
-
-fn stacked_wireframe(active: bool, theme: Theme) -> Vec<Line<'static>> {
-    let border = if active {
-        theme.style(theme.accent).add_modifier(Modifier::BOLD)
-    } else {
-        theme.style(theme.muted)
-    };
-    let new_style = if active {
-        theme.style(theme.success).add_modifier(Modifier::BOLD)
-    } else {
-        theme.style(theme.muted)
-    };
-    let main_style = if active {
-        theme.style(theme.text)
-    } else {
-        theme.style(theme.muted)
-    };
-    if theme.ascii {
-        vec![
-            Line::from(Span::styled("+-------------+", border)),
-            Line::from(vec![
-                Span::styled("| ", border),
-                Span::styled("main        ", main_style),
-                Span::styled("|", border),
-            ]),
-            Line::from(Span::styled("+-------------+", border)),
-            Line::from(vec![
-                Span::styled("| ", border),
-                Span::styled("+new        ", new_style),
-                Span::styled("|", border),
-            ]),
-            Line::from(Span::styled("+-------------+", border)),
-        ]
-    } else {
-        vec![
-            Line::from(Span::styled("╭─────────────╮", border)),
-            Line::from(vec![
-                Span::styled("│ ", border),
-                Span::styled("main        ", main_style),
-                Span::styled("│", border),
-            ]),
-            Line::from(Span::styled("├─────────────┤", border)),
-            Line::from(vec![
-                Span::styled("│ ", border),
-                Span::styled("+new        ", new_style),
-                Span::styled("│", border),
-            ]),
-            Line::from(Span::styled("╰─────────────╯", border)),
-        ]
-    }
 }
 
 fn build_theme_list_items(
@@ -10609,7 +10349,7 @@ pub fn render_help(frame: &mut Frame<'_>, area: Rect, theme: Theme) {
                 "/list",
                 theme.tr("browse sessions & actions", "浏览会话与操作"),
                 "/split",
-                theme.tr("visual split direction preview", "可视化分屏方向预览"),
+                theme.tr("2x2 visual Split Studio", "2x2 可视化分屏工作台"),
             ),
             (
                 "/rename",
@@ -10696,7 +10436,10 @@ pub fn render_help(frame: &mut Frame<'_>, area: Rect, theme: Theme) {
             ("/kill", theme.tr("terminate a session", "终止会话")),
             ("/window", theme.tr("manage windows", "管理窗口")),
             ("/pane", theme.tr("manage panes", "管理窗格")),
-            ("/split", theme.tr("split current pane", "拆分当前窗格")),
+            (
+                "/split",
+                theme.tr("2x2 visual Split Studio", "2x2 可视化分屏工作台"),
+            ),
             ("/theme", theme.tr("switch theme palette", "切换主题调色板")),
             (
                 "/config",
@@ -10744,7 +10487,7 @@ pub fn render_help(frame: &mut Frame<'_>, area: Rect, theme: Theme) {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
     use ratatui::{Terminal, backend::TestBackend};
 
@@ -10961,16 +10704,9 @@ mod tests {
     }
 
     #[test]
-    fn split_selector_theme_picker_rich_picker_and_tribute_modal_render_cleanly() {
+    fn theme_picker_rich_picker_and_tribute_modal_render_cleanly() {
         let theme = Theme::default().with_preset(ThemePreset::CodexEmerald);
         let mut terminal = Terminal::new(TestBackend::new(72, 16)).expect("terminal");
-
-        terminal
-            .draw(|frame| render_split_selector(frame, frame.area(), "work:1.0 zsh", 0, theme))
-            .expect("split");
-        let split_text = terminal.backend().to_string();
-        assert!(split_text.contains("╭──────┬──────╮"));
-        assert!(split_text.contains("╭─────────────╮"));
 
         terminal
             .draw(|frame| {
@@ -11054,11 +10790,17 @@ mod tests {
         };
         terminal
             .draw(|frame| {
-                render_split_selector(frame, frame.area(), "work:1.0 zsh", 1, ascii_no_color)
+                render_theme_picker(
+                    frame,
+                    frame.area(),
+                    ThemePreset::ALL,
+                    1,
+                    ThemePreset::AntigravityAurora,
+                    ascii_no_color,
+                )
             })
-            .expect("ascii split");
+            .expect("ascii theme picker");
         assert!(terminal.backend().to_string().is_ascii());
-        assert!(terminal.backend().to_string().contains("+-------------+"));
         assert!(
             terminal
                 .backend()
@@ -11208,6 +10950,18 @@ mod tests {
             .expect("draw status");
             assert_eq!(term.backend().buffer()[(0, 5)].fg, expected_fg);
         }
+        for ok_accent in [
+            "Reset 2x2 split layout",
+            "Flipped split layout",
+            "分屏画布已重置",
+            "已翻转分屏方向",
+        ] {
+            assert_eq!(status_style(ok_accent, theme).fg, Some(theme.accent));
+        }
+        assert_eq!(
+            status_style("unknown command: /wat", theme).fg,
+            Some(theme.error)
+        );
     }
 
     #[test]
@@ -13624,7 +13378,7 @@ mod tests {
         assert_ne!(hout_i0, hout_i9);
     }
 
-    fn buffer_row_logical(buf: &ratatui::buffer::Buffer, y: u16) -> (String, Vec<u16>) {
+    pub(super) fn buffer_row_logical(buf: &ratatui::buffer::Buffer, y: u16) -> (String, Vec<u16>) {
         let mut row = String::new();
         let mut byte_to_col = Vec::new();
         let mut x = 0_u16;
@@ -13640,7 +13394,7 @@ mod tests {
         (row, byte_to_col)
     }
 
-    fn buffer_logical_text(buf: &ratatui::buffer::Buffer) -> String {
+    pub(super) fn buffer_logical_text(buf: &ratatui::buffer::Buffer) -> String {
         (0..buf.area.height)
             .map(|y| buffer_row_logical(buf, y).0)
             .collect::<Vec<_>>()

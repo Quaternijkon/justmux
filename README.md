@@ -1,232 +1,164 @@
-# JustMux
+<div align="center">
 
-**Stop memorizing tmux commands. Just type `/`.**
+# ◫ JustMux (`jm`)
 
-JustMux (`jm`) is a small, native terminal front end for the tmux server you
-already use. It provides a focused Ratatui interface, searchable slash
-commands, and hands control back to tmux as soon as you enter a session.
+### tmux is awesome. Prefix gymnastics aren't.
 
-## Features
+**Stop memorizing `Ctrl+b %`, `Ctrl+b "`, `Ctrl+b s`, and `Ctrl+b q`. Just type `/`.**
 
-- A Codex-style framed composer with command completion, `Shift+Tab` mode
-  switching (`Command & @Jump`, `Live Radar`, `Quick Launch`), `@target` jump
-  menus, `1–9` direct session keys, `Ctrl+P`/`Ctrl+K` universal palette,
-  natural phrases, and zero-learning shortcuts (`↓`, `?`, `Ctrl+T`).
-- A spacious Fullscreen studio by default with live pane previews
-  (`tmux capture-pane`), 8 quick commands, 6 numbered workspaces, optional
-  mouse scroll/click support (`DisableMouseCapture` before tmux handoff), and
-  optional `--inline` mode that preserves native shell scrollback.
-- Unified zero-dependency TOML configuration (`~/.config/justmux/config.toml`,
-  `--config`, `--print-config`, interactive `/config`, and `/theme` `s` save)
-  plus five switchable TrueColor theme presets (`/theme` or `Ctrl+T`, with
-  `JUSTMUX_THEME`, `NO_COLOR`, and ASCII fallbacks).
-- Session create, list, resume, rename, and Codex-style confirmed kill cards.
-- Window and pane management with a visual `/split` wireframe preview through
-  the native tmux CLI.
-- Correct attach-from-a-shell and switch-client-from-tmux behavior.
-- No daemon, database, plugin, telemetry, or tmux configuration changes.
+[![npm version](https://img.shields.io/npm/v/justmux?color=38bdf8&label=npm&logo=npm)](https://www.npmjs.com/package/justmux)
+[![License: MIT](https://img.shields.io/badge/license-MIT-22c55e.svg)](LICENSE)
+[![Platforms](https://img.shields.io/badge/platform-macOS%20ARM64%20%7C%20Linux%20x64-6366f1.svg)](#get-started-in-15-seconds)
+[![Pure Rust](https://img.shields.io/badge/built%20with-Rust%20%2B%20Ratatui-f97316.svg)](#inside-the-box)
 
-## Requirements
+**English** · [简体中文](README.zh-CN.md)
 
-- Rust 1.88 or newer for source builds.
-- Node.js 22.15+ with `process.execve` support for npm installations (Node.js 24
-  LTS is recommended). npm installs precompiled binaries; Rust is not needed.
-- tmux 3.2 or newer for the optional popup integration (ordinary `jm` use
-  works with older tmux versions where the server supports the requested
-  operation).
-- macOS ARM64 (Apple Silicon) or Linux x64 with a UTF-8 capable terminal.
+```sh
+npm install -g justmux@latest
+jm
+```
 
-## Install
+<br />
 
-Install or update from [npm](https://www.npmjs.com/package/justmux):
+<img src="assets/home-studio.png" alt="JustMux Workspace Studio showing live terminal preview, session grid, action tabs, and keycap hints" width="92%" />
+
+</div>
+
+---
+
+## Why tmux users switch to `jm` in 5 minutes
+
+We all love tmux's persistence—until real life gets messy:
+
+- **"Which of my 6 detached sessions has the failing server log?"**
+  Normally you attach, squint, detach, repeat. JustMux gives you a **live colored terminal preview** of every window *before* you enter it—complete with scrollback history (`PgUp`/`PgDn`/mouse wheel).
+- **"Splitting into a clean 2×2 workspace shouldn't feel like origami."**
+  Skip chaining `Ctrl+b %`, `Ctrl+b "`, and panicking when a split lands in the wrong half. Open `/split` to get an interactive **2×2 Visual Split Studio**—slice panes with mouse or keyboard, preview live windows inside each tile, hit `Enter`, and drop straight into the finished tmux layout.
+- **"I'm mid-prompt inside Vim, Claude Code, Codex CLI, or agy—I don't want to quit just to hop windows."**
+  Tap one optional popup shortcut (**`Ctrl+b j`**): `jm` floats cleanly above your fullscreen app, switches you with native `switch-client` when you pick a window, or disappears on `Esc` without touching the running process below.
+- **"I don't want plugins, daemons, or anything touching my `~/.tmux.conf`."**
+  JustMux is a single fast Rust binary on top of the tmux server you already run. No background daemon, no database, zero config required, and it never touches your dotfiles unless you ask.
+
+---
+
+## See it in action
+
+### 1. Visual 2×2 Split Studio — VS Code feel inside your terminal
+
+Type `/split` (or tab to `[ ◫ Split ]` on Home) to stage up to **2 columns × 2 rows** visually before touching a single live tmux pane:
+
+<div align="center">
+  <img src="assets/split-studio.png" alt="JustMux 2x2 Visual Split Studio with live SGR previews in each tile and interactive toolbar" width="90%" />
+</div>
+
+- **Slice visually, click or type:** Pick any pane tile with **`1`–`4`**, **`Tab`**, or a **mouse click**; split sideways with **`h`** (`|`), vertically with **`v`** (`-`), transpose the whole grid with **`t`**, remove a tile with **`x`**, or reset to 1×1 with **`r`**.
+- **Fill panes with real running windows:** Arrow up/down (or click any row) to pour existing windows into the active tile—or keep `+ New shell` for a fresh terminal. Already-placed windows **never get stolen accidentally** while browsing; press **`Space`** or **click** to cleanly swap tiles.
+- **Scroll live ANSI previews right inside the tiles:** Catch up on logs via mouse wheel hover, **`PgUp`/`PgDn`**, **`Home`/`End`**, or **`Ctrl+U`/`Ctrl+D`**.
+- **Zero-regret preview:** Press **`Enter`** (or click `[Enter] Apply & Enter`) and JustMux runs native `join-pane` / `split-window`, **focuses the exact pane you highlighted** (`#3 ★`), and puts you right inside tmux. Press **`Esc`** to back out with zero changes.
+
+---
+
+### 2. Stop memorizing key chords — just type `/`
+
+Forgot the command? Type **`/`** (or press **`↓`** on an empty bar, or **`Ctrl+P`** anywhere) for a searchable, typo-forgiving palette:
+
+<div align="center">
+  <img src="assets/slash-palette.png" alt="JustMux searchable slash-command palette in Claude Warmth theme" width="90%" />
+</div>
+
+- **Three instant home modes (`Shift+Tab`):** Switch between **Command & `@Jump`** (default matrix + `1–9` direct keys), **Live Radar** (session list + huge preview), and **Quick Launch** (press `Enter` to spin up a workspace for your current folder).
+- **`@` target autocomplete anywhere:** Type `@`, `/kill @`, `/rename @`, or `/split @` to jump straight to `@session`, `@session:window`, or `@session:window.pane`.
+- **Natural phrases & forgiving typos:** `new api`, `split right`, `split down`, `kill demo`, or even bare `resume` all just work—and destructive kills always pause on an explicit `yes` Approval Card.
+- **Tucked-away Easter eggs:** Try `/codex`, `/claude`, `/antigravity`, `/vibe`, or hit `Ctrl+b` on the home screen for a quiet nod to muscle memory.
+
+---
+
+### 3. Five TrueColor themes & native English / 简体中文 UI
+
+Press **`Ctrl+T`** anytime to cycle palettes—from **Antigravity Aurora** and **Codex Emerald** to **Claude Warmth**, **Cyber Matrix**, and **Classic**—or open **`/theme`** to live-preview before saving (`s`), and toggle **English / 简体中文** live inside **`/config`**:
+
+<table>
+  <tr>
+    <td width="50%">
+      <img src="assets/theme-picker.png" alt="Live TrueColor theme switcher in JustMux" width="100%" />
+      <p align="center"><sub><code>/theme</code> — Live palette switcher + 1-key save to <code>config.toml</code></sub></p>
+    </td>
+    <td width="50%">
+      <img src="assets/split-studio-zh.png" alt="2x2 Visual Split Studio localized in Simplified Chinese with Codex Emerald theme" width="100%" />
+      <p align="center"><sub><code>language = "zh"</code> + <code>Codex Emerald</code> theme in 2×2 Split Studio</sub></p>
+    </td>
+  </tr>
+</table>
+
+---
+
+## Get started in 15 seconds
+
+### Install via npm (prebuilt binary, no Rust needed)
 
 ```sh
 npm install -g justmux@latest
 jm        # or: justmux
 ```
 
-Update anytime with `jm update` (or `justmux update`), or check first with
-`jm update --check`; you can also re-run `npm install -g justmux@latest`. Both
-`jm` and `justmux` start the same program. npm selects the binary for
-macOS ARM64 or Linux x64. The Linux package is a static musl build and works on
-both glibc and musl systems. Keep optional dependencies enabled.
-tmux must be installed separately; for example, `brew install tmux` on macOS
-or `sudo apt install tmux` on Debian/Ubuntu. The npm launcher replaces its
-process with the Rust executable, so it does not stay in the background.
+> Both `jm` and `justmux` launch the exact same native Rust executable (the thin Node launcher `execve`s straight into the binary and exits). Update anytime with **`jm update`**. Supports **macOS Apple Silicon** and **Linux x64** (static musl).
 
-Global npm installs check for updates when `jm` or `justmux` starts interactively
-without a command (also with `--fullscreen` or `--inline`). At most once a day, a check waits
-up to three seconds for npm. A newer version opens an inline picker:
-
-```text
-JustMux update available
-0.1.1 -> 0.1.2
-
-> 1. Update
-  2. Skip
-  3. Skip this version
-```
-
-Use Up/Down and Enter, or press 1, 2, or 3. `Update` is initially selected;
-it installs that exact version and exits, so run `jm` again afterward. `Skip`
-(also Esc) continues this launch; `Skip this version` remembers the dismissal
-until a different version is available. The picker uses a compact region in
-the current terminal and restores input and the cursor before continuing.
-Ctrl+C cancels startup. Offline checks and failed updates let you keep using
-JustMux. Set `JUSTMUX_NO_UPDATE_CHECK=1` to disable checks. Help, version,
-direct commands, CI, and noninteractive runs skip them.
-
-Release preparation and publication run locally; GitHub builds are optional.
-See [npm release instructions](docs/npm-release.md). The npm source template is
-private to prevent accidental publication; only generated packages are released.
-
-Install from this checkout:
+### Or install from source with Cargo (Rust 1.88+)
 
 ```sh
 cargo install --path . --locked
 ```
 
-The package installs two executable names into Cargo's binary directory:
-`jm` and `justmux`. They are the same JustMux CLI, so either command starts
-the same TUI and accepts the same options. With the standard Rust setup this
-directory is `$HOME/.cargo/bin`; add it to your shell `PATH` once if it is not
-already present:
+---
 
-```sh
-export PATH="$HOME/.cargo/bin:$PATH"
-jm --version
-justmux --version
-```
+## Pro tip: Pop up `jm` over Vim, Codex, Claude Code, or agy
 
-To build a local release artifact without installing it:
-
-```sh
-cargo build --release
-./target/release/jm
-```
-
-The equivalent long-form invocation is `./target/release/justmux`.
-
-## Quick start
-
-Run `jm` from a normal shell and open `/resume`. Sessions run across the grid,
-with their windows listed beneath them. Use Left/Right to choose a session
-and Up/Down to select a window, or type a session or window name to filter.
-Search ranks exact names before prefixes, substrings, and fuzzy matches. Words
-can match in any order, and matching parts of names are underlined. A session
-name match keeps that session's windows visible. Enter opens the selected
-window. Each session defaults to its active window until a search finds a
-better match. Narrower terminals show fewer columns at a time. The TUI is torn
-down before tmux takes over the terminal and keyboard.
-
-By default, JustMux launches in a spacious Fullscreen alternate-screen studio
-with live workspace previews and mouse wheel/click support (cleanly restored
-before handing control to tmux or exiting). The UI waits for input, ignores
-mouse hover/move events, updates only changed cells, and combines queued input
-events before drawing. This keeps SSH output low, although menu navigation
-still depends on network latency.
-
-Use `jm --inline` (or `justmux --inline`, or set `screen_mode = "inline"` in
-`config.toml`) when you prefer the compact inline region that keeps existing
-shell output above it and leaves native terminal scrollback untouched without
-enabling mouse capture. Inside tmux, scrollback remains subject to tmux's own
-scroll/copy-mode settings.
-
-See [Configuring JustMux](docs/configuration.md) for `--config`,
-`--print-config`, `--theme`, environment precedence, and interactive `/config`.
-
-When `jm` is launched in a tmux pane (including a `display-popup`), choosing a
-session uses `switch-client`; closing the popup leaves the program in the pane
-below it untouched.
-
-Run `/exit` inside tmux to detach and return to the terminal that opened the
-tmux client. You can reconnect to the session with `/resume`. If several
-clients share the same window, open JustMux with the popup binding below so
-it can identify your client. Use `/quit` to close JustMux while staying in tmux.
-
-Recommended popup binding (tmux 3.2+):
+Already deep inside a fullscreen TUI inside tmux? Don't quit your app. Run `jm --print-keybind` or drop this one line into `~/.tmux.conf` (tmux 3.2+):
 
 ```tmux
 bind-key j run-shell 'tmux display-popup -E -w 80% -h 70% -c #{q:client_name} "JUSTMUX_CLIENT=#{q:client_name} JUSTMUX_PANE=#{q:pane_id} JUSTMUX_POPUP=1 jm"'
 ```
 
-`run-shell` expands the launching client's identity before opening the popup.
-This keeps switching and detaching scoped to that client even when several
-clients share a session.
+Reload tmux once (`tmux source-file ~/.tmux.conf`), then press **`Ctrl+b` → `j`** from inside *any* program:
 
-## Slash commands
+1. `jm` pops open cleanly over your terminal.
+2. Pick another window—or assemble a 2×2 layout in `/split`—and press **`Enter`** to switch there cleanly.
+3. Or hit **`Esc`** to dismiss the popup and go straight back to what you were typing.
 
-| Command | Action |
+---
+
+## Quick cheat sheet
+
+| You want to… | Just type or press |
 | --- | --- |
-| `/resume` | Search sessions and windows, then open a window from the grid |
-| `/new` | Create a detached session, optionally with a working directory |
-| `/list` | Browse current sessions |
-| `/rename` | Rename a session |
-| `/kill` | Confirm and remove a session |
-| `/window` | Inspect and manage windows |
-| `/pane` | Inspect and manage panes |
-| `/split` | Split the current pane horizontally or vertically with a live wireframe preview |
-| `/theme` | Switch visual color theme (`aurora`, `codex`, `claude`, `matrix`, `classic`) |
-| `/help` | Show command and keyboard help |
-| `/exit` | Detach the current tmux client, or quit JustMux from outside tmux |
-| `/quit` | Exit JustMux and return to the shell |
+| Jump straight to workspace 1–9 | `1`–`9` (on an empty bar) or `Enter` |
+| Open the 2×2 Visual Split Studio | `/split` (or `Tab` to `[Split]`, or `/split @name`) |
+| Arrange panes inside Split Studio | `1-4`/`Tab`/Click focus · `h` split H · `v` split V · `t` flip · `x` del · `r` reset · `Space` swap |
+| Scroll live pane output | `PgUp` / `PgDn` · `Home` / `End` · `Ctrl+U` / `Ctrl+D` · Mouse Wheel |
+| Switch Home Studio view | `Shift+Tab` (`Command & @Jump` / `Live Radar` / `Quick Launch`) |
+| Open command palette anywhere | `/` · `↓` · `Ctrl+P` · `Ctrl+K` (outside text inputs) |
+| Switch colors / open settings | `Ctrl+T` / `/theme` / `/config` (`s` saves to `~/.config/justmux/config.toml`) |
+| Detach vs leave JustMux | `/exit` (detach tmux client) · `/quit` or `Esc` (exit `jm`) |
 
-In `/window`, choose **New window** to select a session and enter an optional
-name. To manage an existing window, filter by session or window name, select
-it, and press Enter for **Open window**, **Rename window**, or **Close window**.
-Closing ends the programs running in that window and requires typing `yes`
-and pressing Enter. In `/list` and `/pane`, Enter on a row opens its actions.
-Choose **Refresh list** in an unfiltered list to reload it.
+---
 
-The command popup filters as you type. For example, `/att` matches the
-`/attach` alias for `/resume`, and `/reusme` prompts you to check the
-spelling. On the home studio screen:
+## Inside the box
 
-- Press `Shift+Tab` to cycle between **Command & @Jump** (default), **Live
-  Radar** (browse sessions alongside live captured terminal previews), and
-  **Quick Launch** (press Enter on an empty bar to create/enter a workspace
-  named after your current directory, or type any workspace name).
-- Press `1`–`9` on an empty Command & @Jump bar to jump directly to the
-  numbered live workspace.
-- Type `@` (standalone or after `/kill`, `/rename`, `/split`, `/window`,
-  `/pane`, `/resume`) to autocomplete `@session`, `@session:window`, and
-  `@session:window.pane` targets.
-- Press `Ctrl+P` anywhere (or `Ctrl+K` outside text inputs / on an empty home
-  bar) to jump straight to the `/` command palette.
-- Press `↓` on an empty prompt to open the command menu without typing `/`, `?`
-  to jump straight to `/help`, or `Ctrl+T` to cycle through the five built-in
-  palettes (also configurable via `JUSTMUX_THEME`).
-- Bare command names (`resume`, `theme codex`, `config`), natural phrases (`new demo`,
-  `create demo`, `split right`, `split down`, `kill demo`), and exact live
-  session names work without a leading `/`.
-- Open `/config` (or `/settings`) to toggle any setting live and press `s` to
-  save directly to `~/.config/justmux/config.toml` (or your `--config` file);
-  inside `/theme`, press `s` to save the highlighted preset. See
-  [`docs/configuration.md`](docs/configuration.md).
+<details>
+<summary><strong>Requirements, inline mode, custom sockets & auto-update details</strong></summary>
 
-Use Up/Down to move, Tab to complete, Enter to run, Esc to return, and Ctrl+C
-to quit safely. Pasting edits the focused input. Line breaks and tabs become
-spaces, and Enter submits the result. (There are also a few hidden tribute
-Easter eggs tucked behind `/codex`, `/claude`, `/antigravity`, `/vibe`, and
-friends—plus a wink if you reach for `Ctrl+b` out of habit.)
+- **Runtime requirements:** `tmux` (`3.2+` recommended for `display-popup`, `brew install tmux` or `apt install tmux`), Node.js `22.15+` (Node 24 LTS recommended) for global npm install, and a UTF-8 terminal on macOS ARM64 or Linux x64.
+- **Native `--inline` scrollback mode:** Prefer keeping your native terminal history intact? Run `jm --inline` (or set `screen_mode = "inline"` in `/config`). Respects `NO_COLOR=1`, `TERM=dumb`, and `--ascii`.
+- **Unified TOML config:** Zero-dependency TOML at `~/.config/justmux/config.toml` (`CLI > Env > config.toml > defaults`). Generate a starter with `jm --print-config`, or inspect your setup with `jm doctor`. See [`docs/configuration.md`](docs/configuration.md).
+- **Custom sockets:** Pass `jm -L NAME` or `jm -S /path/to/socket` just like tmux. Outside tmux it replaces itself with `tmux attach-session`; inside tmux it switches only the launching client.
+- **Daily update check (global npm only):** Checks npm at most once per day for interactive launches (disable with `JUSTMUX_NO_UPDATE_CHECK=1`, or run `jm update --check` / `jm update`).
 
-JustMux passes session and resource names to tmux as individual arguments.
+</details>
 
-## Relationship with tmux
+<details>
+<summary><strong>For contributors: building, testing & local releases</strong></summary>
 
-JustMux is an on-demand client of an existing tmux server. It does not emulate
-a terminal, create a private server, maintain session state, or modify
-`~/.tmux.conf`. Outside tmux it replaces itself with `tmux attach-session`; in
-tmux it uses `switch-client` to enter a session and `detach-client` for `/exit`.
-Destructive actions always require an explicit confirmation.
-
-Use `jm -L NAME` or `jm -S PATH` when you intentionally manage a custom tmux
-socket. `jm doctor` reports the resolved config path, screen mode, detected
-theme, and local tmux capabilities without changing configuration.
-`jm --print-config` outputs starter TOML defaults, and `jm --print-keybind`
-prints the popup snippet above.
-
-## Development
+All tmux integration tests run against private sockets and clean up automatically—they never touch your default tmux server or `~/.tmux.conf`. See [`docs/manual-test.md`](docs/manual-test.md) and [`assets/demo.cast`](assets/demo.cast) for real PTY smoke checks and manual verification checklists.
 
 ```sh
 export PATH="$HOME/.cargo/bin:$PATH"
@@ -236,63 +168,16 @@ cargo test --all
 cargo build --release
 ```
 
-To test the npm packaging and real installation/update workflow without
-publishing anything:
+Packaging, npm wrapper, and release workflow tests live in [`docs/npm-release.md`](docs/npm-release.md) and [`docs/local-release.md`](docs/local-release.md):
 
 ```sh
 npm --prefix npm/justmux test
-node --test tests/npm-packages.test.mjs
-node --test tests/release-workflow.test.mjs
-node scripts/test-npm-install.mjs --pty
-```
-
-The last command uses packed files and a temporary loopback registry and global
-prefix. It also checks native tmux handoff and two-client popup switching through
-the installed npm launcher. On Linux, pass `--binary` pointing to the static
-musl release build.
-
-Integration tests use private tmux sockets and clean them up automatically.
-Never run destructive tmux commands against your default server while
-developing. Manual interaction is best checked in Ghostty, iTerm2, or a
-standard Linux terminal; see [`docs/manual-test.md`](docs/manual-test.md).
-
-After a release build, the bounded PTY smoke check exercises external
-attach/detach, session creation, and a real popup switch on an isolated tmux
-socket:
-
-```sh
+node --test tests/npm-packages.test.mjs tests/release-workflow.test.mjs
 python3 scripts/pty_smoke.py
 ```
 
-To release from this Mac with one command, after committing your changes:
+</details>
 
-```sh
-./scripts/release 0.1.2
-```
+## License
 
-This updates the version, runs checks, builds both supported platforms, pushes the
-release source and tag to GitHub, and publishes the npm packages. Use `--dry-run`
-to preview, `--commit` to include all nonignored working-tree changes, or
-`--resume` to continue a failed release at the same version. npm may ask for
-browser-based 2FA. See [the local release workflow](docs/local-release.md).
-
-## FAQ and limitations
-
-**Does JustMux require a configuration file?** No. The popup binding is an
-optional snippet that you copy into your own tmux configuration.
-
-**What happens if a session disappears while it is selected?** The operation
-reports a friendly error and refreshes the list.
-
-**Can it attach from inside a different tmux server?** It can inspect and
-manage the selected socket, but refuses to nest a client inside another server.
-
-**Is there a recording or screenshot?** [`assets/demo.cast`](assets/demo.cast)
-is a real asciinema v2 recording generated from the bounded PTY smoke check;
-it is not a static UI mock.
-
-## Contributing
-
-Keep tmux process spawning in `src/tmux`, keep widgets independent from tmux,
-and add regression tests for parser, command, and state-machine changes. Pull
-requests should include the four checks in the Development section.
+MIT © [Quaternijkon](https://github.com/Quaternijkon/justmux)

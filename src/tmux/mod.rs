@@ -105,6 +105,14 @@ pub trait Tmux {
     /// target pane's current directory.
     fn split_pane(&self, target: &PaneId, direction: SplitDirection) -> TmuxResult<Pane>;
 
+    /// Move `source` pane into a split alongside or below `target` (`tmux join-pane -d -h|-v`).
+    fn join_pane(
+        &self,
+        source: &PaneId,
+        target: &PaneId,
+        direction: SplitDirection,
+    ) -> TmuxResult<()>;
+
     fn kill_pane(&self, id: &PaneId) -> TmuxResult<()>;
 
     /// Capture scrollback history plus visible pane lines of `target`

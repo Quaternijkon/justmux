@@ -833,9 +833,9 @@ fn match_key_token(s: &str, idx: usize) -> Option<usize> {
             return Some(5);
         }
 
-        const NAMED_AND_DIGIT_KEYS: [&str; 17] = [
+        const NAMED_AND_DIGIT_KEYS: [&str; 18] = [
             "PageDown", "PageUp", "Arrows", "Enter", "Space", "Right", "PgUp", "PgDn", "Left",
-            "Down", "Tab", "Esc", "Up", "1-9", "1-6", "1-5", "1~9",
+            "Down", "Tab", "Esc", "Up", "1-9", "1-6", "1-5", "1-4", "1~9",
         ];
         for tok in NAMED_AND_DIGIT_KEYS {
             if rest.starts_with(tok) && boundary_right_ok(s, idx + tok.len()) {
@@ -846,12 +846,27 @@ fn match_key_token(s: &str, idx: usize) -> Option<usize> {
         if rest.starts_with("s Save") || rest.starts_with("s 保存") {
             return Some(1);
         }
+        if rest.starts_with("h/v Split") || rest.starts_with("h/v 分屏") {
+            return Some(1);
+        }
+        if s[..idx].ends_with("h/") && (rest.starts_with("v Split") || rest.starts_with("v 分屏"))
+        {
+            return Some(1);
+        }
         if rest.starts_with('t')
-            && (s[..idx].ends_with("Enter/")
+            && ((s[..idx].ends_with("Enter/")
                 || s[..idx].ends_with("Enter or ")
                 || s[..idx].ends_with("Enter 或 "))
+                || rest.starts_with("t Flip")
+                || rest.starts_with("t 翻转"))
             && boundary_right_ok(s, idx + 1)
         {
+            return Some(1);
+        }
+        if rest.starts_with("x Del") || rest.starts_with("x 移除") {
+            return Some(1);
+        }
+        if rest.starts_with("r Reset") || rest.starts_with("r 重置") {
             return Some(1);
         }
         if rest.starts_with("? Help") || rest.starts_with("? help") || rest.starts_with("? 帮助")
@@ -1665,12 +1680,44 @@ mod tests {
             vec!["Tab", "/", "1-9", "Shift+Tab", "s", "Enter", "t", "+", "?"]
         );
 
-        let non_key_prose =
-            "/resume · 8..=40 · Save · session · Alt-screen · backs up · on the right · ↑ +12/48";
+        let non_key_prose = "/resume · 8..=40 · Save · session · Alt-screen · backs up · on the right · ↑ +12/48 · split Flip · tmux Del · h/v ratio · your Reset";
         let plain_spans = styled_key_hint_spans(non_key_prose, muted, aurora);
         assert!(
             plain_spans.iter().all(|s| s.style == muted),
             "unexpected key highlight in prose: {plain_spans:?}"
+        );
+
+        let split_en = "1-4/Tab Pane · h/v Split · t Flip · x Del · r Reset · ↑↓ Window · Space Swap · Enter Launch · Esc Back";
+        let split_en_spans = styled_key_hint_spans(split_en, muted, aurora);
+        let split_en_keys: Vec<&str> = split_en_spans
+            .iter()
+            .filter(|s| s.style == key_style)
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert_eq!(
+            split_en_keys,
+            vec![
+                "1-4", "Tab", "h", "v", "t", "x", "r", "↑↓", "Space", "Enter", "Esc",
+            ]
+        );
+        let launch_plain = split_en_spans
+            .iter()
+            .find(|s| s.content.contains("Launch"))
+            .expect("plain Launch span");
+        assert_eq!(launch_plain.style, muted);
+
+        let split_zh = "1-4/Tab 选窗格 · h/v 分屏 · t 翻转 · x 移除 · r 重置 · ↑↓ 选窗口 · Space 交换 · Enter 进入 · Esc 返回";
+        let split_zh_spans = styled_key_hint_spans(split_zh, muted, aurora);
+        let split_zh_keys: Vec<&str> = split_zh_spans
+            .iter()
+            .filter(|s| s.style == key_style)
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert_eq!(
+            split_zh_keys,
+            vec![
+                "1-4", "Tab", "h", "v", "t", "x", "r", "↑↓", "Space", "Enter", "Esc",
+            ]
         );
 
         let no_color_ascii = Theme {

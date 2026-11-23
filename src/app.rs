@@ -1,8 +1,13 @@
 //! Application state and keyboard focus. Views never handle keys below the top
 //! of the stack; all tmux mutations happen here, outside the rendering layer.
 mod resume;
+mod split;
 
-use std::{env, path::PathBuf};
+use std::{
+    collections::{HashMap, HashSet},
+    env,
+    path::PathBuf,
+};
 
 use crossterm::event::{
     Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
@@ -14,6 +19,7 @@ use ratatui::{
     widgets::{Block, Borders, Paragraph},
 };
 use resume::{MatrixHitTarget, MatrixSelection, ResumePicker};
+use split::{SlotId, SplitNode, SplitSlotFill, SplitStudio, SplitToolbarAction, SplitWindowOption};
 
 use crate::{
     commands::{self, CommandKind, CommandMatch, ParsedCommand},
@@ -21,14 +27,16 @@ use crate::{
     fuzzy::{FuzzyMatcher, MatchKind},
     terminal::ScreenMode,
     tmux::{
-        Context, InsideContext, Pane, Session, SessionId, SplitDirection, Target, Tmux, TmuxResult,
-        Window,
+        Context, InsideContext, Pane, PaneId, Session, SessionId, SplitDirection, Target, Tmux,
+        TmuxResult, Window, WindowId,
     },
     tributes::{self, MicroTributeKind, TributeId},
     ui::{
         self, CommandItem, ComposerMode, ConfigItemView, EmblemMode, HomeDetails, HomeSessionEntry,
-        HomeTelemetry, MatrixAction, SubviewContent, TargetScope, TextInput, Theme, ThemePreset,
-        WorkspaceHomeSpec, WorkspaceSubviewSpec, render_workspace_home, render_workspace_subview,
+        HomeTelemetry, MatrixAction, SplitCanvasNode, SplitCanvasPaneView, SplitStudioView,
+        SplitToolbarButton, SplitWindowRowView, SubviewContent, TargetScope, TextInput, Theme,
+        ThemePreset, WorkspaceHomeSpec, WorkspaceSubviewSpec, render_workspace_home,
+        render_workspace_subview,
     },
 };
 
@@ -384,7 +392,7 @@ enum View {
     Form(Form),
     Confirm(Confirm),
     Created(Resource),
-    Split(Resource, usize),
+    Split(SplitStudio),
     ThemePicker {
         initial: ThemePreset,
         selected: usize,
@@ -708,32 +716,7 @@ impl<'a> App<'a> {
                     self.views.push(View::Created(resource));
                 }
             }
-            Some(View::Split(resource, mut selected)) => {
-                match key.code {
-                    KeyCode::Up | KeyCode::Down | KeyCode::Tab | KeyCode::Left | KeyCode::Right => {
-                        selected = 1 - selected
-                    }
-                    KeyCode::Enter => {
-                        if let Resource::Pane(pane) = &resource {
-                            let direction = if selected == 0 {
-                                SplitDirection::SideBySide
-                            } else {
-                                SplitDirection::Stacked
-                            };
-                            match self.tmux.split_pane(&pane.id, direction) {
-                                Ok(_) => {
-                                    self.status = "Pane split. Native tmux layout updated.".into();
-                                    self.refresh_parent();
-                                    return;
-                                }
-                                Err(error) => self.status = error.to_string(),
-                            }
-                        }
-                    }
-                    _ => {}
-                }
-                self.views.push(View::Split(resource, selected));
-            }
+            Some(View::Split(studio)) => self.split_studio_key(studio, key),
             Some(View::ThemePicker { initial, selected }) => {
                 self.theme_picker_key(initial, selected, key);
             }
@@ -1690,24 +1673,6 @@ impl<'a> App<'a> {
         best.map(|(_, res)| res)
     }
 
-    fn resolve_pane_for_resource(&self, resource: &Resource) -> Option<Pane> {
-        match resource {
-            Resource::Pane(pane) => Some(pane.clone()),
-            Resource::Window(window) => self
-                .home_panes
-                .iter()
-                .find(|p| p.window_id == window.id && p.active)
-                .or_else(|| self.home_panes.iter().find(|p| p.window_id == window.id))
-                .cloned(),
-            Resource::Session(session) => self
-                .home_panes
-                .iter()
-                .find(|p| p.session_id == session.id && p.active)
-                .or_else(|| self.home_panes.iter().find(|p| p.session_id == session.id))
-                .cloned(),
-        }
-    }
-
     fn split_mention_and_arg(&self, text_after_cmd: &str) -> (String, Option<String>) {
         let rest = text_after_cmd.trim_start();
         for (token, _, _, _) in self.all_mention_resources() {
@@ -1742,15 +1707,7 @@ impl<'a> App<'a> {
         match cmd {
             CommandKind::Kill => self.kill_confirm(resource),
             CommandKind::Resume => self.enter(resource.target()),
-            CommandKind::Split => {
-                if let Some(pane) = self.resolve_pane_for_resource(&resource) {
-                    self.views.push(View::Split(Resource::Pane(pane), 0));
-                } else {
-                    self.views = ViewStack::default();
-                    self.matrix_action = MatrixAction::Split;
-                    self.refresh_home_data();
-                }
-            }
+            CommandKind::Split => self.open_split_studio(Some(resource)),
             CommandKind::Rename => {
                 let target_resource = match resource {
                     Resource::Pane(pane) => self
@@ -1862,6 +1819,724 @@ impl<'a> App<'a> {
             self.views = ViewStack::default();
             self.matrix_action = MatrixAction::Split;
             self.refresh_home_data();
+        }
+    }
+
+    fn open_split_studio_from_home(&mut self, resource: Resource) {
+        self.matrix_action = MatrixAction::Open;
+        self.composer.set_value("");
+        self.sync_home_matrix();
+        self.open_split_studio(Some(resource));
+    }
+
+    fn open_split_studio(&mut self, resource: Option<Resource>) {
+        self.refresh_home_data();
+        if self.home_windows.is_empty() {
+            self.views = ViewStack::default();
+            self.matrix_action = MatrixAction::Split;
+            return;
+        }
+        let anchor_window = match &resource {
+            Some(Resource::Window(window)) => Some(
+                self.home_windows
+                    .iter()
+                    .find(|w| w.id == window.id)
+                    .cloned()
+                    .unwrap_or_else(|| window.clone()),
+            ),
+            Some(Resource::Pane(pane)) => self
+                .home_windows
+                .iter()
+                .find(|w| w.id == pane.window_id)
+                .cloned()
+                .or_else(|| self.home_windows.first().cloned()),
+            Some(Resource::Session(session)) => self
+                .home_windows
+                .iter()
+                .find(|w| w.session_id == session.id && w.active)
+                .or_else(|| {
+                    self.home_windows
+                        .iter()
+                        .find(|w| w.session_id == session.id)
+                })
+                .cloned()
+                .or_else(|| self.home_windows.first().cloned()),
+            None => self
+                .active_or_first_pane()
+                .and_then(|pane| {
+                    self.home_windows
+                        .iter()
+                        .find(|w| w.id == pane.window_id)
+                        .cloned()
+                })
+                .or_else(|| self.home_windows.first().cloned()),
+        };
+        let Some(anchor_window) = anchor_window else {
+            self.views = ViewStack::default();
+            self.matrix_action = MatrixAction::Split;
+            return;
+        };
+
+        let anchor_pane = match &resource {
+            Some(Resource::Pane(pane)) => Some(pane.clone()),
+            _ => self.representative_pane_for_window(&anchor_window.id),
+        };
+        let anchor_cwd = anchor_pane
+            .as_ref()
+            .map(|p| PathBuf::from(&p.current_path))
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or_else(|| env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+
+        let options = self.collect_split_window_options(
+            &anchor_window.session_id,
+            Some(&anchor_window.id),
+            anchor_pane.as_ref(),
+        );
+        let mut previews = HashMap::new();
+        for opt in options.iter().take(24) {
+            if let Some(lines) = self.capture_split_option_preview(opt) {
+                previews.insert(opt.window.id.clone(), lines);
+            }
+        }
+
+        let studio = SplitStudio::new(
+            anchor_window.session_id,
+            anchor_cwd,
+            Some(&anchor_window.id),
+            options,
+            previews,
+        );
+        self.views.push(View::Split(studio));
+    }
+
+    fn collect_split_window_options(
+        &self,
+        anchor_session_id: &SessionId,
+        preferred_anchor_window_id: Option<&WindowId>,
+        preferred_anchor_pane: Option<&Pane>,
+    ) -> Vec<SplitWindowOption> {
+        let mut ordered_windows: Vec<&Window> = Vec::with_capacity(self.home_windows.len());
+        if let Some(pref_id) = preferred_anchor_window_id
+            && let Some(pref) = self.home_windows.iter().find(|w| &w.id == pref_id)
+        {
+            ordered_windows.push(pref);
+        }
+        for window in &self.home_windows {
+            if Some(&window.id) != preferred_anchor_window_id
+                && &window.session_id == anchor_session_id
+            {
+                ordered_windows.push(window);
+            }
+        }
+        for window in &self.home_windows {
+            if &window.session_id != anchor_session_id {
+                ordered_windows.push(window);
+            }
+        }
+
+        ordered_windows
+            .into_iter()
+            .map(|window| {
+                let rep_pane = if preferred_anchor_window_id == Some(&window.id) {
+                    preferred_anchor_pane
+                        .cloned()
+                        .or_else(|| self.representative_pane_for_window(&window.id))
+                } else {
+                    self.representative_pane_for_window(&window.id)
+                };
+                let command = rep_pane
+                    .as_ref()
+                    .map(|p| p.current_command.clone())
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or_default();
+                let path = rep_pane
+                    .as_ref()
+                    .map(|p| p.current_path.clone())
+                    .unwrap_or_default();
+                SplitWindowOption {
+                    window: window.clone(),
+                    active_pane_id: rep_pane.map(|p| p.id),
+                    command,
+                    path,
+                }
+            })
+            .collect()
+    }
+
+    fn capture_split_option_preview(&self, opt: &SplitWindowOption) -> Option<Vec<String>> {
+        if !self.config.live_preview {
+            return None;
+        }
+        let target = opt.active_pane_id.as_ref().map_or_else(
+            || Target::Window(opt.window.session_id.clone(), opt.window.id.clone()),
+            |pane_id| Target::Pane(pane_id.clone()),
+        );
+        self.tmux.capture_pane(&target, PREVIEW_CAPTURE_LINES).ok()
+    }
+
+    fn ensure_split_preview(&self, studio: &mut SplitStudio, window_id: &WindowId) {
+        if !self.config.live_preview || studio.previews.contains_key(window_id) {
+            return;
+        }
+        if let Some(opt) = studio.window_option(window_id).cloned()
+            && let Some(lines) = self.capture_split_option_preview(&opt)
+        {
+            studio.previews.insert(window_id.clone(), lines);
+        }
+    }
+
+    fn ensure_selected_split_preview(&self, studio: &mut SplitStudio) {
+        if let Some(SplitSlotFill::Window(window_id)) =
+            studio.root.slot_fill(studio.selected_slot).cloned()
+        {
+            self.ensure_split_preview(studio, &window_id);
+        }
+    }
+
+    fn recover_split_studio(&mut self, mut studio: SplitStudio) {
+        self.refresh_home_data();
+        if !self.home_windows.is_empty()
+            && !self
+                .home_windows
+                .iter()
+                .any(|w| w.session_id == studio.anchor_session_id)
+        {
+            studio.anchor_session_id = self.home_windows[0].session_id.clone();
+        }
+        let preferred_window_id = match &studio.initial_fill {
+            SplitSlotFill::Window(wid) => Some(wid.clone()),
+            SplitSlotFill::NewShell => None,
+        };
+        let options = self.collect_split_window_options(
+            &studio.anchor_session_id,
+            preferred_window_id.as_ref(),
+            None,
+        );
+        let live_windows: HashSet<WindowId> =
+            options.iter().map(|opt| opt.window.id.clone()).collect();
+        studio.root.prune_missing_windows(&live_windows);
+        if let SplitSlotFill::Window(wid) = &studio.initial_fill
+            && !live_windows.contains(wid)
+        {
+            studio.initial_fill = SplitSlotFill::NewShell;
+        }
+        studio.preview_scrolls.retain(|slot_id, _| {
+            matches!(
+                studio.root.slot_fill(*slot_id),
+                Some(SplitSlotFill::Window(_))
+            )
+        });
+        studio.previews.clear();
+        for opt in options.iter().take(24) {
+            if let Some(lines) = self.capture_split_option_preview(opt) {
+                studio.previews.insert(opt.window.id.clone(), lines);
+            }
+        }
+        studio.window_options = options;
+        let leaf_windows: Vec<WindowId> = studio
+            .root
+            .leaves()
+            .into_iter()
+            .filter_map(|(_, fill)| match fill {
+                SplitSlotFill::Window(wid) => Some(wid),
+                SplitSlotFill::NewShell => None,
+            })
+            .collect();
+        for wid in leaf_windows {
+            self.ensure_split_preview(&mut studio, &wid);
+        }
+        studio.sync_cursor_to_selected_slot();
+        self.ensure_selected_split_preview(&mut studio);
+        self.views.push(View::Split(studio));
+    }
+
+    fn representative_pane_for_window(&self, window_id: &WindowId) -> Option<Pane> {
+        self.home_panes
+            .iter()
+            .find(|p| &p.window_id == window_id && p.active)
+            .or_else(|| self.home_panes.iter().find(|p| &p.window_id == window_id))
+            .cloned()
+    }
+
+    fn split_studio_key(&mut self, mut studio: SplitStudio, key: KeyEvent) {
+        let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let alt = key.modifiers.contains(KeyModifiers::ALT);
+        match key.code {
+            KeyCode::Tab => {
+                studio.cycle_slot(true);
+                self.ensure_selected_split_preview(&mut studio);
+            }
+            KeyCode::BackTab => {
+                studio.cycle_slot(false);
+                self.ensure_selected_split_preview(&mut studio);
+            }
+            KeyCode::Left if !shift && !ctrl && !alt => {
+                studio.cycle_slot(false);
+                self.ensure_selected_split_preview(&mut studio);
+            }
+            KeyCode::Right if !shift && !ctrl && !alt => {
+                studio.cycle_slot(true);
+                self.ensure_selected_split_preview(&mut studio);
+            }
+            KeyCode::Up if !ctrl && !alt => {
+                studio.move_window_cursor(true);
+                self.ensure_selected_split_preview(&mut studio);
+            }
+            KeyCode::Down if !ctrl && !alt => {
+                studio.move_window_cursor(false);
+                self.ensure_selected_split_preview(&mut studio);
+            }
+            KeyCode::PageUp => {
+                let selected = studio.selected_slot;
+                self.scroll_split_slot_preview(&mut studio, selected, true, 6);
+            }
+            KeyCode::PageDown => {
+                let selected = studio.selected_slot;
+                self.scroll_split_slot_preview(&mut studio, selected, false, 6);
+            }
+            KeyCode::Home => {
+                let selected = studio.selected_slot;
+                self.scroll_split_slot_preview(&mut studio, selected, true, usize::MAX);
+            }
+            KeyCode::End => {
+                let selected = studio.selected_slot;
+                self.scroll_split_slot_preview(&mut studio, selected, false, usize::MAX);
+            }
+            KeyCode::Char('u' | 'U') if ctrl && !alt => {
+                let selected = studio.selected_slot;
+                self.scroll_split_slot_preview(&mut studio, selected, true, 12);
+            }
+            KeyCode::Char('d' | 'D') if ctrl && !alt => {
+                let selected = studio.selected_slot;
+                self.scroll_split_slot_preview(&mut studio, selected, false, 12);
+            }
+            KeyCode::Char('1') if !ctrl && !alt => {
+                if studio.select_slot_by_number(1) {
+                    self.ensure_selected_split_preview(&mut studio);
+                }
+            }
+            KeyCode::Char('2') if !ctrl && !alt => {
+                if studio.select_slot_by_number(2) {
+                    self.ensure_selected_split_preview(&mut studio);
+                }
+            }
+            KeyCode::Char('3') if !ctrl && !alt => {
+                if studio.select_slot_by_number(3) {
+                    self.ensure_selected_split_preview(&mut studio);
+                }
+            }
+            KeyCode::Char('4') if !ctrl && !alt => {
+                if studio.select_slot_by_number(4) {
+                    self.ensure_selected_split_preview(&mut studio);
+                }
+            }
+            KeyCode::Char('h' | 'H' | '|') if !ctrl && !alt => {
+                self.run_split_toolbar_action(&mut studio, SplitToolbarAction::SplitHorizontal);
+            }
+            KeyCode::Char('v' | 'V' | '-') if !ctrl && !alt => {
+                self.run_split_toolbar_action(&mut studio, SplitToolbarAction::SplitVertical);
+            }
+            KeyCode::Char('t' | 'T') if !ctrl && !alt => {
+                self.run_split_toolbar_action(&mut studio, SplitToolbarAction::FlipDirection);
+            }
+            KeyCode::Char('x' | 'X') | KeyCode::Delete | KeyCode::Backspace if !ctrl && !alt => {
+                self.run_split_toolbar_action(&mut studio, SplitToolbarAction::RemoveSlot);
+            }
+            KeyCode::Char('r' | 'R') if !ctrl && !alt => {
+                self.run_split_toolbar_action(&mut studio, SplitToolbarAction::Reset);
+            }
+            KeyCode::Char(' ') if !ctrl && !alt => {
+                let row = studio.window_cursor;
+                if studio.assign_cursor_row(row) {
+                    self.ensure_selected_split_preview(&mut studio);
+                }
+            }
+            KeyCode::Enter => {
+                self.apply_split_studio_and_enter(studio);
+                return;
+            }
+            _ => {}
+        }
+        self.views.push(View::Split(studio));
+    }
+
+    fn scroll_split_slot_preview(
+        &self,
+        studio: &mut SplitStudio,
+        slot_id: SlotId,
+        up: bool,
+        step: usize,
+    ) {
+        if let Some(SplitSlotFill::Window(wid)) = studio.root.slot_fill(slot_id).cloned() {
+            self.ensure_split_preview(studio, &wid);
+        }
+        let max = match studio.root.slot_fill(slot_id) {
+            Some(SplitSlotFill::Window(wid)) => studio
+                .previews
+                .get(wid)
+                .map_or(0, |lines| lines.len().saturating_sub(1)),
+            _ => 0,
+        };
+        studio.scroll_slot_preview(slot_id, up, step, max);
+    }
+
+    fn run_split_toolbar_action(&mut self, studio: &mut SplitStudio, action: SplitToolbarAction) {
+        match action {
+            SplitToolbarAction::SplitHorizontal => {
+                if studio.split_selected(SplitDirection::SideBySide) {
+                    self.status.clear();
+                } else {
+                    self.status = self
+                        .theme
+                        .tr(
+                            "Max 2x2 layout reached (at most 2 columns x 2 rows).",
+                            "已达 2x2 分屏上限（最多 2 列 × 2 行）。",
+                        )
+                        .into();
+                }
+            }
+            SplitToolbarAction::SplitVertical => {
+                if studio.split_selected(SplitDirection::Stacked) {
+                    self.status.clear();
+                } else {
+                    self.status = self
+                        .theme
+                        .tr(
+                            "Max 2x2 layout reached (at most 2 columns x 2 rows).",
+                            "已达 2x2 分屏上限（最多 2 列 × 2 行）。",
+                        )
+                        .into();
+                }
+            }
+            SplitToolbarAction::FlipDirection => {
+                if studio.flip_layout() {
+                    self.status = self
+                        .theme
+                        .tr("✦ Flipped split layout", "✦ 已翻转分屏方向")
+                        .into();
+                } else {
+                    self.status = self
+                        .theme
+                        .tr(
+                            "Need at least 2 panes to flip split direction.",
+                            "至少需要 2 个窗格才能翻转分屏方向。",
+                        )
+                        .into();
+                }
+            }
+            SplitToolbarAction::RemoveSlot => {
+                if studio.remove_selected() {
+                    self.ensure_selected_split_preview(studio);
+                    self.status.clear();
+                } else {
+                    self.status = self
+                        .theme
+                        .tr(
+                            "Cannot remove the last remaining pane.",
+                            "无法移除最后一个窗格。",
+                        )
+                        .into();
+                }
+            }
+            SplitToolbarAction::Reset => {
+                studio.reset();
+                self.ensure_selected_split_preview(studio);
+                self.status = self
+                    .theme
+                    .tr("Reset split canvas to 1x1", "分屏画布已重置为 1x1")
+                    .into();
+            }
+            SplitToolbarAction::ApplyAndEnter => {}
+        }
+    }
+
+    fn apply_split_studio_and_enter(&mut self, studio: SplitStudio) {
+        let windows = match self.tmux.list_windows(None) {
+            Ok(w) => w,
+            Err(error) => {
+                self.status = error.to_string();
+                self.recover_split_studio(studio);
+                return;
+            }
+        };
+        let panes = match self.tmux.list_panes(None) {
+            Ok(p) => p,
+            Err(error) => {
+                self.status = error.to_string();
+                self.recover_split_studio(studio);
+                return;
+            }
+        };
+
+        let mut window_map: HashMap<WindowId, Window> =
+            windows.into_iter().map(|w| (w.id.clone(), w)).collect();
+        let mut rep_panes: HashMap<WindowId, (PaneId, usize, Option<String>)> = HashMap::new();
+        for pane in &panes {
+            let entry = rep_panes.entry(pane.window_id.clone()).or_insert_with(|| {
+                (
+                    pane.id.clone(),
+                    0,
+                    (!pane.current_path.trim().is_empty()).then(|| pane.current_path.clone()),
+                )
+            });
+            entry.1 += 1;
+            if pane.active {
+                entry.0 = pane.id.clone();
+                if !pane.current_path.trim().is_empty() {
+                    entry.2 = Some(pane.current_path.clone());
+                }
+            }
+        }
+
+        let missing_staged_window = studio.root.leaves().into_iter().any(|(_, fill)| {
+            matches!(
+                fill,
+                SplitSlotFill::Window(ref wid)
+                    if !window_map.contains_key(wid) || !rep_panes.contains_key(wid)
+            )
+        });
+        if missing_staged_window {
+            self.status = self
+                .theme
+                .tr(
+                    "Selected window no longer exists in tmux.",
+                    "所选窗口在 tmux 中已不存在。",
+                )
+                .into();
+            self.recover_split_studio(studio);
+            return;
+        }
+
+        let anchor_cwd = (!studio.anchor_cwd.as_os_str().is_empty() && studio.anchor_cwd.is_dir())
+            .then_some(studio.anchor_cwd.as_path());
+
+        if let SplitNode::Leaf { fill, .. } = &studio.root {
+            match fill {
+                SplitSlotFill::Window(window_id) => {
+                    if let Some(win) = window_map.get(window_id) {
+                        if let Some((pane_id, _, _)) = rep_panes.get(window_id) {
+                            let _ = self.tmux.select(&Target::Pane(pane_id.clone()));
+                        }
+                        self.enter(Target::Window(win.session_id.clone(), win.id.clone()));
+                        return;
+                    }
+                    self.status = self
+                        .theme
+                        .tr(
+                            "Selected window no longer exists in tmux.",
+                            "所选窗口在 tmux 中已不存在。",
+                        )
+                        .into();
+                    self.recover_split_studio(studio);
+                    return;
+                }
+                SplitSlotFill::NewShell => {
+                    match self
+                        .tmux
+                        .new_window(&studio.anchor_session_id, None, anchor_cwd)
+                    {
+                        Ok(created) => {
+                            if let Ok(created_panes) = self.tmux.list_panes(Some(&created.id))
+                                && let Some(first_pane) = created_panes.first()
+                            {
+                                let _ = self.tmux.select(&Target::Pane(first_pane.id.clone()));
+                            }
+                            self.enter(Target::Window(studio.anchor_session_id, created.id));
+                        }
+                        Err(error) => {
+                            self.status = error.to_string();
+                            self.recover_split_studio(studio);
+                        }
+                    }
+                    return;
+                }
+            }
+        }
+
+        let (_, first_fill) = studio.root.first_leaf();
+        let (target_session_id, target_window_id, first_anchor_pane) =
+            if let SplitSlotFill::Window(win_id) = &first_fill
+                && let Some(win) = window_map.get(win_id)
+                && let Some((pane_id, 1, _)) = rep_panes.get(win_id)
+            {
+                (win.session_id.clone(), win.id.clone(), pane_id.clone())
+            } else {
+                let target_sess = match &first_fill {
+                    SplitSlotFill::Window(win_id) => window_map
+                        .get(win_id)
+                        .map(|w| w.session_id.clone())
+                        .unwrap_or_else(|| studio.anchor_session_id.clone()),
+                    SplitSlotFill::NewShell => studio.anchor_session_id.clone(),
+                };
+                let created = match self.tmux.new_window(&target_sess, None, anchor_cwd) {
+                    Ok(w) => w,
+                    Err(error) => {
+                        self.status = error.to_string();
+                        self.recover_split_studio(studio);
+                        return;
+                    }
+                };
+                let created_panes = match self.tmux.list_panes(Some(&created.id)) {
+                    Ok(p) => p,
+                    Err(error) => {
+                        self.status = error.to_string();
+                        self.recover_split_studio(studio);
+                        return;
+                    }
+                };
+                let Some(fresh_pane) = created_panes.first() else {
+                    self.status = "Created window has no active pane.".into();
+                    self.recover_split_studio(studio);
+                    return;
+                };
+                let anchor_pane = if let SplitSlotFill::Window(win_id) = &first_fill
+                    && let Some((src_pane, _, _)) = rep_panes.get(win_id)
+                {
+                    if let Err(error) =
+                        self.tmux
+                            .join_pane(src_pane, &fresh_pane.id, SplitDirection::SideBySide)
+                    {
+                        self.status = error.to_string();
+                        self.recover_split_studio(studio);
+                        return;
+                    }
+                    if let Err(error) = self.tmux.kill_pane(&fresh_pane.id) {
+                        self.status = error.to_string();
+                        self.recover_split_studio(studio);
+                        return;
+                    }
+                    src_pane.clone()
+                } else {
+                    fresh_pane.id.clone()
+                };
+                window_map.insert(created.id.clone(), created.clone());
+                (target_sess, created.id, anchor_pane)
+            };
+
+        let mut slot_panes: HashMap<SlotId, PaneId> = HashMap::new();
+        if let Err(error) = self.materialize_split_subtree(
+            &studio.root,
+            &first_anchor_pane,
+            &rep_panes,
+            &mut slot_panes,
+        ) {
+            self.status = error.to_string();
+            self.recover_split_studio(studio);
+            return;
+        }
+
+        if let Some(selected_pane_id) = slot_panes.get(&studio.selected_slot) {
+            let _ = self.tmux.select(&Target::Pane(selected_pane_id.clone()));
+        }
+        self.refresh_home_data();
+        self.enter(Target::Window(target_session_id, target_window_id));
+    }
+
+    fn materialize_split_subtree(
+        &self,
+        node: &SplitNode,
+        first_anchor: &PaneId,
+        rep_panes: &HashMap<WindowId, (PaneId, usize, Option<String>)>,
+        slot_panes: &mut HashMap<SlotId, PaneId>,
+    ) -> TmuxResult<()> {
+        match node {
+            SplitNode::Leaf { id, .. } => {
+                slot_panes.insert(*id, first_anchor.clone());
+                Ok(())
+            }
+            SplitNode::Split {
+                direction,
+                first,
+                second,
+            } => {
+                let second_anchor = match second.first_leaf().1 {
+                    SplitSlotFill::Window(win_id) => {
+                        if let Some((src_pane, _, _)) = rep_panes.get(&win_id)
+                            && src_pane != first_anchor
+                        {
+                            self.tmux.join_pane(src_pane, first_anchor, *direction)?;
+                            src_pane.clone()
+                        } else {
+                            self.tmux.split_pane(first_anchor, *direction)?.id
+                        }
+                    }
+                    SplitSlotFill::NewShell => self.tmux.split_pane(first_anchor, *direction)?.id,
+                };
+                self.materialize_split_subtree(first, first_anchor, rep_panes, slot_panes)?;
+                self.materialize_split_subtree(second, &second_anchor, rep_panes, slot_panes)
+            }
+        }
+    }
+
+    fn ui_toolbar_to_action(button: SplitToolbarButton) -> SplitToolbarAction {
+        match button {
+            SplitToolbarButton::SplitHorizontal => SplitToolbarAction::SplitHorizontal,
+            SplitToolbarButton::SplitVertical => SplitToolbarAction::SplitVertical,
+            SplitToolbarButton::FlipDirection => SplitToolbarAction::FlipDirection,
+            SplitToolbarButton::RemoveSlot => SplitToolbarAction::RemoveSlot,
+            SplitToolbarButton::Reset => SplitToolbarAction::Reset,
+            SplitToolbarButton::ApplyAndEnter => SplitToolbarAction::ApplyAndEnter,
+        }
+    }
+
+    fn build_split_canvas_node<'s>(
+        &self,
+        studio: &'s SplitStudio,
+        node: &'s SplitNode,
+    ) -> SplitCanvasNode<'s> {
+        match node {
+            SplitNode::Leaf { id, fill } => {
+                let ordinal = studio.slot_ordinal(*id).unwrap_or(1);
+                let preview_lines: &'s [String] = match fill {
+                    SplitSlotFill::Window(wid) => {
+                        studio.previews.get(wid).map(Vec::as_slice).unwrap_or(&[])
+                    }
+                    SplitSlotFill::NewShell => &[],
+                };
+                let (title, subtitle, is_new_shell) = match fill {
+                    SplitSlotFill::Window(win_id) => {
+                        if let Some(opt) = studio.window_option(win_id) {
+                            (
+                                format!(
+                                    "{}:{} {}",
+                                    opt.window.session_name, opt.window.index, opt.window.name
+                                ),
+                                opt.command.clone(),
+                                false,
+                            )
+                        } else {
+                            (win_id.as_str().to_owned(), String::new(), false)
+                        }
+                    }
+                    SplitSlotFill::NewShell => (
+                        self.theme.tr("+ New shell", "+ 新建终端").to_owned(),
+                        self.theme
+                            .tr("Opens fresh shell in tmux", "进入 tmux 时新建终端")
+                            .to_owned(),
+                        true,
+                    ),
+                };
+                SplitCanvasNode::Pane(SplitCanvasPaneView {
+                    slot_id: *id,
+                    ordinal,
+                    title,
+                    subtitle,
+                    selected: studio.selected_slot == *id,
+                    is_new_shell,
+                    preview_lines,
+                    preview_scroll: studio.preview_scrolls.get(id).copied().unwrap_or(0),
+                })
+            }
+            SplitNode::Split {
+                direction,
+                first,
+                second,
+            } => SplitCanvasNode::Split {
+                horizontal: *direction == SplitDirection::SideBySide,
+                first: Box::new(self.build_split_canvas_node(studio, first)),
+                second: Box::new(self.build_split_canvas_node(studio, second)),
+            },
         }
     }
 
@@ -2044,15 +2719,7 @@ impl<'a> App<'a> {
                     self.kill_confirm(Resource::Session(session));
                 }
                 MatrixAction::Split => {
-                    self.matrix_action = MatrixAction::Open;
-                    self.composer.set_value("");
-                    self.sync_home_matrix();
-                    if let Some(pane) = self.resolve_pane_for_resource(&Resource::Session(session))
-                    {
-                        self.views.push(View::Split(Resource::Pane(pane), 0));
-                    } else {
-                        self.open_picker(PickerPurpose::Panes);
-                    }
+                    self.open_split_studio_from_home(Resource::Session(session));
                 }
                 MatrixAction::Window => {
                     self.status.clear();
@@ -2102,14 +2769,7 @@ impl<'a> App<'a> {
                     self.kill_confirm(Resource::Session(session));
                 }
                 MatrixAction::Split => {
-                    self.matrix_action = MatrixAction::Open;
-                    self.composer.set_value("");
-                    self.sync_home_matrix();
-                    if let Some(pane) = self.resolve_pane_for_resource(&Resource::Window(window)) {
-                        self.views.push(View::Split(Resource::Pane(pane), 0));
-                    } else {
-                        self.open_picker(PickerPurpose::Panes);
-                    }
+                    self.open_split_studio_from_home(Resource::Window(window));
                 }
                 MatrixAction::Window => {
                     self.composer.set_value("");
@@ -2836,8 +3496,19 @@ impl<'a> App<'a> {
                 };
                 self.views.push(View::Actions(resource, selected));
             }
-            Some(View::Split(resource, _)) => {
-                self.views.push(View::Split(resource, usize::from(!up)));
+            Some(View::Split(mut studio)) => {
+                if let Some((_, slot_id)) = studio
+                    .slot_hits
+                    .iter()
+                    .find(|(rect, _)| rect.contains((column, row).into()))
+                    .copied()
+                {
+                    self.scroll_split_slot_preview(&mut studio, slot_id, up, PREVIEW_WHEEL_STEP);
+                } else {
+                    studio.move_window_cursor(up);
+                    self.ensure_selected_split_preview(&mut studio);
+                }
+                self.views.push(View::Split(studio));
             }
             Some(View::ThemePicker {
                 initial,
@@ -2941,6 +3612,7 @@ impl<'a> App<'a> {
                                         self.matrix_action,
                                         MatrixAction::Open
                                             | MatrixAction::Inspect
+                                            | MatrixAction::Split
                                             | MatrixAction::Rename(_)
                                             | MatrixAction::Kill(_)
                                     )
@@ -3016,6 +3688,38 @@ impl<'a> App<'a> {
                     }
                 }
                 self.views.push(View::ThemePicker { initial, selected });
+            }
+            Some(View::Split(mut studio)) => {
+                if let Some((_, action)) = studio
+                    .toolbar_hits
+                    .iter()
+                    .find(|(rect, _)| rect.contains((column, row).into()))
+                    .copied()
+                {
+                    if action == SplitToolbarAction::ApplyAndEnter {
+                        self.apply_split_studio_and_enter(studio);
+                        return;
+                    }
+                    self.run_split_toolbar_action(&mut studio, action);
+                } else if let Some((_, slot_id)) = studio
+                    .slot_hits
+                    .iter()
+                    .find(|(rect, _)| rect.contains((column, row).into()))
+                    .copied()
+                {
+                    if studio.select_slot(slot_id) {
+                        self.ensure_selected_split_preview(&mut studio);
+                    }
+                } else if let Some(rect) = studio.window_list_rect
+                    && rect.contains((column, row).into())
+                {
+                    let clicked = Self::list_scroll_offset(studio.window_cursor, rect.height)
+                        + usize::from(row - rect.y);
+                    if studio.assign_cursor_row(clicked) {
+                        self.ensure_selected_split_preview(&mut studio);
+                    }
+                }
+                self.views.push(View::Split(studio));
             }
             Some(other) => self.views.push(other),
         }
@@ -3777,8 +4481,63 @@ impl<'a> App<'a> {
                     },
                 )
             }
-            Some(View::Split(resource, selected)) => {
-                let target_label = resource.label();
+            Some(View::Split(studio)) => {
+                let root = self.build_split_canvas_node(studio, &studio.root);
+                let mut window_rows: Vec<SplitWindowRowView> = studio
+                    .window_options
+                    .iter()
+                    .map(|opt| {
+                        let detail = if opt.window.panes > 1 {
+                            let active_note = self.theme.tr("active pane", "仅迁活跃窗格");
+                            if opt.command.is_empty() {
+                                format!("{}p · {active_note}", opt.window.panes)
+                            } else {
+                                format!("{} · {}p · {active_note}", opt.command, opt.window.panes)
+                            }
+                        } else {
+                            opt.command.clone()
+                        };
+                        SplitWindowRowView {
+                            primary: format!(
+                                "{}:{} {}",
+                                opt.window.session_name, opt.window.index, opt.window.name
+                            ),
+                            detail,
+                            active_in_session: opt.window.active,
+                            assigned_slot: studio
+                                .root
+                                .find_slot_with_window(&opt.window.id)
+                                .and_then(|sid| studio.slot_ordinal(sid)),
+                            is_new_shell: false,
+                        }
+                    })
+                    .collect();
+                window_rows.push(SplitWindowRowView {
+                    primary: self.theme.tr("+ New shell", "+ 新建终端").to_owned(),
+                    detail: self
+                        .theme
+                        .tr("Open fresh shell in this slot", "在此窗格新建空白终端")
+                        .to_owned(),
+                    active_in_session: false,
+                    assigned_slot: None,
+                    is_new_shell: true,
+                });
+                let view = SplitStudioView {
+                    root,
+                    selected_slot: studio.selected_slot,
+                    selected_ordinal: studio.slot_ordinal(studio.selected_slot).unwrap_or(1),
+                    slot_count: studio.root.leaf_count(),
+                    can_split_h: studio
+                        .root
+                        .can_split(studio.selected_slot, SplitDirection::SideBySide),
+                    can_split_v: studio
+                        .root
+                        .can_split(studio.selected_slot, SplitDirection::Stacked),
+                    can_flip: studio.root.can_flip(),
+                    can_remove: studio.root.leaf_count() > 1,
+                    window_rows: &window_rows,
+                    window_cursor: studio.window_cursor,
+                };
                 draw_subview(
                     frame,
                     subview_area,
@@ -3786,10 +4545,7 @@ impl<'a> App<'a> {
                     telemetry,
                     emblem,
                     self.theme,
-                    SubviewContent::Split {
-                        target_label: &target_label,
-                        selected: *selected,
-                    },
+                    SubviewContent::Split(view),
                 )
             }
             Some(View::ThemePicker { initial, selected }) => draw_subview(
@@ -3880,6 +4636,15 @@ impl<'a> App<'a> {
         if let Some(View::Confirm(confirm)) = self.views.0.last_mut() {
             confirm.scroll = sub_layout.confirm_scroll;
         }
+        if let Some(View::Split(studio)) = self.views.0.last_mut() {
+            studio.slot_hits = sub_layout.split_slot_hits;
+            studio.toolbar_hits = sub_layout
+                .split_toolbar_hits
+                .into_iter()
+                .map(|(rect, btn)| (rect, Self::ui_toolbar_to_action(btn)))
+                .collect();
+            studio.window_list_rect = sub_layout.list_rect;
+        }
         if let Some(chunks) = compact_chunks {
             frame.render_widget(
                 Paragraph::new(Line::from(vec![
@@ -3888,12 +4653,7 @@ impl<'a> App<'a> {
                 ])),
                 chunks[1],
             );
-            let status_style =
-                if self.status.starts_with("Refreshed") || self.status.starts_with('✦') {
-                    self.theme.style(self.theme.success)
-                } else {
-                    self.theme.style(self.theme.error)
-                };
+            let status_style = ui::status_style(&self.status, self.theme);
             frame.render_widget(
                 Paragraph::new(self.theme.adapt(&self.status)).style(status_style),
                 chunks[2],

@@ -182,7 +182,8 @@ fn window_and_pane_management_work_through_keyboard_events() {
             initial_command: Some("/split".into()),
         },
     );
-    keys(&mut app, &[Enter, Enter]);
+    keys(&mut app, &[Enter, KeyCode::Char('h'), Enter]);
+    assert!(matches!(app.exit(), Some(Exit::Attach(Target::Window(sid, _))) if sid == &session.id));
     assert_eq!(
         server.client.list_panes(None).expect("split panes").len(),
         2
@@ -693,4 +694,51 @@ fn attached_clients_do_not_block_management_or_get_detached() {
             .iter()
             .any(|s| s.id == session.id && s.attached > 0)
     );
+}
+
+#[test]
+fn join_pane_combines_windows_into_split_layout() {
+    let server = PrivateServer::new();
+    let session = server
+        .client
+        .new_session("studio-join", cwd())
+        .expect("session");
+    let first_win = server
+        .client
+        .list_windows(Some(&session.id))
+        .expect("first win")
+        .into_iter()
+        .next()
+        .expect("window 0");
+    let second_win = server
+        .client
+        .new_window(&session.id, Some("right"), Some(cwd()))
+        .expect("second win");
+    let first_pane = server
+        .client
+        .list_panes(Some(&first_win.id))
+        .expect("first pane")
+        .into_iter()
+        .next()
+        .expect("pane 0");
+    let second_pane = server
+        .client
+        .list_panes(Some(&second_win.id))
+        .expect("second pane")
+        .into_iter()
+        .next()
+        .expect("pane 1");
+
+    server
+        .client
+        .join_pane(&second_pane.id, &first_pane.id, SplitDirection::SideBySide)
+        .expect("join_pane should move second pane beside first pane");
+
+    let combined = server
+        .client
+        .list_panes(Some(&first_win.id))
+        .expect("combined panes");
+    assert_eq!(combined.len(), 2);
+    assert!(combined.iter().any(|p| p.id == first_pane.id));
+    assert!(combined.iter().any(|p| p.id == second_pane.id));
 }

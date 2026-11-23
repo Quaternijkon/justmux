@@ -402,29 +402,39 @@ fn split_renders_visual_wireframe_preview_and_rich_picker_shows_badges() {
     );
     key(&mut app, KeyCode::Esc);
 
-    // `/split` -> Enter opens View::Split with live visual wireframe preview.
+    // `/split` -> Enter opens interactive Split Studio; `h` splits into 2 panes (#1 & #2).
     type_text(&mut app, "/split");
     key(&mut app, KeyCode::Enter);
     key(&mut app, KeyCode::Enter);
-    let split_unicode = render_app(&mut app, 80, 16).backend().to_string();
-    assert!(split_unicode.contains("╭──────┬──────╮"), "{split_unicode}");
-    assert!(split_unicode.contains("╭─────────────╮"), "{split_unicode}");
+    let split_unicode = render_app(&mut app, 100, 26).backend().to_string();
+    assert!(split_unicode.contains("#1 ★"), "{split_unicode}");
+    assert!(split_unicode.contains("codex-dev"), "{split_unicode}");
+    assert!(
+        split_unicode.contains("[Enter] Apply & Enter"),
+        "{split_unicode}"
+    );
+    key(&mut app, KeyCode::Char('h'));
+    let split_two = render_app(&mut app, 100, 26).backend().to_string();
+    assert!(split_two.contains("#1"), "{split_two}");
+    assert!(split_two.contains("#2 ★"), "{split_two}");
+    assert!(split_two.contains("+ New shell"), "{split_two}");
 
-    // ASCII fallback on `/split` stays pure ASCII.
+    // ASCII + NO_COLOR fallback on `/split` stays pure ASCII/box-drawing with zero color.
     app.set_theme(Theme {
         ascii: true,
         no_color: true,
         ..app.theme()
     });
-    let split_ascii = render_app(&mut app, 80, 16).backend().to_string();
+    let split_ascii = render_app(&mut app, 100, 26).backend().to_string();
     assert!(
         split_ascii
             .chars()
             .all(|c| c.is_ascii() || matches!(c, '┌' | '┐' | '└' | '┘' | '─' | '│')),
         "{split_ascii}"
     );
-    assert!(split_ascii.contains("+------+------+"), "{split_ascii}");
-    assert!(split_ascii.contains("+-------------+"), "{split_ascii}");
+    assert!(split_ascii.contains("#1"), "{split_ascii}");
+    assert!(split_ascii.contains("#2 *"), "{split_ascii}");
+    assert!(split_ascii.contains("+ New shell"), "{split_ascii}");
 }
 
 fn wait_for_pane_text(client: &TmuxClient, target: &Target, needle: &str) {
@@ -692,11 +702,16 @@ fn at_mentions_ctrl_p_ctrl_k_and_live_previews_in_picker_resume_and_confirm() {
             .any(|s| s.id == dev.id && s.name == "api-renamed")
     );
 
-    // `/split @api-renamed` opens visual Split selector.
+    // `/split @api-renamed` opens interactive Split Studio seeded with api-renamed.
     type_text(&mut kill_app, "/split @api-renamed");
     key(&mut kill_app, KeyCode::Enter);
-    let split_screen = render_app(&mut kill_app, 80, 16).backend().to_string();
-    assert!(split_screen.contains("╭──────┬──────╮"), "{split_screen}");
+    let split_screen = render_app(&mut kill_app, 100, 26).backend().to_string();
+    assert!(split_screen.contains("#1 ★"), "{split_screen}");
+    assert!(split_screen.contains("api-renamed"), "{split_screen}");
+    assert!(
+        split_screen.contains("[Enter] Apply & Enter"),
+        "{split_screen}"
+    );
 }
 
 #[test]
@@ -1929,4 +1944,449 @@ fn window_preview_renders_ansi_256_and_truecolor_pane_output() {
         assert_eq!(cell.fg, Color::Reset, "fg reset on {cell:?}");
         assert_eq!(cell.bg, Color::Reset, "bg reset on {cell:?}");
     }
+}
+
+#[test]
+fn split_studio_interactive_2x2_mouse_and_apply_layout() {
+    let server = PrivateServer::new();
+    let cwd = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let session = server
+        .client
+        .new_session("studio-e2e", cwd)
+        .expect("session");
+    let w_editor = server
+        .client
+        .list_windows(Some(&session.id))
+        .expect("windows")
+        .into_iter()
+        .next()
+        .expect("editor window");
+    server
+        .client
+        .rename_window(&w_editor.id, "editor")
+        .expect("rename editor");
+    let w_server = server
+        .client
+        .new_window(&session.id, Some("server"), Some(cwd))
+        .expect("server window");
+    let w_logs = server
+        .client
+        .new_window(&session.id, Some("logs"), Some(cwd))
+        .expect("logs window");
+
+    for (wid, a, b) in [
+        (&w_editor.id, "__S_", "EDIT__"),
+        (&w_server.id, "__S_", "SERV__"),
+        (&w_logs.id, "__S_", "LOGS__"),
+    ] {
+        let cmd = format!("printf '{a}{b}\\n'");
+        let out = Command::new("tmux")
+            .args([
+                "-L",
+                &server.socket,
+                "send-keys",
+                "-t",
+                wid.as_str(),
+                &cmd,
+                "Enter",
+            ])
+            .env_remove("TMUX")
+            .env_remove("TMUX_PANE")
+            .output()
+            .expect("send-keys");
+        assert!(out.status.success());
+        let needle = format!("{a}{b}");
+        wait_for_pane_text(
+            &server.client,
+            &Target::Window(session.id.clone(), wid.clone()),
+            &needle,
+        );
+    }
+
+    let p_editor = server
+        .client
+        .list_panes(Some(&w_editor.id))
+        .expect("editor pane")[0]
+        .id
+        .clone();
+    let p_server = server
+        .client
+        .list_panes(Some(&w_server.id))
+        .expect("server pane")[0]
+        .id
+        .clone();
+    let p_logs = server
+        .client
+        .list_panes(Some(&w_logs.id))
+        .expect("logs pane")[0]
+        .id
+        .clone();
+
+    // Cancelling after staging splits, flip, and reset leaves tmux untouched.
+    let mut cancel_app = App::new(&server.client, AppOptions::default());
+    type_text(&mut cancel_app, "/split");
+    key(&mut cancel_app, KeyCode::Enter);
+    key(&mut cancel_app, KeyCode::Enter);
+    key(&mut cancel_app, KeyCode::Char('h'));
+    key(&mut cancel_app, KeyCode::Char('v'));
+    let color_theme = Theme {
+        no_color: false,
+        ..cancel_app.theme()
+    };
+    key(&mut cancel_app, KeyCode::Char('t'));
+    assert!(
+        cancel_app.status().contains("Flipped"),
+        "{}",
+        cancel_app.status()
+    );
+    assert_eq!(
+        justmux::ui::status_style(cancel_app.status(), color_theme),
+        color_theme.style(color_theme.accent)
+    );
+    assert_ne!(
+        justmux::ui::status_style(cancel_app.status(), color_theme),
+        color_theme.style(color_theme.error)
+    );
+    key(&mut cancel_app, KeyCode::Char('r'));
+    assert!(
+        cancel_app.status().contains("Reset"),
+        "{}",
+        cancel_app.status()
+    );
+    assert_eq!(
+        justmux::ui::status_style(cancel_app.status(), color_theme),
+        color_theme.style(color_theme.accent)
+    );
+    assert_ne!(
+        justmux::ui::status_style(cancel_app.status(), color_theme),
+        color_theme.style(color_theme.error)
+    );
+    let reset_screen = render_app(&mut cancel_app, 120, 32).backend().to_string();
+    assert!(reset_screen.contains("#1 ★"), "{reset_screen}");
+    assert!(!reset_screen.contains("#2"), "{reset_screen}");
+    key(&mut cancel_app, KeyCode::Esc);
+    assert!(cancel_app.exit().is_none());
+    assert_eq!(
+        server
+            .client
+            .list_windows(Some(&session.id))
+            .expect("unchanged windows")
+            .len(),
+        3
+    );
+    assert_eq!(
+        server
+            .client
+            .list_panes(None)
+            .expect("unchanged panes")
+            .len(),
+        3
+    );
+
+    // Interactive 2x2 studio via mouse + keyboard, live previews, ZH localization, and Apply & Enter.
+    let mut app = App::new(&server.client, AppOptions::default());
+    type_text(&mut app, "/split");
+    key(&mut app, KeyCode::Enter);
+    key(&mut app, KeyCode::Enter);
+
+    let t1 = render_app(&mut app, 120, 32);
+    let s1 = t1.backend().to_string();
+    assert!(s1.contains("#1 ★"), "{s1}");
+    assert!(
+        s1.contains("__S_EDIT__") || s1.contains("__S_SERV__") || s1.contains("__S_LOGS__"),
+        "expected initial live preview in canvas:\n{s1}"
+    );
+
+    // Click `[h] Split H` toolbar button.
+    let (h_col, h_row) = find_buffer_text(t1.backend().buffer(), "[h]").expect("[h] button");
+    app.handle_event(mouse_event(
+        MouseEventKind::Down(MouseButton::Left),
+        h_col,
+        h_row,
+    ));
+    let t2 = render_app(&mut app, 120, 32);
+    let s2 = t2.backend().to_string();
+    assert!(s2.contains("#1"), "{s2}");
+    assert!(s2.contains("#2 ★"), "{s2}");
+
+    // Click `[v] Split V` on right pane -> 3 panes, then focus #1 and press `v` -> 2x2 (4 panes).
+    let (v_col, v_row) = find_buffer_text(t2.backend().buffer(), "[v]").expect("[v] button");
+    app.handle_event(mouse_event(
+        MouseEventKind::Down(MouseButton::Left),
+        v_col,
+        v_row,
+    ));
+    key(&mut app, KeyCode::Char('1'));
+    key(&mut app, KeyCode::Char('v'));
+    let s4 = render_app(&mut app, 120, 32).backend().to_string();
+    for tag in ["#1", "#2 ★", "#3", "#4"] {
+        assert!(s4.contains(tag), "missing {tag} in 2x2:\n{s4}");
+    }
+
+    // One-key flip (`t`) transposes split axes and flips back cleanly.
+    key(&mut app, KeyCode::Char('t'));
+    assert!(app.status().contains("Flipped"), "{}", app.status());
+    key(&mut app, KeyCode::Char('t'));
+    assert!(app.status().contains("Flipped"), "{}", app.status());
+
+    // Attempting a 5th split is refused with a friendly 2x2 cap status.
+    key(&mut app, KeyCode::Char('h'));
+    let s5 = render_app(&mut app, 120, 32).backend().to_string();
+    assert!(!s5.contains("#5"), "{s5}");
+    assert!(app.status().contains("Max 2x2"), "{}", app.status());
+
+    // Fill #2 and #3 with the remaining free windows; keep #4 as `+ New shell`.
+    key(&mut app, KeyCode::Char('2'));
+    key(&mut app, KeyCode::Up);
+    key(&mut app, KeyCode::Char('3'));
+    key(&mut app, KeyCode::Up);
+    key(&mut app, KeyCode::Up);
+
+    // Extra preview scroll keys (Home/End/Ctrl+U/Ctrl+D) operate safely inside Split Studio.
+    key(&mut app, KeyCode::Home);
+    app.handle_event(Event::Key(KeyEvent::new(
+        KeyCode::Char('d'),
+        crossterm::event::KeyModifiers::CONTROL,
+    )));
+    app.handle_event(Event::Key(KeyEvent::new(
+        KeyCode::Char('u'),
+        crossterm::event::KeyModifiers::CONTROL,
+    )));
+    key(&mut app, KeyCode::End);
+
+    // Focus #2 explicitly so Apply should leave #2's pane active (distinct from #1).
+    key(&mut app, KeyCode::Char('2'));
+    let filled = render_app(&mut app, 120, 32).backend().to_string();
+    assert!(filled.contains("#2 ★ studio-e2e:2 logs"), "{filled}");
+    assert!(filled.contains("Enter Launch"), "{filled}");
+    assert!(filled.contains("__S_EDIT__"), "{filled}");
+    assert!(filled.contains("__S_SERV__"), "{filled}");
+    assert!(filled.contains("__S_LOGS__"), "{filled}");
+    assert!(filled.contains("+ New shell"), "{filled}");
+
+    // Switching language to Chinese updates Split Studio chrome & toolbar pills cleanly.
+    let saved_theme = app.theme();
+    app.set_theme(Theme {
+        language: justmux::ui::Language::Zh,
+        ..saved_theme
+    });
+    let zh_screen = render_app(&mut app, 120, 32).backend().to_string();
+    assert!(zh_screen.contains("左右分"), "{zh_screen}");
+    assert!(zh_screen.contains("上下分"), "{zh_screen}");
+    assert!(zh_screen.contains("翻转"), "{zh_screen}");
+    assert!(zh_screen.contains("确认进入 tmux"), "{zh_screen}");
+    app.set_theme(saved_theme);
+
+    // Click `[Enter] Apply & Enter` pill to materialize the 2x2 layout and enter tmux.
+    let final_term = render_app(&mut app, 120, 32);
+    let (apply_col, apply_row) =
+        find_buffer_text(final_term.backend().buffer(), "[Enter] Apply & Enter")
+            .expect("[Enter] Apply & Enter button");
+    app.handle_event(mouse_event(
+        MouseEventKind::Down(MouseButton::Left),
+        apply_col,
+        apply_row,
+    ));
+
+    let target_window = match app.exit() {
+        Some(Exit::Attach(Target::Window(sid, wid))) if sid == &session.id => wid.clone(),
+        other => panic!("expected Exit::Attach(Target::Window) for studio session, got {other:?}"),
+    };
+    let merged_panes = server
+        .client
+        .list_panes(Some(&target_window))
+        .expect("merged panes");
+    assert_eq!(merged_panes.len(), 4, "expected 4 panes: {merged_panes:?}");
+
+    let active_pane = merged_panes
+        .iter()
+        .find(|p| p.active)
+        .expect("active pane after Apply");
+    assert_ne!(
+        active_pane.id, p_editor,
+        "selected slot #2 should be focused instead of #1 (editor)"
+    );
+    assert_ne!(
+        active_pane.id, p_server,
+        "selected slot #2 (logs) should be focused instead of #3 (server)"
+    );
+    assert_eq!(
+        active_pane.id, p_logs,
+        "expected selected slot #2 pane ({p_logs:?}) to be active: {merged_panes:?}"
+    );
+
+    let mut combined_output = String::new();
+    for pane in &merged_panes {
+        let lines = server
+            .client
+            .capture_pane(&Target::Pane(pane.id.clone()), 40)
+            .expect("capture merged pane");
+        combined_output.push_str(&lines.join("\n"));
+        combined_output.push('\n');
+    }
+    assert!(combined_output.contains("__S_EDIT__"), "{combined_output}");
+    assert!(combined_output.contains("__S_SERV__"), "{combined_output}");
+    assert!(combined_output.contains("__S_LOGS__"), "{combined_output}");
+}
+
+#[test]
+fn split_studio_multi_pane_label_and_vanished_window_recovery() {
+    let server = PrivateServer::new();
+    let cwd = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let session = server
+        .client
+        .new_session("studio-recover", cwd)
+        .expect("session");
+    let w_main = server
+        .client
+        .list_windows(Some(&session.id))
+        .expect("windows")
+        .into_iter()
+        .next()
+        .expect("main window");
+    server
+        .client
+        .rename_window(&w_main.id, "main")
+        .expect("rename");
+    let w_vanish = server
+        .client
+        .new_window(&session.id, Some("worker"), Some(cwd))
+        .expect("worker");
+    let vanish_pane = server
+        .client
+        .list_panes(Some(&w_vanish.id))
+        .expect("worker panes")
+        .into_iter()
+        .next()
+        .expect("worker pane");
+    server
+        .client
+        .split_pane(&vanish_pane.id, justmux::tmux::SplitDirection::SideBySide)
+        .expect("split worker window");
+
+    // Re-focus main so initial slot #1 holds main and worker sits at row 1.
+    server
+        .client
+        .select(&Target::Window(session.id.clone(), w_main.id.clone()))
+        .expect("select main");
+
+    let mut app = App::new(&server.client, AppOptions::default());
+    type_text(&mut app, "/split");
+    key(&mut app, KeyCode::Enter);
+    key(&mut app, KeyCode::Enter);
+
+    let en_screen = render_app(&mut app, 120, 32).backend().to_string();
+    assert!(en_screen.contains("2p · active pane"), "{en_screen}");
+
+    let saved = app.theme();
+    app.set_theme(Theme {
+        language: justmux::ui::Language::Zh,
+        ..saved
+    });
+    let zh_screen = render_app(&mut app, 120, 32).backend().to_string();
+    assert!(zh_screen.contains("2p · 仅迁活跃窗格"), "{zh_screen}");
+    app.set_theme(saved);
+
+    // Stage #1 = main, #2 = worker, then destroy worker externally before Apply.
+    key(&mut app, KeyCode::Char('h'));
+    key(&mut app, KeyCode::Up);
+    let staged = render_app(&mut app, 120, 32).backend().to_string();
+    assert!(staged.contains("[ #2 active ]"), "{staged}");
+
+    let kill_out = Command::new("tmux")
+        .args([
+            "-L",
+            &server.socket,
+            "kill-window",
+            "-t",
+            w_vanish.id.as_str(),
+        ])
+        .env_remove("TMUX")
+        .env_remove("TMUX_PANE")
+        .output()
+        .expect("kill worker window");
+    assert!(kill_out.status.success());
+
+    key(&mut app, KeyCode::Enter);
+    assert!(
+        app.exit().is_none(),
+        "should recover cleanly in Split Studio"
+    );
+    assert!(
+        !app.status().is_empty(),
+        "expected recovery status explaining vanished window"
+    );
+
+    let recovered = render_app(&mut app, 120, 32).backend().to_string();
+    assert!(
+        !recovered.contains("worker"),
+        "vanished window should be pruned from options:\n{recovered}"
+    );
+    assert!(recovered.contains("#2 ★"), "{recovered}");
+    assert!(recovered.contains("+ New shell"), "{recovered}");
+}
+
+#[test]
+fn split_studio_lazy_preview_captures_beyond_initial_24_windows() {
+    let server = PrivateServer::new();
+    let cwd = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let session = server
+        .client
+        .new_session("studio-lazy", cwd)
+        .expect("session");
+    for i in 1..=25 {
+        server
+            .client
+            .new_window(&session.id, Some(&format!("w{i:02}")), Some(cwd))
+            .expect("create extra window");
+    }
+    let windows = server
+        .client
+        .list_windows(Some(&session.id))
+        .expect("all windows");
+    assert_eq!(windows.len(), 26);
+
+    // Ensure window at index 0 is active so w25 stays at index 25 (>= 24 eager cap).
+    let w0 = &windows[0];
+    let w25 = &windows[25];
+    server
+        .client
+        .select(&Target::Window(session.id.clone(), w0.id.clone()))
+        .expect("select w0");
+
+    let out = Command::new("tmux")
+        .args([
+            "-L",
+            &server.socket,
+            "send-keys",
+            "-t",
+            w25.id.as_str(),
+            "printf '__LAZY_25_' && printf 'DONE__\\n'",
+            "Enter",
+        ])
+        .env_remove("TMUX")
+        .env_remove("TMUX_PANE")
+        .output()
+        .expect("send-keys to w25");
+    assert!(out.status.success());
+    wait_for_pane_text(
+        &server.client,
+        &Target::Window(session.id.clone(), w25.id.clone()),
+        "__LAZY_25_DONE__",
+    );
+
+    let mut app = App::new(&server.client, AppOptions::default());
+    type_text(&mut app, "/split");
+    key(&mut app, KeyCode::Enter);
+    key(&mut app, KeyCode::Enter);
+
+    // Split to #2 (+ New shell, cursor at row 26), then step Up onto row 25 (idx 25 >= 24).
+    key(&mut app, KeyCode::Char('h'));
+    key(&mut app, KeyCode::Up);
+
+    let screen = render_app(&mut app, 120, 32).backend().to_string();
+    assert!(
+        screen.contains("__LAZY_25_DONE__"),
+        "expected lazy capture for window beyond index 24:\n{screen}"
+    );
 }

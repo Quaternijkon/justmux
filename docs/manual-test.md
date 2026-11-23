@@ -26,10 +26,11 @@ socket, a 100x30 xterm PTY, deadline based reads, and cleanup on every path.
    is unchanged. Run `/exit` in a pane or in the popup and confirm it detaches
    only your client. Reattach to verify the original pane is still running.
 6. Resize a narrow popup and test `/list`, `/rename`, `/kill`, `/window`,
-   `/pane`, and `/split`. Confirm `/split` previews side-by-side and stacked
-   pane wireframes, `/list` and `/resume` show live captured terminal previews
-   on wide screens, and `/kill` shows the Codex-style Approval Card defaulting
-   to Cancel.
+   `/pane`, and `/split`. Confirm `/split` (or the Home `Split` tab) opens
+   the interactive 2x2 Visual Split Studio cleanly (see the dedicated checklist
+   below), `/list` and `/resume` show live captured terminal previews on wide
+   screens, and `/kill` shows the Codex-style Approval Card defaulting to
+   Cancel.
 7. Test the zero-learning studio UX, modes, `@` targeting, and themes:
    - On an empty Command & @Jump bar, press `↓` to open the `/` command menu,
      `?` to open `/help`, and `1`–`9` to jump straight to a numbered live
@@ -74,6 +75,37 @@ socket, a 100x30 xterm PTY, deadline based reads, and cleanup on every path.
 Do not run these destructive steps against a user's default server. Replace
 the tmux socket with a unique `-L` name or a temporary `-S` path and clean it
 up after the check.
+
+### 2x2 Visual Split Studio checklist
+
+Pending manual verification on a real terminal and private tmux socket (do not
+mark complete until actually exercised):
+
+- [ ] **Launch paths:** Verify `/split` activates the Home `Split` tab
+  (`[ ◫ Split ]`) and `Enter`/click on a session or window opens the studio, and
+  verify `/split @session:window` opens the studio directly anchored to that
+  target.
+- [ ] **Layout orchestration (max 2x2):** Focus panes via `1`–`4`, `Tab` /
+  `Shift+Tab`, and mouse clicks; split horizontally with `h` (`|`) /
+  `[h] Split H` and vertically with `v` (`-`) / `[v] Split V`; confirm a 5th
+  split is refused cleanly at the 2x2 limit; transpose directions with `t` /
+  `[t] Flip`; remove a pane with `x` / `Del` / `Backspace` / `[x] Remove`;
+  and reset to 1x1 with `r` / `[r] Reset`.
+- [ ] **Window fill & swap:** Move through candidate windows and `+ New shell`
+  with `↑`/`↓` and confirm browsing skips stealing occupied windows from other
+  slots; press `Space` or click an occupied window row and confirm the two
+  slots swap cleanly.
+- [ ] **Live SGR preview scrolling:** Confirm ANSI/SGR output renders inside
+  window-backed canvas panes and scrolls cleanly via `PgUp`/`PgDn`,
+  `Home`/`End`, `Ctrl+U`/`Ctrl+D`, and mouse wheel over individual canvas panes
+  (updating the `↑ +N` badge).
+- [ ] **Cancel safety:** Stage splits and window swaps, press `Esc`, and confirm
+  `tmux list-windows` / `tmux list-panes` on the private socket are unchanged.
+- [ ] **Apply, pane focus, and handoff:** Build a multi-pane layout mixing
+  existing windows and `+ New shell`, select a non-`#1` slot, press `Enter` or
+  click `[Enter] Apply & Enter`, and confirm tmux runs `join-pane` /
+  `split-window`, focuses the pane matching the selected slot, and cleanly
+  disables mouse capture / restores terminal state on tmux handoff.
 
 ## Automated PTY assertions
 
