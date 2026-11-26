@@ -67,26 +67,34 @@ fn text(app: &mut App<'_>, value: &str) {
     }
 }
 
+fn key_mod(app: &mut App<'_>, code: KeyCode, modifiers: KeyModifiers) {
+    app.handle_event(Event::Key(KeyEvent::new(code, modifiers)));
+}
+
 #[test]
 fn session_management_works_through_keyboard_events() {
-    use KeyCode::{Down, Enter, Esc};
+    use KeyCode::{Down, Enter, Tab};
 
     let server = PrivateServer::new();
     let mut app = App::new(&server.client, AppOptions::default());
     text(&mut app, "/new");
     keys(&mut app, &[Enter]);
     text(&mut app, "项目 workspace");
-    keys(&mut app, &[Enter]);
+    keys(&mut app, &[Tab]);
+    key_mod(&mut app, KeyCode::Char('u'), KeyModifiers::CONTROL);
     text(&mut app, env!("CARGO_MANIFEST_DIR"));
-    keys(&mut app, &[Enter]);
+    key_mod(&mut app, KeyCode::Enter, KeyModifiers::ALT);
+    assert!(app.exit().is_none(), "Alt+Enter creates & stays on Home");
     let sessions = server.client.list_sessions().expect("created sessions");
     assert_eq!(sessions.len(), 1);
     let session = &sessions[0];
     assert_eq!(session.name, "项目 workspace");
 
-    // Session actions menu: 0 Resume, 1 Attach read-only, 2 New window,
+    // Open session actions menu via `/list` + Enter + Enter:
+    // 0 Resume, 1 Attach read-only, 2 New window,
     // 3 Rename session, 4 Detach other clients, 5 Save snapshot, 6 Close session.
-    keys(&mut app, &[Esc, Enter, Down, Down, Down, Enter]);
+    text(&mut app, "/list");
+    keys(&mut app, &[Enter, Enter, Down, Down, Down, Enter]);
     text(&mut app, "renamed project");
     keys(&mut app, &[Enter]);
     let renamed = server.client.list_sessions().expect("renamed sessions");
@@ -115,7 +123,7 @@ fn session_management_works_through_keyboard_events() {
 
 #[test]
 fn window_and_pane_management_work_through_keyboard_events() {
-    use KeyCode::{Char, Down, Enter, Esc, Right};
+    use KeyCode::{Char, Down, Enter, Right};
 
     let server = PrivateServer::new();
     let session = server.client.new_session("layout", cwd()).expect("session");
@@ -128,7 +136,8 @@ fn window_and_pane_management_work_through_keyboard_events() {
     // In Unified Home Matrix `/window` mode, `+` opens the New Window form.
     keys(&mut app, &[Char('+')]);
     text(&mut app, "build");
-    keys(&mut app, &[Enter]);
+    key_mod(&mut app, KeyCode::Enter, KeyModifiers::ALT);
+    assert!(app.exit().is_none(), "Alt+Enter creates & stays on Home");
     let windows = server
         .client
         .list_windows(Some(&session.id))
@@ -138,7 +147,6 @@ fn window_and_pane_management_work_through_keyboard_events() {
         .iter()
         .find(|w| w.name == "build")
         .expect("build window");
-    keys(&mut app, &[Esc]);
 
     // Filtering `"build"` in `/rename` mode focuses the window directly (no Tab toggle needed).
     text(&mut app, "/rename");
@@ -229,7 +237,8 @@ fn window_and_pane_management_work_through_keyboard_events() {
     let mut matrix_app = App::new(&server.client, AppOptions::default());
     keys(&mut matrix_app, &[Down, Enter]);
     text(&mut matrix_app, "from-matrix");
-    keys(&mut matrix_app, &[Enter]);
+    key_mod(&mut matrix_app, KeyCode::Enter, KeyModifiers::ALT);
+    assert!(matrix_app.exit().is_none());
     assert!(
         server
             .client
@@ -238,9 +247,10 @@ fn window_and_pane_management_work_through_keyboard_events() {
             .iter()
             .any(|w| w.name == "from-matrix")
     );
-    keys(&mut matrix_app, &[Esc, Right, Enter]);
+    keys(&mut matrix_app, &[Right, Enter]);
     text(&mut matrix_app, "matrix-workspace");
-    keys(&mut matrix_app, &[Enter, Enter]);
+    key_mod(&mut matrix_app, KeyCode::Enter, KeyModifiers::ALT);
+    assert!(matrix_app.exit().is_none());
     assert!(
         server
             .client
@@ -1523,13 +1533,15 @@ fn controller_dual_form_new_window_multipane_preview_cycle_and_search_e2e() {
     );
     keys(&mut app, &[Esc]);
 
-    // 2. DualForm New Window: Tab switches to optional CWD and creates window in custom_dir!
+    // 2. DualForm New Window: Tab switches to optional CWD and Alt+Enter creates window in custom_dir!
     // Focus `+ New window` row under `preview-hub` (`Down`, `Enter`).
     keys(&mut app, &[Down, Enter]);
     text(&mut app, "custom-cwd-win");
     keys(&mut app, &[Tab]);
+    key_mod(&mut app, KeyCode::Char('u'), KeyModifiers::CONTROL);
     text(&mut app, custom_dir.path().to_str().expect("utf8 path"));
-    keys(&mut app, &[Enter]);
+    key_mod(&mut app, KeyCode::Enter, KeyModifiers::ALT);
+    assert!(app.exit().is_none(), "Alt+Enter creates & stays on Home");
 
     let wins = server
         .client
@@ -1561,13 +1573,13 @@ fn controller_dual_form_new_window_multipane_preview_cycle_and_search_e2e() {
             .new_window(&session.id, Some("bad-cwd"), Some(&missing_dir)),
         Err(TmuxError::DirectoryNotFound(_))
     ));
-    keys(&mut app, &[Esc]);
     // Open DualForm from Home Matrix (`+ New window`) with invalid dir -> stays in form with error.
     let mut bad_app = App::new(&server.client, AppOptions::default());
     // Move down past the 2 existing windows to `+ New window`.
     keys(&mut bad_app, &[Down, Down, Enter]);
     text(&mut bad_app, "bad-cwd-win");
     keys(&mut bad_app, &[Tab]);
+    key_mod(&mut bad_app, KeyCode::Char('u'), KeyModifiers::CONTROL);
     text(&mut bad_app, missing_dir.to_str().expect("utf8 missing"));
     keys(&mut bad_app, &[Enter]);
     assert!(
@@ -2022,7 +2034,7 @@ fn desktop_menubar_dirty_hover_double_click_context_menu_middle_click_and_f2_ren
     ));
     assert!(app.exit().is_none(), "single click must only focus");
 
-    keys(&mut app, &[KeyCode::F(2)]);
+    keys(&mut app, &[KeyCode::F(2), KeyCode::Right]);
     text(&mut app, "-live");
     keys(&mut app, &[KeyCode::Enter]);
     assert!(
@@ -2480,4 +2492,671 @@ fn desktop_expose_mission_control_and_live_pip_interactive_type_through_e2e() {
     keys(&mut app, &[KeyCode::Esc]);
     assert!(!app.is_live_pip_active());
     assert!(app.exit().is_none());
+}
+
+#[test]
+fn dual_form_inherits_target_folder_name_and_syncs_until_manual_edit() {
+    use KeyCode::{BackTab, Down, Enter, Tab};
+    use ratatui::{Terminal, backend::TestBackend};
+
+    let server = PrivateServer::new();
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let alpha_dir = tmp.path().join("alpha-proj");
+    let beta_dir = tmp.path().join("beta.svc");
+    std::fs::create_dir_all(&alpha_dir).expect("alpha dir");
+    std::fs::create_dir_all(&beta_dir).expect("beta dir");
+
+    let hub = server
+        .client
+        .new_session("hub", &alpha_dir)
+        .expect("hub session");
+    let mut app = App::new(&server.client, AppOptions::default());
+    let mut term = Terminal::new(TestBackend::new(124, 32)).expect("term");
+
+    // Open New Window DualForm from Home Matrix (`+ New window`).
+    keys(&mut app, &[Down, Enter]);
+    term.draw(|f| app.render(f)).expect("draw initial dualform");
+    let init_screen = term.backend().to_string();
+    assert!(init_screen.contains("NEW WINDOW"), "{init_screen}");
+    assert!(init_screen.contains("alpha-proj"), "{init_screen}");
+    assert!(init_screen.contains("auto from folder"), "{init_screen}");
+    assert!(init_screen.contains("exists"), "{init_screen}");
+
+    // Changing Directory dynamically updates unedited Name (`beta.svc` kept verbatim for windows).
+    keys(&mut app, &[Tab]);
+    key_mod(&mut app, KeyCode::Char('u'), KeyModifiers::CONTROL);
+    text(&mut app, beta_dir.to_str().expect("utf8 beta"));
+    term.draw(|f| app.render(f))
+        .expect("draw synced window name");
+    let synced_screen = term.backend().to_string();
+    assert!(synced_screen.contains("beta.svc"), "{synced_screen}");
+
+    key_mod(&mut app, KeyCode::Enter, KeyModifiers::ALT);
+    assert!(app.exit().is_none(), "Alt+Enter stays on Home");
+    let win = server
+        .client
+        .list_windows(Some(&hub.id))
+        .expect("hub windows")
+        .into_iter()
+        .find(|w| w.name == "beta.svc")
+        .expect("window named beta.svc");
+    let win_pane = server.client.list_panes(Some(&win.id)).expect("win pane")[0].clone();
+    assert_eq!(
+        Path::new(&win_pane.current_path)
+            .canonicalize()
+            .expect("canon actual"),
+        beta_dir.canonicalize().expect("canon beta")
+    );
+
+    // New Session DualForm sanitizes dots in folder names (`beta.svc` -> `beta-svc`)
+    // and stops syncing once Name is manually edited.
+    text(&mut app, "/new");
+    keys(&mut app, &[Enter, Tab]);
+    key_mod(&mut app, KeyCode::Char('u'), KeyModifiers::CONTROL);
+    text(&mut app, beta_dir.to_str().expect("utf8 beta"));
+    term.draw(|f| app.render(f))
+        .expect("draw sanitized session");
+    let sess_synced = term.backend().to_string();
+    assert!(sess_synced.contains("beta-svc"), "{sess_synced}");
+
+    // Switch back to Name, replace via replace-on-type, then change Dir to `alpha-proj`:
+    // manual name `custom-sess` must stay intact.
+    keys(&mut app, &[BackTab]);
+    text(&mut app, "custom-sess");
+    keys(&mut app, &[Tab]);
+    key_mod(&mut app, KeyCode::Char('u'), KeyModifiers::CONTROL);
+    text(&mut app, alpha_dir.to_str().expect("utf8 alpha"));
+    term.draw(|f| app.render(f))
+        .expect("draw manual name preserved");
+    let manual_screen = term.backend().to_string();
+    assert!(manual_screen.contains("custom-sess"), "{manual_screen}");
+
+    key_mod(&mut app, KeyCode::Enter, KeyModifiers::ALT);
+    assert!(app.exit().is_none(), "Alt+Enter stays on Home");
+    let sess = server
+        .client
+        .list_sessions()
+        .expect("sessions")
+        .into_iter()
+        .find(|s| s.name == "custom-sess")
+        .expect("custom-sess created");
+    assert_eq!(
+        Path::new(&sess.path)
+            .canonicalize()
+            .expect("canon sess path"),
+        alpha_dir.canonicalize().expect("canon alpha")
+    );
+}
+
+#[test]
+fn dual_form_zsh_style_directory_tab_completion_drill_in_and_esc_restore() {
+    use KeyCode::{Char, Down, Enter, Esc, Tab};
+    use ratatui::{Terminal, backend::TestBackend};
+
+    let server = PrivateServer::new();
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let root = tmp.path().canonicalize().expect("canon root");
+    std::fs::create_dir_all(root.join("app-api/v1")).expect("app-api/v1");
+    std::fs::create_dir_all(root.join("app-web")).expect("app-web");
+    std::fs::create_dir_all(root.join(".hidden-dir")).expect(".hidden-dir");
+    std::fs::write(root.join("app-file.txt"), b"ignore").expect("regular file");
+
+    let sess = server.client.new_session("comp", &root).expect("comp sess");
+    let mut app = App::new(&server.client, AppOptions::default());
+    let mut term = Terminal::new(TestBackend::new(124, 34)).expect("term");
+
+    // Open New Window DualForm, move to Directory, enter partial prefix `<root>/app`, press Tab.
+    keys(&mut app, &[Down, Enter, Tab]);
+    key_mod(&mut app, KeyCode::Char('u'), KeyModifiers::CONTROL);
+    text(&mut app, &format!("{}/app", root.display()));
+    keys(&mut app, &[Tab]);
+
+    term.draw(|f| app.render(f)).expect("draw completion menu");
+    let menu_screen = term.backend().to_string();
+    assert!(menu_screen.contains("app-api/"), "{menu_screen}");
+    assert!(menu_screen.contains("app-web/"), "{menu_screen}");
+    assert!(!menu_screen.contains("app-file.txt"), "{menu_screen}");
+    assert!(!menu_screen.contains(".hidden-dir"), "{menu_screen}");
+
+    // Cycle with Tab -> app-api/, Ctrl+N -> app-web/, Ctrl+P -> app-api/, then Esc restores `<root>/app-`.
+    keys(&mut app, &[Tab]);
+    key_mod(&mut app, Char('n'), KeyModifiers::CONTROL);
+    term.draw(|f| app.render(f)).expect("draw app-web preview");
+    assert!(term.backend().to_string().contains("app-web"));
+    key_mod(&mut app, Char('p'), KeyModifiers::CONTROL);
+    term.draw(|f| app.render(f)).expect("draw app-api preview");
+    assert!(term.backend().to_string().contains("app-api"));
+
+    keys(&mut app, &[Esc]);
+    term.draw(|f| app.render(f))
+        .expect("draw after esc restore");
+    let restored_screen = term.backend().to_string();
+    assert!(
+        restored_screen.contains("NEW WINDOW"),
+        "Esc closes menu, keeps DualForm open: {restored_screen}"
+    );
+    assert!(!restored_screen.contains("app-web/"), "{restored_screen}");
+
+    // Re-open with Tab, select `app-api/`, press `/` to drill into `app-api/` -> shows `v1/`.
+    keys(&mut app, &[Tab, Tab, Char('/')]);
+    term.draw(|f| app.render(f)).expect("draw drilled v1");
+    let drilled_screen = term.backend().to_string();
+    assert!(drilled_screen.contains("v1/"), "{drilled_screen}");
+
+    // 1st Enter accepts `v1/` without submitting; 2nd Enter creates & enters `v1`.
+    keys(&mut app, &[Enter]);
+    assert!(
+        app.exit().is_none(),
+        "Enter on completion menu accepts without submitting"
+    );
+    assert!(
+        !server
+            .client
+            .list_windows(Some(&sess.id))
+            .expect("windows before submit")
+            .iter()
+            .any(|w| w.name == "v1")
+    );
+    keys(&mut app, &[Enter]);
+    assert!(
+        matches!(app.exit(), Some(Exit::Attach(Target::Window(sid, _))) if sid == &sess.id),
+        "2nd Enter creates and enters window, got {:?}",
+        app.exit()
+    );
+    let created = server
+        .client
+        .list_windows(Some(&sess.id))
+        .expect("windows after submit")
+        .into_iter()
+        .find(|w| w.name == "v1")
+        .expect("v1 window");
+    let v1_pane = server
+        .client
+        .list_panes(Some(&created.id))
+        .expect("v1 pane")[0]
+        .clone();
+    assert_eq!(
+        Path::new(&v1_pane.current_path)
+            .canonicalize()
+            .expect("canon v1"),
+        root.join("app-api/v1")
+    );
+
+    // Hidden `.hidden-dir` completion (only when prefix starts with `.`) & Ctrl+W segment rubout.
+    let mut app2 = App::new(&server.client, AppOptions::default());
+    keys(&mut app2, &[Down, Down, Enter, Tab]);
+    key_mod(&mut app2, Char('u'), KeyModifiers::CONTROL);
+    text(&mut app2, &format!("{}/.h", root.display()));
+    keys(&mut app2, &[Tab]);
+    term.draw(|f| app2.render(f)).expect("draw hidden dir");
+    let hidden_screen = term.backend().to_string();
+    assert!(hidden_screen.contains(".hidden-dir"), "{hidden_screen}");
+
+    key_mod(&mut app2, Char('w'), KeyModifiers::CONTROL);
+    text(&mut app2, "app-w");
+    keys(&mut app2, &[Tab]);
+    term.draw(|f| app2.render(f)).expect("draw after ctrl-w");
+    assert!(term.backend().to_string().contains("app-web"));
+}
+
+#[test]
+fn dual_form_enter_creates_and_enters_while_alt_enter_stays_on_home() {
+    use KeyCode::{Down, Enter, Tab};
+
+    let server = PrivateServer::new();
+    let base = server
+        .client
+        .new_session("main", cwd())
+        .expect("base session");
+
+    // Plain Enter creates New Window and attaches immediately.
+    let mut app_win_enter = App::new(&server.client, AppOptions::default());
+    keys(&mut app_win_enter, &[Down, Enter]);
+    text(&mut app_win_enter, "enter-win");
+    keys(&mut app_win_enter, &[Enter]);
+    let enter_win = server
+        .client
+        .list_windows(Some(&base.id))
+        .expect("wins")
+        .into_iter()
+        .find(|w| w.name == "enter-win")
+        .expect("enter-win");
+    assert_eq!(
+        app_win_enter.exit(),
+        Some(&Exit::Attach(Target::Window(base.id.clone(), enter_win.id)))
+    );
+
+    // Plain Enter creates New Session and attaches immediately.
+    let mut app_sess_enter = App::new(&server.client, AppOptions::default());
+    text(&mut app_sess_enter, "/new");
+    keys(&mut app_sess_enter, &[Enter]);
+    text(&mut app_sess_enter, "enter-sess");
+    keys(&mut app_sess_enter, &[Tab]);
+    key_mod(
+        &mut app_sess_enter,
+        KeyCode::Char('u'),
+        KeyModifiers::CONTROL,
+    );
+    text(&mut app_sess_enter, cwd().to_str().expect("utf8 cwd"));
+    keys(&mut app_sess_enter, &[Enter]);
+    let enter_sess = server
+        .client
+        .list_sessions()
+        .expect("sessions")
+        .into_iter()
+        .find(|s| s.name == "enter-sess")
+        .expect("enter-sess");
+    assert_eq!(
+        app_sess_enter.exit(),
+        Some(&Exit::Attach(Target::Session(enter_sess.id)))
+    );
+
+    // Alt+Enter creates New Window, stays on Home with new window selected in Open mode.
+    let stay_server = PrivateServer::new();
+    let stay_base = stay_server
+        .client
+        .new_session("stay-main", cwd())
+        .expect("stay-main session");
+    let mut app_stay = App::new(&stay_server.client, AppOptions::default());
+    keys(&mut app_stay, &[Down, Enter]);
+    text(&mut app_stay, "stay-win");
+    key_mod(&mut app_stay, KeyCode::Enter, KeyModifiers::ALT);
+    assert!(app_stay.exit().is_none(), "Alt+Enter must stay on Home");
+    let stay_win = stay_server
+        .client
+        .list_windows(Some(&stay_base.id))
+        .expect("wins stay")
+        .into_iter()
+        .find(|w| w.name == "stay-win")
+        .expect("stay-win");
+    keys(&mut app_stay, &[Enter]);
+    assert_eq!(
+        app_stay.exit(),
+        Some(&Exit::Attach(Target::Window(
+            stay_base.id.clone(),
+            stay_win.id
+        )))
+    );
+
+    // Alt+Enter creates New Session, stays on Home with new session focused in Open mode.
+    let mut app_sess_stay = App::new(&stay_server.client, AppOptions::default());
+    text(&mut app_sess_stay, "/new");
+    keys(&mut app_sess_stay, &[Enter]);
+    text(&mut app_sess_stay, "stay-sess");
+    keys(&mut app_sess_stay, &[Tab]);
+    key_mod(
+        &mut app_sess_stay,
+        KeyCode::Char('u'),
+        KeyModifiers::CONTROL,
+    );
+    text(&mut app_sess_stay, cwd().to_str().expect("utf8 cwd"));
+    key_mod(&mut app_sess_stay, KeyCode::Enter, KeyModifiers::ALT);
+    assert!(
+        app_sess_stay.exit().is_none(),
+        "Alt+Enter must stay on Home"
+    );
+    let stay_sess = stay_server
+        .client
+        .list_sessions()
+        .expect("sessions stay")
+        .into_iter()
+        .find(|s| s.name == "stay-sess")
+        .expect("stay-sess");
+    keys(&mut app_sess_stay, &[Enter]);
+    assert!(
+        matches!(
+            app_sess_stay.exit(),
+            Some(Exit::Attach(Target::Session(sid) | Target::Window(sid, _))) if sid == &stay_sess.id
+        ),
+        "Home Enter after Alt+Enter /new must enter newly created session, got {:?}",
+        app_sess_stay.exit()
+    );
+}
+
+#[test]
+fn tiered_kill_confirmation_allows_y_for_idle_window_pane_and_requires_yes_for_high_risk() {
+    use KeyCode::{Down, Enter};
+
+    let server = PrivateServer::new();
+    let sess = server.client.new_session("work", cwd()).expect("work");
+    let idle_win = server
+        .client
+        .new_window(&sess.id, Some("idle-win"), Some(cwd()))
+        .expect("idle-win");
+
+    // 1. Idle non-current window accepts `Y ` (case-insensitive trimmed `y`).
+    let mut app = App::new(&server.client, AppOptions::default());
+    text(&mut app, "/kill");
+    keys(&mut app, &[Enter]);
+    text(&mut app, "idle-win");
+    keys(&mut app, &[Enter]);
+    text(&mut app, "Y ");
+    keys(&mut app, &[Enter]);
+    assert!(
+        !server
+            .client
+            .list_windows(Some(&sess.id))
+            .expect("wins after idle kill")
+            .iter()
+            .any(|w| w.id == idle_win.id),
+        "idle window should be killed by 'Y '"
+    );
+
+    // 2. Idle pane in 2-pane window accepts `y`.
+    let win0 = server.client.list_windows(Some(&sess.id)).expect("win0")[0].clone();
+    let p0 = server.client.list_panes(Some(&win0.id)).expect("p0")[0].clone();
+    let idle_p2 = server
+        .client
+        .split_pane(&p0.id, SplitDirection::SideBySide)
+        .expect("idle split");
+    let mut pane_app = App::new(
+        &server.client,
+        AppOptions {
+            initial_command: Some("/pane".into()),
+        },
+    );
+    keys(&mut pane_app, &[Down, Enter]);
+    for _ in 0..16 {
+        keys(&mut pane_app, &[Down]);
+    }
+    keys(&mut pane_app, &[Enter]);
+    text(&mut pane_app, "y");
+    keys(&mut pane_app, &[Enter]);
+    assert_eq!(
+        server
+            .client
+            .list_panes(Some(&win0.id))
+            .expect("panes after idle pane kill")
+            .len(),
+        1,
+        "idle pane {} should be killed by 'y'",
+        idle_p2.id
+    );
+
+    // 3. Busy pane (`sleep 30`) rejects `y` and requires `yes`.
+    let out_busy = server.tmux(&["split-window", "-d", "-t", win0.id.as_str(), "sleep", "30"]);
+    assert!(out_busy.status.success());
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    loop {
+        if server
+            .client
+            .list_panes(Some(&win0.id))
+            .expect("panes")
+            .iter()
+            .any(|p| p.busy)
+        {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "busy pane did not start sleep"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+
+    let mut busy_app = App::new(
+        &server.client,
+        AppOptions {
+            initial_command: Some("/pane".into()),
+        },
+    );
+    keys(&mut busy_app, &[Down, Enter]);
+    for _ in 0..16 {
+        keys(&mut busy_app, &[Down]);
+    }
+    keys(&mut busy_app, &[Enter]);
+    text(&mut busy_app, "y");
+    keys(&mut busy_app, &[Enter]);
+    assert_eq!(
+        server
+            .client
+            .list_panes(Some(&win0.id))
+            .expect("busy pane must survive 'y'")
+            .len(),
+        2
+    );
+    keys(&mut busy_app, &[Enter]);
+    for _ in 0..16 {
+        keys(&mut busy_app, &[Down]);
+    }
+    keys(&mut busy_app, &[Enter]);
+    text(&mut busy_app, "yes");
+    keys(&mut busy_app, &[Enter]);
+    assert_eq!(
+        server
+            .client
+            .list_panes(Some(&win0.id))
+            .expect("busy pane killed by 'yes'")
+            .len(),
+        1
+    );
+
+    // 4. Killing a session rejects `y` and accepts `YES `.
+    let victim = server
+        .client
+        .new_session("victim-sess", cwd())
+        .expect("victim");
+    text(&mut app, "/kill @victim-sess");
+    keys(&mut app, &[Enter]);
+    text(&mut app, "y");
+    keys(&mut app, &[Enter]);
+    assert!(
+        server
+            .client
+            .has_session(&victim.id)
+            .expect("victim survives 'y'")
+    );
+
+    text(&mut app, "/kill @victim-sess");
+    keys(&mut app, &[Enter]);
+    text(&mut app, "YES ");
+    keys(&mut app, &[Enter]);
+    assert!(
+        !server
+            .client
+            .has_session(&victim.id)
+            .expect("victim killed by 'YES '")
+    );
+
+    // 5. `/kill-server` rejects `y` and accepts `yes`.
+    text(&mut app, "/kill-server");
+    keys(&mut app, &[Enter]);
+    text(&mut app, "y");
+    keys(&mut app, &[Enter]);
+    assert!(server.client.server_running().expect("server survives 'y'"));
+
+    text(&mut app, "/kill-server");
+    keys(&mut app, &[Enter]);
+    text(&mut app, "yes");
+    keys(&mut app, &[Enter]);
+    let shutdown_deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    while server
+        .client
+        .server_running()
+        .expect("server killed by 'yes'")
+    {
+        assert!(
+            std::time::Instant::now() < shutdown_deadline,
+            "private tmux server stayed running after confirmed /kill-server"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
+
+#[test]
+fn single_click_matrix_create_cells_and_dual_form_mouse_completion() {
+    use KeyCode::{Esc, Tab};
+    use crossterm::event::{MouseButton, MouseEventKind};
+    use ratatui::{Terminal, backend::TestBackend};
+
+    let server = PrivateServer::new();
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let root = tmp.path().canonicalize().expect("canon root");
+    std::fs::create_dir_all(root.join("dir-one")).expect("dir-one");
+    std::fs::create_dir_all(root.join("dir-two")).expect("dir-two");
+
+    let _sess = server
+        .client
+        .new_session("clicker", &root)
+        .expect("clicker");
+    let mut app = App::new(&server.client, AppOptions::default());
+    let mut term = Terminal::new(TestBackend::new(124, 34)).expect("term");
+
+    term.draw(|f| app.render(f)).expect("initial home draw");
+    let (nw_x, nw_y) = find_rendered_text(&term, "+ New window").expect("+ New window cell");
+    app.handle_event(mouse_ev(
+        MouseEventKind::Down(MouseButton::Left),
+        nw_x,
+        nw_y,
+    ));
+    term.draw(|f| app.render(f))
+        .expect("dualform new window draw");
+    assert!(term.backend().to_string().contains("NEW WINDOW"));
+    keys(&mut app, &[Esc]);
+
+    term.draw(|f| app.render(f)).expect("home redraw");
+    let (ns_x, ns_y) = find_rendered_text(&term, "+ New session").expect("+ New session cell");
+    app.handle_event(mouse_ev(
+        MouseEventKind::Down(MouseButton::Left),
+        ns_x,
+        ns_y,
+    ));
+    term.draw(|f| app.render(f))
+        .expect("dualform new session draw");
+    assert!(term.backend().to_string().contains("NEW SESSION"));
+
+    // Click Working directory field label to focus Dir without Tab.
+    let (dir_x, dir_y) =
+        find_rendered_text(&term, "Working directory").expect("Working directory field");
+    app.handle_event(mouse_ev(
+        MouseEventKind::Down(MouseButton::Left),
+        dir_x,
+        dir_y,
+    ));
+    key_mod(&mut app, KeyCode::Char('u'), KeyModifiers::CONTROL);
+    text(&mut app, &format!("{}/dir", root.display()));
+    keys(&mut app, &[Tab]);
+    term.draw(|f| app.render(f)).expect("draw dir completion");
+    let menu_screen = term.backend().to_string();
+    assert!(menu_screen.contains("dir-one/"), "{menu_screen}");
+    assert!(menu_screen.contains("dir-two/"), "{menu_screen}");
+
+    // Single-click `dir-two/` selects & previews; immediate second click double-clicks into leaf dir & closes menu.
+    let (d2_x, d2_y) = find_rendered_text(&term, "dir-two/").expect("dir-two row");
+    app.handle_event(mouse_ev(
+        MouseEventKind::Down(MouseButton::Left),
+        d2_x,
+        d2_y,
+    ));
+    term.draw(|f| app.render(f))
+        .expect("draw after single click");
+    let preview_screen = term.backend().to_string();
+    assert!(preview_screen.contains("dir-two"), "{preview_screen}");
+    assert!(app.exit().is_none());
+
+    app.handle_event(mouse_ev(
+        MouseEventKind::Down(MouseButton::Left),
+        d2_x,
+        d2_y,
+    ));
+    term.draw(|f| app.render(f))
+        .expect("draw after double click");
+    let accepted_screen = term.backend().to_string();
+    assert!(!accepted_screen.contains("dir-one/"), "{accepted_screen}");
+    assert!(accepted_screen.contains("NEW SESSION"), "{accepted_screen}");
+    assert!(app.exit().is_none());
+}
+
+#[test]
+fn rename_selected_all_terminal_nav_and_composer_new_path_tab_completion() {
+    use KeyCode::{Char, Enter, Esc, Right, Tab};
+    use justmux::ui::ThemePreset;
+    use ratatui::{Terminal, backend::TestBackend};
+
+    let server = PrivateServer::new();
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let root = tmp.path().canonicalize().expect("canon root");
+    std::fs::create_dir_all(root.join("dir-one")).expect("dir-one");
+    std::fs::create_dir_all(root.join("dir-two")).expect("dir-two");
+
+    let sess = server.client.new_session("alpha", &root).expect("alpha");
+    let _ = server.tmux(&["rename-window", "-t", sess.id.as_str(), "main"]);
+    let mut app = App::new(&server.client, AppOptions::default());
+    let mut term = Terminal::new(TestBackend::new(124, 32)).expect("term");
+
+    // 1. `/rename` opens FormAction::Rename selected-all: immediate typing replaces; Right cancels & appends.
+    text(&mut app, "/rename");
+    keys(&mut app, &[Enter]);
+    text(&mut app, "main");
+    keys(&mut app, &[Enter]);
+    text(&mut app, "beta");
+    keys(&mut app, &[Enter]);
+    assert!(
+        server
+            .client
+            .list_windows(Some(&sess.id))
+            .expect("wins after rename 1")
+            .iter()
+            .any(|w| w.name == "beta")
+    );
+
+    text(&mut app, "/rename");
+    keys(&mut app, &[Enter]);
+    text(&mut app, "beta");
+    keys(&mut app, &[Enter, Right]);
+    text(&mut app, "-2");
+    keys(&mut app, &[Enter]);
+    assert!(
+        server
+            .client
+            .list_windows(Some(&sess.id))
+            .expect("wins after rename 2")
+            .iter()
+            .any(|w| w.name == "beta-2")
+    );
+
+    // 2. Terminal navigation: j/k & Ctrl+N/Ctrl+P in ThemePicker, Config (h/l), and Actions.
+    app.set_theme(justmux::ui::Theme::default().with_preset(ThemePreset::AntigravityAurora));
+    text(&mut app, "/theme");
+    keys(&mut app, &[Enter, Char('j')]);
+    assert_eq!(app.theme().preset, ThemePreset::CodexEmerald);
+    keys(&mut app, &[Char('k')]);
+    assert_eq!(app.theme().preset, ThemePreset::AntigravityAurora);
+    key_mod(&mut app, Char('n'), KeyModifiers::CONTROL);
+    assert_eq!(app.theme().preset, ThemePreset::CodexEmerald);
+    key_mod(&mut app, Char('p'), KeyModifiers::CONTROL);
+    assert_eq!(app.theme().preset, ThemePreset::AntigravityAurora);
+    keys(&mut app, &[Esc]);
+
+    let initial_mode = app.config().screen_mode;
+    text(&mut app, "/config");
+    keys(&mut app, &[Enter, Char('l')]);
+    assert_ne!(app.config().screen_mode, initial_mode);
+    keys(&mut app, &[Char('h')]);
+    assert_eq!(app.config().screen_mode, initial_mode);
+    key_mod(&mut app, Char('n'), KeyModifiers::CONTROL);
+    key_mod(&mut app, Char('p'), KeyModifiers::CONTROL);
+    keys(&mut app, &[Char('j'), Char('k'), Esc]);
+
+    text(&mut app, "/list");
+    keys(&mut app, &[Enter, Enter, Char('j'), Char('k')]);
+    key_mod(&mut app, Char('n'), KeyModifiers::CONTROL);
+    key_mod(&mut app, Char('p'), KeyModifiers::CONTROL);
+    keys(&mut app, &[Esc, Esc]);
+
+    // 3. Home composer `/new demo <path>` Tab directory completion.
+    text(&mut app, &format!("/new demo {}/dir", root.display()));
+    keys(&mut app, &[Tab]);
+    term.draw(|f| app.render(f)).expect("draw composer lcp");
+    let lcp_screen = term.backend().to_string();
+    assert!(
+        lcp_screen.contains("/new demo") && lcp_screen.contains("dir-"),
+        "{lcp_screen}"
+    );
+    text(&mut app, "t");
+    keys(&mut app, &[Tab]);
+    term.draw(|f| app.render(f))
+        .expect("draw composer completed");
+    let done_screen = term.backend().to_string();
+    assert!(done_screen.contains("dir-two/"), "{done_screen}");
 }

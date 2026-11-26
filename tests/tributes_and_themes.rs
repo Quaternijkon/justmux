@@ -671,10 +671,33 @@ fn at_mentions_ctrl_p_ctrl_k_and_live_previews_in_picker_resume_and_confirm() {
     let list_screen = render_app(&mut app, 100, 18).backend().to_string();
     assert!(list_screen.contains("PICKER_PREVIEW_OK"), "{list_screen}");
 
-    // Ctrl+P from Picker clears stack and opens `/` command palette.
+    // Ctrl+P from empty Home composer (`/list` returns to Home) opens `/` command palette.
     key_mod(&mut app, KeyCode::Char('p'), KeyModifiers::CONTROL);
     let palette_screen = render_app(&mut app, 80, 16).backend().to_string();
     assert!(palette_screen.contains("/resume"), "{palette_screen}");
+    key(&mut app, KeyCode::Esc);
+
+    // `/pane` Picker keeps Ctrl+N/Ctrl+P for list navigation and Ctrl+K as Emacs kill-to-EOL on Filter.
+    type_text(&mut app, "/pane");
+    key(&mut app, KeyCode::Enter);
+    key_mod(&mut app, KeyCode::Char('n'), KeyModifiers::CONTROL);
+    key_mod(&mut app, KeyCode::Char('p'), KeyModifiers::CONTROL);
+    assert!(
+        render_app(&mut app, 90, 18)
+            .backend()
+            .to_string()
+            .contains("PANES")
+    );
+    type_text(&mut app, "abcd");
+    key(&mut app, KeyCode::Left);
+    key(&mut app, KeyCode::Left);
+    key_mod(&mut app, KeyCode::Char('k'), KeyModifiers::CONTROL);
+    type_text(&mut app, "Z");
+    let pane_after_k = render_app(&mut app, 90, 18).backend().to_string();
+    assert!(
+        pane_after_k.contains("abZ") && pane_after_k.contains("PANES"),
+        "{pane_after_k}"
+    );
     key(&mut app, KeyCode::Esc);
 
     // `/resume` shows Window Preview with captured lines.
@@ -714,13 +737,17 @@ fn at_mentions_ctrl_p_ctrl_k_and_live_previews_in_picker_resume_and_confirm() {
     assert!(composer_screen.contains("abZ"), "{composer_screen}");
     key(&mut app, KeyCode::Esc);
 
-    // Ctrl+P reverts live ThemePicker preview.
+    // Ctrl+P navigates Up inside ThemePicker without stealing focus; Ctrl+K reverts preview and opens `/`.
     app.set_theme(Theme::default().with_preset(ThemePreset::AntigravityAurora));
     type_text(&mut app, "/theme");
     key(&mut app, KeyCode::Enter);
     key(&mut app, KeyCode::Down);
-    assert_eq!(app.theme().preset, ThemePreset::CodexEmerald);
+    key(&mut app, KeyCode::Down);
+    assert_ne!(app.theme().preset, ThemePreset::AntigravityAurora);
+    assert_ne!(app.theme().preset, ThemePreset::CodexEmerald);
     key_mod(&mut app, KeyCode::Char('p'), KeyModifiers::CONTROL);
+    assert_eq!(app.theme().preset, ThemePreset::CodexEmerald);
+    key_mod(&mut app, KeyCode::Char('k'), KeyModifiers::CONTROL);
     assert_eq!(app.theme().preset, ThemePreset::AntigravityAurora);
     key(&mut app, KeyCode::Esc);
 

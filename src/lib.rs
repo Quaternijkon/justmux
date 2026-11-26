@@ -26,6 +26,7 @@ pub mod clipboard;
 pub mod commands;
 pub mod config;
 pub mod fuzzy;
+pub mod path_complete;
 pub mod snapshot;
 pub mod terminal;
 pub mod tmux;

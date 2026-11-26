@@ -470,6 +470,30 @@ impl ResumePicker {
         true
     }
 
+    pub(super) fn select_window(&mut self, session_id: &SessionId, window_id: &WindowId) -> bool {
+        let Some(col_idx) = self.find_visible_session(session_id) else {
+            return false;
+        };
+        let visible_col = &self.visible[col_idx];
+        let Some(column) = self.columns.get(visible_col.index) else {
+            return false;
+        };
+        let Some(row_idx) = visible_col
+            .windows
+            .iter()
+            .position(|win| &column.windows[win.index].id == window_id)
+        else {
+            return false;
+        };
+        if col_idx != self.selected_column {
+            self.first_row = 0;
+        }
+        self.selected_column = col_idx;
+        self.selected_row = row_idx;
+        self.row_focus = RowFocus::Window;
+        true
+    }
+
     pub(super) fn select_visible_cell(&mut self, col: usize, row: Option<usize>) -> bool {
         let Some(visible_col) = self.visible.get(col) else {
             return false;

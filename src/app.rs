@@ -420,8 +420,6 @@ impl Picker {
 
 #[derive(Debug, Clone)]
 enum FormAction {
-    NewSessionName,
-    NewSessionDirectory { name: String },
     Rename(Resource),
     RenamePaneTitle(Pane),
     SendCommandToPane(Pane),
@@ -439,6 +437,7 @@ struct Confirm {
     input: TextInput,
     message: String,
     scroll: u16,
+    require_full_yes: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -482,7 +481,6 @@ enum View {
     Form(Form),
     DualForm(DualForm),
     Confirm(Confirm),
-    Created(Resource),
     Split(SplitStudio),
     LayoutStudio(LayoutStudioState),
     Expose(ExposeState),
@@ -556,25 +554,56 @@ const fn composer_mode_slug(mode: ComposerMode) -> &'static str {
 }
 
 fn quick_launch_default_name() -> String {
-    let base = env::current_dir()
-        .ok()
-        .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
-        .unwrap_or_default();
-    let cleaned: String = base
-        .trim()
-        .chars()
-        .map(|c| match c {
-            '.' | ':' => '-',
-            c if c.is_control() => '-',
-            c => c,
-        })
-        .collect();
-    let trimmed = cleaned.trim();
-    if trimmed.is_empty() {
-        "workspace".to_owned()
-    } else {
-        trimmed.to_owned()
+    match env::current_dir() {
+        Ok(dir) => crate::path_complete::folder_name_from_path(&dir, true),
+        Err(_) => "workspace".to_owned(),
     }
+}
+
+fn composer_new_dir_arg_span(text: &str) -> Option<(usize, &str)> {
+    let trimmed_start_len = text.len() - text.trim_start().len();
+    let rest = text.get(trimmed_start_len..)?;
+    let after_slash = rest.strip_prefix('/')?;
+    let cmd_end_rel = after_slash.find(char::is_whitespace)?;
+    let cmd = &after_slash[..cmd_end_rel];
+    if !cmd.eq_ignore_ascii_case("new") && !cmd.eq_ignore_ascii_case("n") {
+        return None;
+    }
+    let body_start = trimmed_start_len + 1 + cmd_end_rel;
+    let body = &text[body_start..];
+    let first_non_ws = body.find(|c: char| !c.is_whitespace())?;
+    let args_start = body_start + first_non_ws;
+    let args = &text[args_start..];
+    let mut quote: Option<char> = None;
+    let mut escaped = false;
+    let mut second_arg_ws_start = None;
+    for (idx, ch) in args.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if ch == '\\' && quote != Some('\'') {
+            escaped = true;
+            continue;
+        }
+        if let Some(q) = quote {
+            if ch == q {
+                quote = None;
+            }
+        } else if ch == '\'' || ch == '"' {
+            quote = Some(ch);
+        } else if ch.is_whitespace() {
+            second_arg_ws_start = Some(args_start + idx);
+            break;
+        }
+    }
+    let ws_start = second_arg_ws_start?;
+    let after_first = &text[ws_start..];
+    let dir_offset = after_first
+        .find(|c: char| !c.is_whitespace())
+        .unwrap_or(after_first.len());
+    let dir_start = ws_start + dir_offset;
+    Some((dir_start, &text[dir_start..]))
 }
 
 pub struct App<'a> {
@@ -822,7 +851,7 @@ impl<'a> App<'a> {
             && !key.modifiers.contains(KeyModifiers::ALT)
         {
             match key.code {
-                KeyCode::Char('p' | 'P') => {
+                KeyCode::Char('p' | 'P') if self.should_ctrl_p_open_palette() => {
                     self.open_universal_palette();
                     return true;
                 }
@@ -862,6 +891,14 @@ impl<'a> App<'a> {
             {
                 return true;
             }
+        }
+        if key.code == KeyCode::Esc
+            && let Some(View::DualForm(form)) = self.views.0.last_mut()
+            && form.completion.open
+        {
+            form.cancel_completion();
+            self.status.clear();
+            return true;
         }
         if self.handle_preview_search_key(key) {
             return true;
@@ -913,13 +950,6 @@ impl<'a> App<'a> {
             Some(View::Form(form)) => self.form_key(form, key),
             Some(View::DualForm(form)) => self.dual_form_key(form, key),
             Some(View::Confirm(confirm)) => self.confirm_key(confirm, key),
-            Some(View::Created(resource)) => {
-                if key.code == KeyCode::Enter {
-                    self.enter(resource.target());
-                } else {
-                    self.views.push(View::Created(resource));
-                }
-            }
             Some(View::Split(studio)) => self.split_studio_key(studio, key),
             Some(View::LayoutStudio(state)) => self.layout_studio_key(state, key),
             Some(View::Expose(state)) => self.expose_key(state, key),
@@ -934,6 +964,14 @@ impl<'a> App<'a> {
             Some(View::Help) => self.views.push(View::Help),
         }
         true
+    }
+
+    fn should_ctrl_p_open_palette(&self) -> bool {
+        match self.views.top() {
+            None => self.composer.value().is_empty() && !self.preview_search.active,
+            Some(View::Help | View::Tribute { .. }) => true,
+            _ => false,
+        }
     }
 
     fn is_non_text_context(&self) -> bool {
@@ -953,8 +991,7 @@ impl<'a> App<'a> {
                 | View::Expose(..)
                 | View::Clients(..)
                 | View::Buffers(..)
-                | View::Snapshots(..)
-                | View::Created(..),
+                | View::Snapshots(..),
             ) => true,
             Some(
                 View::Picker(_)
@@ -1049,7 +1086,13 @@ impl<'a> App<'a> {
                 self.views.push(View::Form(form));
             }
             Some(View::DualForm(mut form)) => {
+                form.completion.close();
                 form.active_input_mut().insert_str(&text);
+                if form.active_field == 0 {
+                    form.name_manually_edited = !form.first_input.value().trim().is_empty();
+                } else {
+                    form.sync_default_name_from_dir();
+                }
                 self.views.push(View::DualForm(form));
             }
             Some(View::Confirm(mut confirm)) => {
@@ -1210,7 +1253,7 @@ impl<'a> App<'a> {
         let alt = key.modifiers.contains(KeyModifiers::ALT);
         if ctrl && !alt {
             match key.code {
-                KeyCode::Char('b' | 'B') => {
+                KeyCode::Char('b' | 'B') if self.composer.value().is_empty() => {
                     self.easter_step = self.easter_step.wrapping_add(1);
                     self.status = tributes::ctrl_b_quip(self.easter_step).to_owned();
                     return;
@@ -1223,7 +1266,9 @@ impl<'a> App<'a> {
                     return;
                 }
                 KeyCode::Char('f' | 'F')
-                    if self.config.live_preview && self.cached_preview.is_some() =>
+                    if self.composer.value().is_empty()
+                        && self.config.live_preview
+                        && self.cached_preview.is_some() =>
                 {
                     self.open_preview_search();
                     return;
@@ -1272,10 +1317,7 @@ impl<'a> App<'a> {
                     }
                     if self.home_sessions.is_empty() && d == '1' {
                         self.status.clear();
-                        self.views.push(View::Form(Form {
-                            action: FormAction::NewSessionName,
-                            input: TextInput::default(),
-                        }));
+                        self.open_new_session_form(None);
                         return;
                     }
                 }
@@ -1368,12 +1410,11 @@ impl<'a> App<'a> {
                             && key.modifiers.is_empty()));
                 if is_new_window && let Some(session) = self.matrix.selected_session().cloned() {
                     self.status.clear();
-                    self.views
-                        .push(View::DualForm(DualForm::new_window(session.id)));
+                    self.open_new_window_form(session.id);
                     return;
                 }
             }
-            if self.composer_mode == ComposerMode::LiveRadar && !ctrl && !alt {
+            if self.composer_mode == ComposerMode::LiveRadar && !alt {
                 match key.code {
                     KeyCode::Char('f')
                         if key.modifiers.is_empty()
@@ -1398,33 +1439,36 @@ impl<'a> App<'a> {
                         self.step_preview_search_match(true);
                         return;
                     }
-                    KeyCode::Char('N') if self.preview_search.query_str().is_some() => {
+                    KeyCode::Char('N') if !ctrl && self.preview_search.query_str().is_some() => {
                         self.step_preview_search_match(false);
                         return;
                     }
-                    KeyCode::Up => {
+                    KeyCode::Up if !ctrl => {
                         self.radar_selected =
                             wrap_step(self.radar_selected, self.home_sessions.len(), -1);
                         self.refresh_radar_preview();
                         return;
                     }
-                    KeyCode::Down => {
+                    KeyCode::Down if !ctrl => {
                         self.radar_selected =
                             wrap_step(self.radar_selected, self.home_sessions.len(), 1);
                         self.refresh_radar_preview();
                         return;
                     }
-                    KeyCode::Enter => {
+                    KeyCode::Char('n') if ctrl => {
+                        self.radar_selected =
+                            wrap_step(self.radar_selected, self.home_sessions.len(), 1);
+                        self.refresh_radar_preview();
+                        return;
+                    }
+                    KeyCode::Enter if !ctrl => {
                         if let Some(session) = self.home_sessions.get(self.radar_selected) {
                             let id = session.id.clone();
                             self.status.clear();
                             self.enter(Target::Session(id));
                         } else {
                             self.status.clear();
-                            self.views.push(View::Form(Form {
-                                action: FormAction::NewSessionName,
-                                input: TextInput::default(),
-                            }));
+                            self.open_new_session_form(None);
                         }
                         return;
                     }
@@ -1451,14 +1495,39 @@ impl<'a> App<'a> {
                     self.palette_selected = wrap_step(self.palette_selected, palette.len(), -1);
                     return;
                 }
+                KeyCode::Char('p') if ctrl && !alt => {
+                    self.palette_selected = wrap_step(self.palette_selected, palette.len(), -1);
+                    return;
+                }
                 KeyCode::Down => {
+                    self.palette_selected = wrap_step(self.palette_selected, palette.len(), 1);
+                    return;
+                }
+                KeyCode::Char('n') if ctrl && !alt => {
                     self.palette_selected = wrap_step(self.palette_selected, palette.len(), 1);
                     return;
                 }
                 KeyCode::Tab => {
                     if let Some(candidate) = palette.get(self.palette_selected) {
-                        self.composer
-                            .set_value(format!("/{}", candidate.command.name));
+                        let needs_arg = matches!(
+                            candidate.command.kind,
+                            CommandKind::New
+                                | CommandKind::Kill
+                                | CommandKind::Rename
+                                | CommandKind::Split
+                                | CommandKind::Layout
+                                | CommandKind::Window
+                                | CommandKind::Pane
+                                | CommandKind::Resume
+                                | CommandKind::Theme
+                                | CommandKind::Snapshot
+                        );
+                        let value = if needs_arg {
+                            format!("/{} ", candidate.command.name)
+                        } else {
+                            format!("/{}", candidate.command.name)
+                        };
+                        self.composer.set_value(value);
                         self.palette_selected = 0;
                     }
                     return;
@@ -1483,7 +1552,16 @@ impl<'a> App<'a> {
                             wrap_step(self.mention_selected, mentions.len(), -1);
                         return;
                     }
+                    KeyCode::Char('p') if ctrl && !alt => {
+                        self.mention_selected =
+                            wrap_step(self.mention_selected, mentions.len(), -1);
+                        return;
+                    }
                     KeyCode::Down => {
+                        self.mention_selected = wrap_step(self.mention_selected, mentions.len(), 1);
+                        return;
+                    }
+                    KeyCode::Char('n') if ctrl && !alt => {
                         self.mention_selected = wrap_step(self.mention_selected, mentions.len(), 1);
                         return;
                     }
@@ -1518,27 +1596,46 @@ impl<'a> App<'a> {
                 }
             }
         }
+        if key.code == KeyCode::Tab
+            && key.modifiers.is_empty()
+            && self.try_complete_composer_new_path()
+        {
+            return;
+        }
         if self.composer_mode == ComposerMode::CommandJump
             && !self.composer.value().trim_start().starts_with('/')
             && !self.composer.value().trim_start().starts_with('@')
-            && key.modifiers.is_empty()
         {
             match key.code {
-                KeyCode::Up => {
+                KeyCode::Up if key.modifiers.is_empty() => {
                     if self.matrix.move_row(-1) {
                         self.sync_action_scope_with_matrix();
                         self.refresh_home_preview();
                     }
                     return;
                 }
-                KeyCode::Down => {
+                KeyCode::Char('p') if ctrl && !alt => {
+                    if self.matrix.move_row(-1) {
+                        self.sync_action_scope_with_matrix();
+                        self.refresh_home_preview();
+                    }
+                    return;
+                }
+                KeyCode::Down if key.modifiers.is_empty() => {
                     if self.matrix.move_row(1) {
                         self.sync_action_scope_with_matrix();
                         self.refresh_home_preview();
                     }
                     return;
                 }
-                KeyCode::Tab => {
+                KeyCode::Char('n') if ctrl && !alt => {
+                    if self.matrix.move_row(1) {
+                        self.sync_action_scope_with_matrix();
+                        self.refresh_home_preview();
+                    }
+                    return;
+                }
+                KeyCode::Tab if key.modifiers.is_empty() => {
                     self.matrix_action = self
                         .matrix_action
                         .cycle_workspace_tab(self.matrix.is_session_selected());
@@ -1578,6 +1675,48 @@ impl<'a> App<'a> {
         }
     }
 
+    fn try_complete_composer_new_path(&mut self) -> bool {
+        let Some((arg_start, raw_arg)) = composer_new_dir_arg_span(self.composer.value()) else {
+            return false;
+        };
+        if raw_arg.starts_with(['\'', '"']) {
+            return false;
+        }
+        let raw_owned = raw_arg.to_owned();
+        let prefix = String::from(&self.composer.value()[..arg_start]);
+        let res = crate::path_complete::complete_directory(&raw_owned, &self.default_session_dir());
+        if res.entries.is_empty() {
+            let msg = self
+                .theme
+                .tr("No matching directories", "无匹配目录")
+                .to_owned();
+            self.status = msg;
+            return true;
+        }
+        let chosen = if res.entries.len() == 1 {
+            res.entries[0].full_input.clone()
+        } else {
+            let preview_names: Vec<&str> = res
+                .entries
+                .iter()
+                .take(6)
+                .map(|e| e.display.as_str())
+                .collect();
+            let suffix = if res.entries.len() > 6 { " …" } else { "" };
+            self.status = format!("{}  {suffix}", preview_names.join("  "));
+            res.common_prefix
+        };
+        if !chosen.is_empty() {
+            let formatted = if chosen.chars().any(char::is_whitespace) {
+                format!("'{}'", chosen.replace('\'', "'\\''"))
+            } else {
+                chosen
+            };
+            self.composer.set_value(format!("{prefix}{formatted}"));
+        }
+        true
+    }
+
     fn quick_launch_submit(&mut self) {
         let raw = self.composer.value().trim().to_owned();
         let name = if raw.is_empty() {
@@ -1609,8 +1748,9 @@ impl<'a> App<'a> {
     }
 
     fn theme_picker_key(&mut self, initial: ThemePreset, mut selected: usize, key: KeyEvent) {
-        let no_ctrl_alt = !key.modifiers.contains(KeyModifiers::CONTROL)
-            && !key.modifiers.contains(KeyModifiers::ALT);
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let alt = key.modifiers.contains(KeyModifiers::ALT);
+        let no_ctrl_alt = !ctrl && !alt;
         match key.code {
             KeyCode::Up => {
                 selected = wrap_step(selected, ThemePreset::ALL.len(), -1);
@@ -1618,7 +1758,31 @@ impl<'a> App<'a> {
                 self.theme = self.theme.with_preset(preset);
                 self.views.push(View::ThemePicker { initial, selected });
             }
+            KeyCode::Char('p') if ctrl && !alt => {
+                selected = wrap_step(selected, ThemePreset::ALL.len(), -1);
+                let preset = ThemePreset::ALL.get(selected).copied().unwrap_or(initial);
+                self.theme = self.theme.with_preset(preset);
+                self.views.push(View::ThemePicker { initial, selected });
+            }
+            KeyCode::Char('k') if no_ctrl_alt => {
+                selected = wrap_step(selected, ThemePreset::ALL.len(), -1);
+                let preset = ThemePreset::ALL.get(selected).copied().unwrap_or(initial);
+                self.theme = self.theme.with_preset(preset);
+                self.views.push(View::ThemePicker { initial, selected });
+            }
             KeyCode::Down => {
+                selected = wrap_step(selected, ThemePreset::ALL.len(), 1);
+                let preset = ThemePreset::ALL.get(selected).copied().unwrap_or(initial);
+                self.theme = self.theme.with_preset(preset);
+                self.views.push(View::ThemePicker { initial, selected });
+            }
+            KeyCode::Char('n') if ctrl && !alt => {
+                selected = wrap_step(selected, ThemePreset::ALL.len(), 1);
+                let preset = ThemePreset::ALL.get(selected).copied().unwrap_or(initial);
+                self.theme = self.theme.with_preset(preset);
+                self.views.push(View::ThemePicker { initial, selected });
+            }
+            KeyCode::Char('j') if no_ctrl_alt => {
                 selected = wrap_step(selected, ThemePreset::ALL.len(), 1);
                 let preset = ThemePreset::ALL.get(selected).copied().unwrap_or(initial);
                 self.theme = self.theme.with_preset(preset);
@@ -1674,13 +1838,30 @@ impl<'a> App<'a> {
     }
 
     fn config_key(&mut self, mut selected: usize, key: KeyEvent) {
-        let no_ctrl_alt = !key.modifiers.contains(KeyModifiers::CONTROL)
-            && !key.modifiers.contains(KeyModifiers::ALT);
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let alt = key.modifiers.contains(KeyModifiers::ALT);
+        let no_ctrl_alt = !ctrl && !alt;
         match key.code {
             KeyCode::Up => selected = wrap_step(selected, CONFIG_ITEM_COUNT, -1),
+            KeyCode::Char('p') if ctrl && !alt => {
+                selected = wrap_step(selected, CONFIG_ITEM_COUNT, -1)
+            }
+            KeyCode::Char('k') if no_ctrl_alt => {
+                selected = wrap_step(selected, CONFIG_ITEM_COUNT, -1)
+            }
             KeyCode::Down => selected = wrap_step(selected, CONFIG_ITEM_COUNT, 1),
-            KeyCode::Left if no_ctrl_alt => self.cycle_config_setting(selected, false),
-            KeyCode::Right if no_ctrl_alt => self.cycle_config_setting(selected, true),
+            KeyCode::Char('n') if ctrl && !alt => {
+                selected = wrap_step(selected, CONFIG_ITEM_COUNT, 1)
+            }
+            KeyCode::Char('j') if no_ctrl_alt => {
+                selected = wrap_step(selected, CONFIG_ITEM_COUNT, 1)
+            }
+            KeyCode::Left | KeyCode::Char('h') if no_ctrl_alt => {
+                self.cycle_config_setting(selected, false)
+            }
+            KeyCode::Right | KeyCode::Char('l') if no_ctrl_alt => {
+                self.cycle_config_setting(selected, true)
+            }
             KeyCode::Enter => self.cycle_config_setting(selected, true),
             KeyCode::Char(' ') if no_ctrl_alt => self.cycle_config_setting(selected, true),
             KeyCode::Char('s' | 'S') if no_ctrl_alt => {
@@ -2697,7 +2878,15 @@ impl<'a> App<'a> {
                 studio.move_window_cursor(true);
                 self.ensure_selected_split_preview(&mut studio);
             }
+            KeyCode::Char('p') if ctrl && !alt => {
+                studio.move_window_cursor(true);
+                self.ensure_selected_split_preview(&mut studio);
+            }
             KeyCode::Down if !ctrl && !alt => {
+                studio.move_window_cursor(false);
+                self.ensure_selected_split_preview(&mut studio);
+            }
+            KeyCode::Char('n') if ctrl && !alt => {
                 studio.move_window_cursor(false);
                 self.ensure_selected_split_preview(&mut studio);
             }
@@ -3750,17 +3939,13 @@ impl<'a> App<'a> {
                 self.status.clear();
                 self.composer.set_value("");
                 self.sync_home_matrix();
-                self.views.push(View::Form(Form {
-                    action: FormAction::NewSessionName,
-                    input: TextInput::default(),
-                }));
+                self.open_new_session_form(None);
             }
             SelectedMatrixTarget::NewWindow(session) => {
                 self.status.clear();
                 self.composer.set_value("");
                 self.sync_home_matrix();
-                self.views
-                    .push(View::DualForm(DualForm::new_window(session.id)));
+                self.open_new_window_form(session.id);
             }
             SelectedMatrixTarget::Session(session) => match self.matrix_action {
                 MatrixAction::Open => {
@@ -3788,8 +3973,7 @@ impl<'a> App<'a> {
                     self.status.clear();
                     self.composer.set_value("");
                     self.sync_home_matrix();
-                    self.views
-                        .push(View::DualForm(DualForm::new_window(session.id)));
+                    self.open_new_window_form(session.id);
                 }
                 MatrixAction::Inspect => {
                     self.composer.set_value("");
@@ -4027,16 +4211,10 @@ impl<'a> App<'a> {
                     if let Some(path) = parsed.args.get(1) {
                         self.create_session(name, path);
                     } else {
-                        self.views.push(View::Form(Form {
-                            action: FormAction::NewSessionDirectory { name: name.clone() },
-                            input: TextInput::default(),
-                        }));
+                        self.open_new_session_form(Some(name.clone()));
                     }
                 } else {
-                    self.views.push(View::Form(Form {
-                        action: FormAction::NewSessionName,
-                        input: TextInput::default(),
-                    }));
+                    self.open_new_session_form(None);
                 }
             }
             C::Theme => {
@@ -4612,7 +4790,17 @@ impl<'a> App<'a> {
                 picker.selected = wrap_step(picker.selected, len, -1);
                 self.update_picker_preview(&picker);
             }
+            KeyCode::Char('p') if ctrl && !alt => {
+                let len = picker.rows(&mut self.matcher).len();
+                picker.selected = wrap_step(picker.selected, len, -1);
+                self.update_picker_preview(&picker);
+            }
             KeyCode::Down => {
+                let len = picker.rows(&mut self.matcher).len();
+                picker.selected = wrap_step(picker.selected, len, 1);
+                self.update_picker_preview(&picker);
+            }
+            KeyCode::Char('n') if ctrl && !alt => {
                 let len = picker.rows(&mut self.matcher).len();
                 picker.selected = wrap_step(picker.selected, len, 1);
                 self.update_picker_preview(&picker);
@@ -4789,6 +4977,21 @@ impl<'a> App<'a> {
                 selected = wrap_step(selected, CONFIG_ITEM_COUNT, delta);
                 self.views.push(View::Config { selected });
             }
+            Some(View::DualForm(mut form)) => {
+                if form.completion.open && !form.completion.entries.is_empty() {
+                    form.completion.selected = wrap_step(
+                        form.completion.selected,
+                        form.completion.entries.len(),
+                        delta,
+                    );
+                    form.completion.previewing = true;
+                    if let Some(entry) = form.completion.entries.get(form.completion.selected) {
+                        form.second_input.set_value(&entry.full_input);
+                        form.sync_default_name_from_dir();
+                    }
+                }
+                self.views.push(View::DualForm(form));
+            }
             Some(View::Confirm(mut confirm)) => {
                 confirm.scroll = if up {
                     confirm.scroll.saturating_sub(1)
@@ -4811,10 +5014,17 @@ impl<'a> App<'a> {
     }
 
     fn resource_action_key(&mut self, resource: Resource, mut selected: usize, key: KeyEvent) {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let alt = key.modifiers.contains(KeyModifiers::ALT);
+        let no_ctrl_alt = !ctrl && !alt;
         let actions = resource.actions_for(&self.piping_panes, self.theme.language);
         match key.code {
             KeyCode::Up => selected = wrap_step(selected, actions.len(), -1),
+            KeyCode::Char('p') if ctrl && !alt => selected = wrap_step(selected, actions.len(), -1),
+            KeyCode::Char('k') if no_ctrl_alt => selected = wrap_step(selected, actions.len(), -1),
             KeyCode::Down => selected = wrap_step(selected, actions.len(), 1),
+            KeyCode::Char('n') if ctrl && !alt => selected = wrap_step(selected, actions.len(), 1),
+            KeyCode::Char('j') if no_ctrl_alt => selected = wrap_step(selected, actions.len(), 1),
             KeyCode::Enter => {
                 if let Some((_, action)) = actions.get(selected) {
                     let action = *action;
@@ -4828,9 +5038,14 @@ impl<'a> App<'a> {
     }
 
     fn rename_form(&mut self, resource: Resource) {
+        let current = match &resource {
+            Resource::Session(session) => session.name.as_str(),
+            Resource::Window(window) => window.name.as_str(),
+            Resource::Pane(pane) => pane.title.as_str(),
+        };
         self.views.push(View::Form(Form {
+            input: TextInput::new_selected(current),
             action: FormAction::Rename(resource),
-            input: TextInput::default(),
         }));
     }
 
@@ -4854,6 +5069,8 @@ impl<'a> App<'a> {
                 })
                 .unwrap_or(true),
         };
+        let require_full_yes =
+            matches!(&resource, Resource::Session(_)) || current || attached || busy;
         let label = resource.label();
         let zh = self.theme.language.is_zh();
         let mut message = if zh {
@@ -4882,22 +5099,36 @@ impl<'a> App<'a> {
                 " This is in your current session; tmux may close this popup or client."
             });
         }
-        message.push_str(if zh {
-            " 输入 yes 后按 Enter 确认，留空则取消。"
+        message.push_str(if require_full_yes {
+            if zh {
+                " 输入 yes 后按 Enter 确认，留空则取消。"
+            } else {
+                " Type yes, then Enter to confirm. Empty input cancels."
+            }
+        } else if zh {
+            " 输入 y 或 yes 后按 Enter 确认，留空则取消。"
         } else {
-            " Type yes, then Enter to confirm. Empty input cancels."
+            " Type y or yes, then Enter to confirm. Empty input cancels."
         });
         self.views.push(View::Confirm(Confirm {
             target: ConfirmTarget::Resource(Box::new(resource)),
             input: TextInput::default(),
             message,
             scroll: 0,
+            require_full_yes,
         }));
     }
 
     fn confirm_key(&mut self, mut confirm: Confirm, key: KeyEvent) {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let alt = key.modifiers.contains(KeyModifiers::ALT);
         match key.code {
             KeyCode::Up | KeyCode::PageUp => {
+                confirm.scroll = confirm.scroll.saturating_sub(1);
+                self.views.push(View::Confirm(confirm));
+                return;
+            }
+            KeyCode::Char('p') if ctrl && !alt => {
                 confirm.scroll = confirm.scroll.saturating_sub(1);
                 self.views.push(View::Confirm(confirm));
                 return;
@@ -4907,10 +5138,17 @@ impl<'a> App<'a> {
                 self.views.push(View::Confirm(confirm));
                 return;
             }
+            KeyCode::Char('n') if ctrl && !alt => {
+                confirm.scroll = confirm.scroll.saturating_add(1);
+                self.views.push(View::Confirm(confirm));
+                return;
+            }
             _ => {}
         }
         if key.code == KeyCode::Enter {
-            if confirm.input.value() != "yes" {
+            let answer = confirm.input.value().trim().to_ascii_lowercase();
+            let confirmed = answer == "yes" || (!confirm.require_full_yes && answer == "y");
+            if !confirmed {
                 self.status = self
                     .theme
                     .tr("Cancelled. Nothing was killed.", "已取消，未关闭任何目标。")
@@ -4962,25 +5200,6 @@ impl<'a> App<'a> {
         }
         let value = form.input.value().to_owned();
         match &form.action {
-            FormAction::NewSessionName => {
-                if let Err(error) = crate::tmux::validate_session_name(&value) {
-                    self.status = error.to_string();
-                    self.views.push(View::Form(form));
-                    return;
-                }
-                // Keep the name form beneath the directory form so Esc goes back.
-                self.views.push(View::Form(form.clone()));
-                self.views.push(View::Form(Form {
-                    action: FormAction::NewSessionDirectory { name: value },
-                    input: TextInput::default(),
-                }));
-            }
-            FormAction::NewSessionDirectory { name } => {
-                let name = name.clone();
-                if !self.create_session(&name, &value) {
-                    self.views.push(View::Form(form));
-                }
-            }
             FormAction::Rename(resource) => {
                 let renamed_current = matches!(
                     &resource,
@@ -5110,31 +5329,44 @@ impl<'a> App<'a> {
     }
 
     fn create_session(&mut self, name: &str, directory: &str) -> bool {
-        let path = if directory.is_empty() {
-            std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+        let base = self.default_session_dir();
+        let path = if directory.trim().is_empty() {
+            base
         } else {
-            PathBuf::from(directory)
+            crate::path_complete::resolve_dir_path(directory, &base)
         };
-        match self.tmux.new_session(name, &path) {
+        self.create_session_at(name, &path, true)
+    }
+
+    pub(super) fn create_session_at(
+        &mut self,
+        name: &str,
+        path: &std::path::Path,
+        enter_after: bool,
+    ) -> bool {
+        match self.tmux.new_session(name, path) {
             Ok(session) => {
                 self.views = ViewStack::default();
-                self.matrix_action = MatrixAction::Inspect;
+                self.matrix_action = MatrixAction::Open;
                 self.composer.set_value("");
                 self.refresh_home_data();
                 self.matrix.select_session(&session.id);
                 self.refresh_home_preview();
-                self.status = self
-                    .theme
-                    .tr(
-                        "Session created. Enter to enter it, or Esc to keep managing.",
-                        "会话已创建 · 按 Enter 立即进入，或 Esc 继续管理。",
-                    )
-                    .into();
-                self.views.push(View::Created(Resource::Session(session)));
+                let msg = if self.theme.language.is_zh() {
+                    format!("✦ 已创建会话 {}", session.name)
+                } else {
+                    format!("✦ Created session {}", session.name)
+                };
+                if enter_after {
+                    self.status = msg;
+                    self.enter(Target::Session(session.id));
+                } else {
+                    self.push_toast(ToastKind::Success, msg);
+                }
                 true
             }
             Err(error) => {
-                self.status = error.to_string();
+                self.push_toast(ToastKind::Error, error.to_string());
                 false
             }
         }
@@ -5715,17 +5947,6 @@ impl<'a> App<'a> {
             Some(View::Form(form)) => {
                 let dynamic_label;
                 let (title, label) = match &form.action {
-                    FormAction::NewSessionName => (
-                        self.theme.tr("New session", "新建会话"),
-                        self.theme.tr("Session name", "会话名称"),
-                    ),
-                    FormAction::NewSessionDirectory { .. } => (
-                        self.theme.tr("New session", "新建会话"),
-                        self.theme.tr(
-                            "Working directory (empty = current directory)",
-                            "工作目录（留空则使用当前目录）",
-                        ),
-                    ),
                     FormAction::Rename(resource) => {
                         dynamic_label = if self.theme.language.is_zh() {
                             format!("将 {} 重命名为", resource.label())
@@ -5789,13 +6010,26 @@ impl<'a> App<'a> {
                 let (title, first_label, second_label) = match &form.action {
                     controller::DualFormAction::NewWindow(_) => (
                         self.theme.tr("New window", "新建窗口"),
-                        self.theme.tr("Window name (optional)", "窗口名称（可选）"),
-                        self.theme.tr(
-                            "Working directory (optional, Tab to edit)",
-                            "工作目录（可选，按 Tab 切换）",
-                        ),
+                        self.theme.tr("Window name", "窗口名称"),
+                        self.theme.tr("Working directory", "工作目录"),
+                    ),
+                    controller::DualFormAction::NewSession => (
+                        self.theme.tr("New session", "新建会话"),
+                        self.theme.tr("Session name", "会话名称"),
+                        self.theme.tr("Working directory", "工作目录"),
                     ),
                 };
+                let dir_exists = form.resolved_dir().is_dir();
+                let auto_name = !form.name_manually_edited;
+                let completion_items: Vec<ui::PathCompletionItem<'_>> = form
+                    .completion
+                    .entries
+                    .iter()
+                    .map(|e| ui::PathCompletionItem {
+                        display: e.display.as_str(),
+                        is_symlink: e.is_symlink,
+                    })
+                    .collect();
                 draw_subview(
                     frame,
                     subview_area,
@@ -5811,6 +6045,11 @@ impl<'a> App<'a> {
                         second_label,
                         second_input: &form.second_input,
                         active_field: form.active_field,
+                        dir_exists,
+                        auto_name,
+                        completions: &completion_items,
+                        completion_selected: form.completion.selected,
+                        completion_open: form.completion.open,
                     },
                 )
             }
@@ -5832,21 +6071,7 @@ impl<'a> App<'a> {
                         message: &confirm.message,
                         input: &confirm.input,
                         scroll: confirm.scroll,
-                    },
-                )
-            }
-            Some(View::Created(resource)) => {
-                let target_label = resource.label();
-                draw_subview(
-                    frame,
-                    subview_area,
-                    details,
-                    telemetry,
-                    emblem,
-                    menubar,
-                    self.theme,
-                    SubviewContent::Created {
-                        target_label: &target_label,
+                        require_full_yes: confirm.require_full_yes,
                     },
                 )
             }
@@ -6150,6 +6375,24 @@ impl<'a> App<'a> {
         if let Some(View::Confirm(confirm)) = self.views.0.last_mut() {
             confirm.scroll = sub_layout.confirm_scroll;
         }
+        if let Some(View::DualForm(form)) = self.views.0.last_mut() {
+            form.field_hits = sub_layout.dual_form_field_hits;
+            form.completion_list_rect = sub_layout.list_rect;
+            form.completion_offset = if form.completion.open
+                && !form.completion.entries.is_empty()
+                && let Some(list_area) = sub_layout.list_rect
+                && list_area.height > 0
+            {
+                let visible = usize::from(list_area.height);
+                let clamped = form
+                    .completion
+                    .selected
+                    .min(form.completion.entries.len() - 1);
+                (clamped + 1).saturating_sub(visible)
+            } else {
+                0
+            };
+        }
         if let Some(View::Split(studio)) = self.views.0.last_mut() {
             studio.slot_hits = sub_layout.split_slot_hits;
             studio.toolbar_hits = sub_layout
@@ -6245,6 +6488,7 @@ mod tests {
             input: TextInput::default(),
             message: "An irreversible action".into(),
             scroll: 0,
+            require_full_yes: true,
         }));
         for code in [
             KeyCode::Char('y'),
@@ -6279,6 +6523,7 @@ mod tests {
             input: TextInput::default(),
             message: "An irreversible action".into(),
             scroll: 0,
+            require_full_yes: true,
         }));
         app.handle_event(Event::Key(KeyEvent::new(
             KeyCode::Enter,
@@ -6418,21 +6663,24 @@ mod tests {
         term.draw(|f| app.render(f)).expect("draw split studio");
         send_key(&mut app, KeyCode::Esc);
 
-        // 5. DualForm New Window (Tab between Name & Directory, 1-step Enter works).
+        // 5. DualForm New Window (Tab between Name & Directory, Alt+Enter creates & stays).
         app.views
             .push(View::DualForm(DualForm::new_window(sess.id.clone())));
         send_str(&mut app, "dual-win");
         send_key(&mut app, KeyCode::Tab);
+        app.handle_event(Event::Key(KeyEvent::new(
+            KeyCode::Char('u'),
+            KeyModifiers::CONTROL,
+        )));
         send_str(&mut app, &cwd.display().to_string());
         term.draw(|f| app.render(f)).expect("draw dual form");
-        send_key(&mut app, KeyCode::Enter);
+        app.handle_event(Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT)));
         assert!(
             tmux.list_windows(Some(&sess.id))
                 .expect("windows after dual form")
                 .iter()
                 .any(|w| w.name == "dual-win")
         );
-        send_key(&mut app, KeyCode::Esc);
 
         // 6. /config comfort toggles sync isolated tempdir tmux.conf & live tmux.
         send_str(&mut app, "/config");
@@ -6727,6 +6975,7 @@ mod tests {
             input: TextInput::default(),
             message: "msg".into(),
             scroll: 0,
+            require_full_yes: true,
         }));
         app.mouse_scroll(0, 0, true);
         assert!(matches!(

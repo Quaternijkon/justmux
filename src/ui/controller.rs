@@ -11,9 +11,9 @@ use ratatui::{
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use super::{
-    ConfigGuideSpec, EmblemMode, Language, PanePreview, RichPickerRow, SashId, TextInput, Theme,
-    WorkspaceSubviewLayout, build_art_box, build_rich_picker_list_items, parse_ansi_preview_line,
-    pill_span, render_dock_zone_overlay, render_horizontal_divider_line,
+    ConfigGuideSpec, EmblemMode, Language, PanePreview, PathCompletionItem, RichPickerRow, SashId,
+    TextInput, Theme, WorkspaceSubviewLayout, build_art_box, build_rich_picker_list_items,
+    parse_ansi_preview_line, pill_span, render_dock_zone_overlay, render_horizontal_divider_line,
     render_hydra_emblem_if_some, render_rich_picker_with_preview, render_sash_divider, single_line,
     split_lower_band_for_hydra, split_subview_bands, status_style, styled_key_hint_line,
     styled_key_hint_spans, truncate_to_width, wrap_description,
@@ -3225,97 +3225,243 @@ pub(super) fn render_subview_dual_form(
     second_label: &str,
     second_input: &TextInput,
     active_field: usize,
+    dir_exists: bool,
+    auto_name: bool,
+    completions: &[PathCompletionItem<'_>],
+    completion_selected: usize,
+    completion_open: bool,
     border_color: Color,
     emblem_step: usize,
     emblem_mode: EmblemMode,
     theme: Theme,
 ) -> WorkspaceSubviewLayout {
     let zh = theme.language.is_zh() && !theme.ascii;
-    let render_fields = |frame: &mut Frame<'_>, area: Rect| {
+    let render_fields = |frame: &mut Frame<'_>, area: Rect| -> [Option<Rect>; 2] {
+        let mut field_hits = [None, None];
+        let spacious = area.height >= 7;
         let mut lines = vec![Line::from(Span::styled(
             theme.adapt(title),
             theme.style(border_color).add_modifier(Modifier::BOLD),
         ))];
-        lines.push(Line::default());
+        if spacious {
+            lines.push(Line::default());
+        }
         for (idx, (lbl, inp)) in [(first_label, first_input), (second_label, second_input)]
             .into_iter()
             .enumerate()
         {
             let active = idx == active_field.min(1);
+            let start_y = area
+                .y
+                .saturating_add(u16::try_from(lines.len()).unwrap_or(u16::MAX));
             let marker = if active { theme.marker() } else { " " };
             let lbl_style = if active {
                 theme.style(theme.accent).add_modifier(Modifier::BOLD)
             } else {
                 theme.style(theme.muted)
             };
-            lines.push(Line::from(Span::styled(
-                truncate_to_width(
-                    &format!("{marker} {}", theme.adapt(lbl)),
-                    usize::from(area.width),
-                ),
+            let lbl_text = format!("{marker} {}", theme.adapt(lbl));
+            let mut lbl_spans = vec![Span::styled(
+                truncate_to_width(&lbl_text, usize::from(area.width)),
                 lbl_style,
-            )));
-            let val_text = if inp.value().is_empty() {
-                theme.adapt(if idx == 0 {
-                    if zh {
-                        "(留空使用默认名)"
-                    } else {
-                        "(optional)"
-                    }
-                } else if zh {
-                    "(留空继承当前工作目录)"
+            )];
+            if idx == 0 && auto_name {
+                let badge = if zh {
+                    "  [自动跟随目录]"
                 } else {
-                    "(empty = inherit current directory)"
-                })
+                    "  [auto from folder]"
+                };
+                if lbl_text.width() + badge.width() <= usize::from(area.width) {
+                    lbl_spans.push(Span::styled(theme.adapt(badge), theme.style(theme.muted)));
+                }
+            } else if idx == 1 {
+                let (badge, color) = if dir_exists {
+                    (
+                        if theme.ascii {
+                            "  [OK]"
+                        } else if zh {
+                            "  ✓ 目录存在"
+                        } else {
+                            "  ✓ exists"
+                        },
+                        theme.success,
+                    )
+                } else {
+                    (
+                        if theme.ascii {
+                            "  [! not found]"
+                        } else if zh {
+                            "  ✕ 目录不存在"
+                        } else {
+                            "  ✕ not found"
+                        },
+                        theme.error,
+                    )
+                };
+                if lbl_text.width() + badge.width() <= usize::from(area.width) {
+                    lbl_spans.push(Span::styled(theme.adapt(badge), theme.style(color)));
+                }
+            }
+            lines.push(Line::from(lbl_spans));
+
+            let empty_hint = if idx == 0 {
+                if zh {
+                    "(留空使用目录名)"
+                } else {
+                    "(empty = folder name)"
+                }
+            } else if zh {
+                "(留空使用默认目录)"
             } else {
-                single_line(inp.value())
+                "(empty = default dir)"
             };
-            let val_style = if inp.value().is_empty() {
-                theme.style(theme.muted)
-            } else if active {
-                theme.style(theme.text).add_modifier(Modifier::BOLD)
+            if active {
+                let val_avail = area.width.saturating_sub(4);
+                let mut val_line = inp.rendered_width(true, theme, val_avail);
+                val_line.spans.insert(0, Span::raw("    "));
+                if inp.value().is_empty() {
+                    let hint = theme.adapt(&format!(" {empty_hint}"));
+                    if val_line.width() + hint.width() <= usize::from(area.width) {
+                        val_line
+                            .spans
+                            .push(Span::styled(hint, theme.style(theme.muted)));
+                    }
+                }
+                lines.push(val_line);
             } else {
-                theme.style(theme.text)
-            };
-            lines.push(Line::from(Span::styled(
-                truncate_to_width(&format!("    {val_text}"), usize::from(area.width)),
-                val_style,
-            )));
-            if idx == 0 && area.height >= 7 {
+                let val_text = if inp.value().is_empty() {
+                    theme.adapt(empty_hint)
+                } else {
+                    single_line(inp.value())
+                };
+                let val_style = if inp.value().is_empty() {
+                    theme.style(theme.muted)
+                } else {
+                    theme.style(theme.text)
+                };
+                lines.push(Line::from(Span::styled(
+                    truncate_to_width(&format!("    {val_text}"), usize::from(area.width)),
+                    val_style,
+                )));
+            }
+            if start_y < area.bottom() && area.width > 0 {
+                let h = area.bottom().saturating_sub(start_y).min(2);
+                if h > 0 {
+                    field_hits[idx] = Some(Rect {
+                        x: area.x,
+                        y: start_y,
+                        width: area.width,
+                        height: h,
+                    });
+                }
+            }
+            if idx == 0 && spacious {
                 lines.push(Line::default());
             }
         }
         frame.render_widget(Paragraph::new(lines), area);
+        field_hits
     };
+
+    if completion_open && !completions.is_empty() && card_inner.height >= 8 {
+        let (upper_band, rule_area, lower_band) = if card_inner.height >= 14 {
+            split_subview_bands(card_inner, 7, false)
+        } else {
+            let [upper, rule, lower] = Layout::vertical([
+                Constraint::Length(5),
+                Constraint::Length(1),
+                Constraint::Min(2),
+            ])
+            .areas(card_inner);
+            (upper, rule, lower)
+        };
+        let dual_form_field_hits = render_fields(frame, upper_band);
+        render_horizontal_divider_line(frame, rule_area, theme);
+        let [header_area, list_area] =
+            Layout::vertical([Constraint::Length(1), Constraint::Min(1)]).areas(lower_band);
+        let head_label = format!(
+            "{} ({})",
+            theme.tr("Directories", "可选目录"),
+            completions.len()
+        );
+        let head_hint = if theme.ascii {
+            " | Tab/Up/Down Pick | / Drill | Enter Accept | Esc Close"
+        } else if zh {
+            " · Tab/↑↓ 选择 · / 钻入 · Enter 确认 · Esc 收起"
+        } else {
+            " · Tab/↑↓ Pick · / Drill · Enter Accept · Esc Close"
+        };
+        let mut head_spans = vec![Span::styled(
+            truncate_to_width(&head_label, usize::from(header_area.width)),
+            theme.style(theme.secondary).add_modifier(Modifier::BOLD),
+        )];
+        let rem = usize::from(header_area.width).saturating_sub(head_label.width());
+        if rem > 4 {
+            head_spans.push(Span::styled(
+                truncate_to_width(head_hint, rem),
+                theme.style(theme.muted),
+            ));
+        }
+        frame.render_widget(Paragraph::new(Line::from(head_spans)), header_area);
+
+        let clamped_selected = completion_selected.min(completions.len().saturating_sub(1));
+        let items: Vec<ListItem<'_>> = completions
+            .iter()
+            .enumerate()
+            .map(|(idx, entry)| {
+                let is_sel = idx == clamped_selected;
+                let style = if is_sel {
+                    theme.selected_style()
+                } else {
+                    theme.style(theme.text)
+                };
+                let marker = if is_sel { theme.marker() } else { " " };
+                let suffix = if entry.is_symlink { "  @" } else { "" };
+                let text = truncate_to_width(
+                    &format!("{marker} {}{suffix}", single_line(entry.display)),
+                    usize::from(list_area.width),
+                );
+                ListItem::new(Line::from(Span::styled(text, style)))
+            })
+            .collect();
+        let mut state = ListState::default();
+        state.select(Some(clamped_selected));
+        frame.render_stateful_widget(List::new(items), list_area, &mut state);
+        return WorkspaceSubviewLayout {
+            list_rect: Some(list_area),
+            dual_form_field_hits,
+            ..WorkspaceSubviewLayout::default()
+        };
+    }
 
     if card_inner.height >= 14 {
         let (upper_band, rule_area, lower_band) = split_subview_bands(card_inner, 7, false);
-        render_fields(frame, upper_band);
+        let dual_form_field_hits = render_fields(frame, upper_band);
         render_horizontal_divider_line(frame, rule_area, theme);
         let (left_band, hydra_box) = split_lower_band_for_hydra(lower_band);
         let tips = Paragraph::new(vec![
             Line::from(Span::styled(
                 theme.adapt(if zh {
-                    "◈ 一步创建与目录设置"
+                    "◈ 终端级名称与目录设置"
                 } else {
-                    "◈ Quick Create & Optional Directory"
+                    "◈ Project Defaults & Path Completion"
                 }),
                 theme.style(theme.secondary).add_modifier(Modifier::BOLD),
             )),
             styled_key_hint_line(
                 if zh {
-                    "直接按 Enter 一步创建 · 按 Tab 在名称与工作目录间切换"
+                    "名称默认使用目录名 (直接打字覆盖) · 目录按 Tab 补全并列出可选项"
                 } else {
-                    "Press Enter right away for 1-step create · Tab switches Name / Directory"
+                    "Name defaults to folder (type to replace) · Tab completes Directory"
                 },
                 theme.style(theme.text),
                 theme,
             ),
             styled_key_hint_line(
                 if zh {
-                    "目录留空时自动继承当前工作目录 · Esc 取消返回"
+                    "Enter 创建并进入 · Alt+Enter 仅创建 · Ctrl+W 退回上一级 · Esc 返回"
                 } else {
-                    "Leave directory empty to inherit current cwd · Esc cancels"
+                    "Enter Create & enter · Alt+Enter Stay · Ctrl+W Up dir · Esc Back"
                 },
                 theme.style(theme.muted),
                 theme,
@@ -3326,12 +3472,16 @@ pub(super) fn render_subview_dual_form(
             render_hydra_emblem_if_some(frame, hydra_box, emblem_step, emblem_mode, theme);
         return WorkspaceSubviewLayout {
             hydra_rendered,
+            dual_form_field_hits,
             ..WorkspaceSubviewLayout::default()
         };
     }
 
-    render_fields(frame, card_inner);
-    WorkspaceSubviewLayout::default()
+    let dual_form_field_hits = render_fields(frame, card_inner);
+    WorkspaceSubviewLayout {
+        dual_form_field_hits,
+        ..WorkspaceSubviewLayout::default()
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3344,18 +3494,39 @@ pub(super) fn render_compact_dual_form(
     second_label: &str,
     second_input: &TextInput,
     active_field: usize,
+    completions: &[PathCompletionItem<'_>],
+    completion_selected: usize,
+    completion_open: bool,
     theme: Theme,
 ) {
     let (lbl, inp) = if active_field == 0 {
-        (first_label, first_input)
+        (first_label.to_owned(), first_input)
+    } else if completion_open && !completions.is_empty() {
+        let clamped = completion_selected.min(completions.len() - 1);
+        (
+            format!(
+                "{second_label} [{}/{} {}]",
+                clamped + 1,
+                completions.len(),
+                completions[clamped].display
+            ),
+            second_input,
+        )
     } else {
-        (second_label, second_input)
+        (second_label.to_owned(), second_input)
     };
-    let footer = theme.tr(
-        "Tab Next field · Enter Submit · Esc Back",
-        "Tab 切栏 · Enter 提交 · Esc 返回",
-    );
-    super::render_form(frame, area, title, lbl, inp, footer, theme);
+    let footer = if completion_open {
+        theme.tr(
+            "Tab Pick · / Drill · Enter Accept · Esc Close",
+            "Tab 选 · / 钻 · Enter 确认 · Esc 收",
+        )
+    } else {
+        theme.tr(
+            "Tab Complete/Next · Enter Submit · Esc Back",
+            "Tab 补全/切栏 · Enter 提交 · Esc 返回",
+        )
+    };
+    super::render_form(frame, area, title, &lbl, inp, footer, theme);
 }
 
 // ---------------------------------------------------------------------------
@@ -4750,6 +4921,11 @@ mod tests {
                 second_label: "Working directory (optional)",
                 second_input: &f2,
                 active_field: 1,
+                dir_exists: false,
+                auto_name: false,
+                completions: &[],
+                completion_selected: 0,
+                completion_open: false,
             },
         );
         let ftext = buffer_logical_text(tf.backend().buffer());

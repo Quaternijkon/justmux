@@ -5,17 +5,22 @@
 use std::{collections::HashSet, env, path::PathBuf};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use ratatui::layout::Rect;
 
 use crate::{
     clipboard,
     fuzzy::FuzzyMatcher,
+    path_complete::{self, PathCompletionEntry},
     snapshot::{self, SnapshotSummary, WorkspaceSnapshot},
     tmux::{
         ClientInfo, Context, LayoutPreset, Pane, PaneId, PasteBuffer, ResizeDirection, SessionId,
         SplitDirection, Target, Window, WindowId,
     },
     tmux_conf::{self, TmuxComfortOptions},
-    ui::{self, ControllerAction, HomeQuickAction, PanePreview, PreviewAction, TextInput, Theme},
+    ui::{
+        self, ControllerAction, HomeQuickAction, PanePreview, PreviewAction, TextInput, Theme,
+        ToastKind,
+    },
 };
 
 use super::{App, Confirm, Exit, Form, FormAction, Resource, ResourceAction, View};
@@ -154,10 +159,38 @@ impl ConfirmTarget {
     }
 }
 
-/// Interactive two-field form state (e.g., New Window name + optional working directory).
+/// Interactive two-field form state (New Window / New Session Name + Working Directory).
 #[derive(Debug, Clone)]
 pub(super) enum DualFormAction {
     NewWindow(SessionId),
+    NewSession,
+}
+
+#[derive(Debug, Clone, Default)]
+pub(super) struct PathCompletionMenu {
+    pub open: bool,
+    pub entries: Vec<PathCompletionEntry>,
+    pub selected: usize,
+    pub original_input: String,
+    pub previewing: bool,
+}
+
+impl PathCompletionMenu {
+    pub fn open_with(&mut self, original_input: String, entries: Vec<PathCompletionEntry>) {
+        self.open = !entries.is_empty();
+        self.entries = entries;
+        self.selected = 0;
+        self.original_input = original_input;
+        self.previewing = false;
+    }
+
+    pub fn close(&mut self) {
+        self.open = false;
+        self.entries.clear();
+        self.selected = 0;
+        self.original_input.clear();
+        self.previewing = false;
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -166,15 +199,59 @@ pub(super) struct DualForm {
     pub first_input: TextInput,
     pub second_input: TextInput,
     pub active_field: usize,
+    pub base_dir: PathBuf,
+    pub name_manually_edited: bool,
+    pub completion: PathCompletionMenu,
+    pub field_hits: [Option<Rect>; 2],
+    pub completion_list_rect: Option<Rect>,
+    pub completion_offset: usize,
 }
 
 impl DualForm {
+    #[cfg(test)]
     pub fn new_window(session_id: SessionId) -> Self {
+        let base_dir = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        Self::new_window_in(session_id, base_dir)
+    }
+
+    pub fn new_window_in(session_id: SessionId, base_dir: PathBuf) -> Self {
+        let default_name = path_complete::folder_name_from_path(&base_dir, false);
+        let short_dir = path_complete::display_short_path(&base_dir);
         Self {
             action: DualFormAction::NewWindow(session_id),
-            first_input: TextInput::default(),
-            second_input: TextInput::default(),
+            first_input: TextInput::new_selected(default_name),
+            second_input: TextInput::new(short_dir),
             active_field: 0,
+            base_dir,
+            name_manually_edited: false,
+            completion: PathCompletionMenu::default(),
+            field_hits: [None, None],
+            completion_list_rect: None,
+            completion_offset: 0,
+        }
+    }
+
+    pub fn new_session_in(base_dir: PathBuf, preset_name: Option<String>) -> Self {
+        let short_dir = path_complete::display_short_path(&base_dir);
+        let (first_input, active_field, name_manually_edited) = match preset_name {
+            Some(name) => (TextInput::new(name), 1, true),
+            None => (
+                TextInput::new_selected(path_complete::folder_name_from_path(&base_dir, true)),
+                0,
+                false,
+            ),
+        };
+        Self {
+            action: DualFormAction::NewSession,
+            first_input,
+            second_input: TextInput::new(short_dir),
+            active_field,
+            base_dir,
+            name_manually_edited,
+            completion: PathCompletionMenu::default(),
+            field_hits: [None, None],
+            completion_list_rect: None,
+            completion_offset: 0,
         }
     }
 
@@ -186,8 +263,26 @@ impl DualForm {
         }
     }
 
-    pub fn toggle_field(&mut self) {
-        self.active_field = if self.active_field == 0 { 1 } else { 0 };
+    pub fn resolved_dir(&self) -> PathBuf {
+        path_complete::resolve_dir_path(self.second_input.value(), &self.base_dir)
+    }
+
+    pub fn sync_default_name_from_dir(&mut self) {
+        if self.name_manually_edited {
+            return;
+        }
+        let resolved = self.resolved_dir();
+        let sanitize = matches!(self.action, DualFormAction::NewSession);
+        let default_name = path_complete::folder_name_from_path(&resolved, sanitize);
+        self.first_input.set_value_selected(default_name);
+    }
+
+    pub fn cancel_completion(&mut self) {
+        if self.completion.previewing {
+            self.second_input.set_value(&self.completion.original_input);
+            self.sync_default_name_from_dir();
+        }
+        self.completion.close();
     }
 }
 
@@ -719,8 +814,7 @@ impl<'a> App<'a> {
             A::AttachReadOnly => self.enter_readonly(resource.target()),
             A::NewWindow => {
                 if let Resource::Session(session) = resource {
-                    self.views
-                        .push(View::DualForm(DualForm::new_window(session.id)));
+                    self.open_new_window_form(session.id);
                 }
             }
             A::Rename => self.rename_form(resource),
@@ -850,10 +944,7 @@ impl<'a> App<'a> {
             }
             A::RenamePaneTitle => {
                 if let Resource::Pane(p) = resource {
-                    let mut input = TextInput::default();
-                    if !p.title.is_empty() {
-                        input.set_value(&p.title);
-                    }
+                    let input = TextInput::new_selected(&p.title);
                     self.views.push(View::Form(Form {
                         action: FormAction::RenamePaneTitle(p),
                         input,
@@ -1676,14 +1767,31 @@ impl<'a> App<'a> {
     }
 
     pub(super) fn snapshots_key(&mut self, mut state: SnapshotsViewState, key: KeyEvent) {
-        let no_ctrl_alt = !key.modifiers.contains(KeyModifiers::CONTROL)
-            && !key.modifiers.contains(KeyModifiers::ALT);
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let alt = key.modifiers.contains(KeyModifiers::ALT);
+        let no_ctrl_alt = !ctrl && !alt;
         match key.code {
             KeyCode::Up => {
                 state.selected = super::wrap_step(state.selected, state.snapshots.len(), -1);
                 self.refresh_selected_snapshot_preview(&mut state);
             }
+            KeyCode::Char('p') if ctrl && !alt => {
+                state.selected = super::wrap_step(state.selected, state.snapshots.len(), -1);
+                self.refresh_selected_snapshot_preview(&mut state);
+            }
+            KeyCode::Char('k') if no_ctrl_alt => {
+                state.selected = super::wrap_step(state.selected, state.snapshots.len(), -1);
+                self.refresh_selected_snapshot_preview(&mut state);
+            }
             KeyCode::Down => {
+                state.selected = super::wrap_step(state.selected, state.snapshots.len(), 1);
+                self.refresh_selected_snapshot_preview(&mut state);
+            }
+            KeyCode::Char('n') if ctrl && !alt => {
+                state.selected = super::wrap_step(state.selected, state.snapshots.len(), 1);
+                self.refresh_selected_snapshot_preview(&mut state);
+            }
+            KeyCode::Char('j') if no_ctrl_alt => {
                 state.selected = super::wrap_step(state.selected, state.snapshots.len(), 1);
                 self.refresh_selected_snapshot_preview(&mut state);
             }
@@ -1746,6 +1854,7 @@ impl<'a> App<'a> {
             input: TextInput::default(),
             message,
             scroll: 0,
+            require_full_yes: true,
         }));
     }
 
@@ -1863,6 +1972,8 @@ impl<'a> App<'a> {
     }
 
     pub(super) fn target_pick_key(&mut self, mut state: TargetPickState, key: KeyEvent) {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let alt = key.modifiers.contains(KeyModifiers::ALT);
         if self.handle_preview_paging_key(key, state.query.value().is_empty()) {
             self.views.push(View::TargetPick(state));
             return;
@@ -1873,7 +1984,17 @@ impl<'a> App<'a> {
                 state.selected = super::wrap_step(state.selected, len, -1);
                 self.update_target_pick_preview(&state);
             }
+            KeyCode::Char('p') if ctrl && !alt => {
+                let len = state.filtered_indices(&mut self.matcher).len();
+                state.selected = super::wrap_step(state.selected, len, -1);
+                self.update_target_pick_preview(&state);
+            }
             KeyCode::Down => {
+                let len = state.filtered_indices(&mut self.matcher).len();
+                state.selected = super::wrap_step(state.selected, len, 1);
+                self.update_target_pick_preview(&state);
+            }
+            KeyCode::Char('n') if ctrl && !alt => {
                 let len = state.filtered_indices(&mut self.matcher).len();
                 state.selected = super::wrap_step(state.selected, len, 1);
                 self.update_target_pick_preview(&state);
@@ -2208,13 +2329,26 @@ impl<'a> App<'a> {
     }
 
     pub(super) fn clients_key(&mut self, mut state: ClientsViewState, key: KeyEvent) {
-        let no_ctrl_alt = !key.modifiers.contains(KeyModifiers::CONTROL)
-            && !key.modifiers.contains(KeyModifiers::ALT);
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let alt = key.modifiers.contains(KeyModifiers::ALT);
+        let no_ctrl_alt = !ctrl && !alt;
         match key.code {
             KeyCode::Up => {
                 state.selected = super::wrap_step(state.selected, state.clients.len(), -1);
             }
+            KeyCode::Char('p') if ctrl && !alt => {
+                state.selected = super::wrap_step(state.selected, state.clients.len(), -1);
+            }
+            KeyCode::Char('k') if no_ctrl_alt => {
+                state.selected = super::wrap_step(state.selected, state.clients.len(), -1);
+            }
             KeyCode::Down => {
+                state.selected = super::wrap_step(state.selected, state.clients.len(), 1);
+            }
+            KeyCode::Char('n') if ctrl && !alt => {
+                state.selected = super::wrap_step(state.selected, state.clients.len(), 1);
+            }
+            KeyCode::Char('j') if no_ctrl_alt => {
                 state.selected = super::wrap_step(state.selected, state.clients.len(), 1);
             }
             KeyCode::Char('d' | 'D' | 'o' | 'O') if no_ctrl_alt => {
@@ -2315,14 +2449,31 @@ impl<'a> App<'a> {
     }
 
     pub(super) fn buffers_key(&mut self, mut state: BuffersViewState, key: KeyEvent) {
-        let no_ctrl_alt = !key.modifiers.contains(KeyModifiers::CONTROL)
-            && !key.modifiers.contains(KeyModifiers::ALT);
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let alt = key.modifiers.contains(KeyModifiers::ALT);
+        let no_ctrl_alt = !ctrl && !alt;
         match key.code {
             KeyCode::Up => {
                 state.selected = super::wrap_step(state.selected, state.buffers.len(), -1);
                 self.refresh_selected_buffer_preview(&mut state);
             }
+            KeyCode::Char('p') if ctrl && !alt => {
+                state.selected = super::wrap_step(state.selected, state.buffers.len(), -1);
+                self.refresh_selected_buffer_preview(&mut state);
+            }
+            KeyCode::Char('k') if no_ctrl_alt => {
+                state.selected = super::wrap_step(state.selected, state.buffers.len(), -1);
+                self.refresh_selected_buffer_preview(&mut state);
+            }
             KeyCode::Down => {
+                state.selected = super::wrap_step(state.selected, state.buffers.len(), 1);
+                self.refresh_selected_buffer_preview(&mut state);
+            }
+            KeyCode::Char('n') if ctrl && !alt => {
+                state.selected = super::wrap_step(state.selected, state.buffers.len(), 1);
+                self.refresh_selected_buffer_preview(&mut state);
+            }
+            KeyCode::Char('j') if no_ctrl_alt => {
                 state.selected = super::wrap_step(state.selected, state.buffers.len(), 1);
                 self.refresh_selected_buffer_preview(&mut state);
             }
@@ -2393,39 +2544,324 @@ impl<'a> App<'a> {
         self.views.push(View::Buffers(state));
     }
 
-    pub(super) fn dual_form_key(&mut self, mut form: DualForm, key: KeyEvent) {
-        match key.code {
-            KeyCode::Tab | KeyCode::BackTab | KeyCode::Up | KeyCode::Down => {
-                form.toggle_field();
-                self.views.push(View::DualForm(form));
+    pub(super) fn default_session_dir(&self) -> PathBuf {
+        if let Context::Inside(inside) = &self.context
+            && let Some(pane_id) = &inside.pane_id
+            && let Some(pane) = self.home_panes.iter().find(|p| &p.id == pane_id)
+        {
+            let p = PathBuf::from(&pane.current_path);
+            if p.is_dir() {
+                return p;
             }
-            KeyCode::Enter => {
-                let name_raw = form.first_input.value().trim().to_owned();
-                let dir_raw = form.second_input.value().trim().to_owned();
-                match &form.action {
-                    DualFormAction::NewWindow(session_id) => {
-                        let name = (!name_raw.is_empty()).then_some(name_raw.as_str());
-                        let cwd_buf = (!dir_raw.is_empty()).then(|| PathBuf::from(&dir_raw));
-                        match self.tmux.new_window(session_id, name, cwd_buf.as_deref()) {
-                            Ok(window) => {
-                                self.views = super::ViewStack::default();
-                                self.matrix_action = ui::MatrixAction::Window;
-                                self.composer.set_value("");
-                                self.refresh_home_data();
-                                self.status = self.theme.tr("Window created", "窗口已创建").into();
-                                self.views.push(View::Created(Resource::Window(window)));
-                            }
-                            Err(error) => {
-                                self.status = error.to_string();
-                                self.views.push(View::DualForm(form));
-                            }
-                        }
+        }
+        env::current_dir()
+            .ok()
+            .filter(|p| p.is_dir())
+            .or_else(env::home_dir)
+            .unwrap_or_else(|| PathBuf::from("."))
+    }
+
+    pub(super) fn default_window_dir(&self, session_id: &SessionId) -> PathBuf {
+        let active_win_id = self
+            .home_windows
+            .iter()
+            .find(|w| &w.session_id == session_id && w.active)
+            .or_else(|| {
+                self.home_windows
+                    .iter()
+                    .find(|w| &w.session_id == session_id)
+            })
+            .map(|w| &w.id);
+        if let Some(wid) = active_win_id
+            && let Some(pane) = self
+                .home_panes
+                .iter()
+                .find(|p| &p.window_id == wid && p.active)
+                .or_else(|| self.home_panes.iter().find(|p| &p.window_id == wid))
+        {
+            let p = PathBuf::from(&pane.current_path);
+            if p.is_dir() {
+                return p;
+            }
+        }
+        if let Some(pane) = self
+            .home_panes
+            .iter()
+            .find(|p| &p.session_id == session_id && p.active)
+            .or_else(|| self.home_panes.iter().find(|p| &p.session_id == session_id))
+        {
+            let p = PathBuf::from(&pane.current_path);
+            if p.is_dir() {
+                return p;
+            }
+        }
+        if let Some(sess) = self.home_sessions.iter().find(|s| &s.id == session_id) {
+            let p = PathBuf::from(&sess.path);
+            if p.is_dir() {
+                return p;
+            }
+        }
+        self.default_session_dir()
+    }
+
+    pub(super) fn open_new_window_form(&mut self, session_id: SessionId) {
+        let base_dir = self.default_window_dir(&session_id);
+        self.views.push(View::DualForm(DualForm::new_window_in(
+            session_id, base_dir,
+        )));
+    }
+
+    pub(super) fn open_new_session_form(&mut self, preset_name: Option<String>) {
+        let base_dir = self.default_session_dir();
+        self.views.push(View::DualForm(DualForm::new_session_in(
+            base_dir,
+            preset_name,
+        )));
+    }
+
+    pub(super) fn drill_into_dual_form_completion(&self, form: &mut DualForm) {
+        if let Some(entry) = form
+            .completion
+            .entries
+            .get(form.completion.selected)
+            .cloned()
+        {
+            let mut next_path = entry.full_input;
+            if !next_path.ends_with('/') {
+                next_path.push('/');
+            }
+            form.second_input.set_value(&next_path);
+            form.sync_default_name_from_dir();
+            let sub = path_complete::complete_directory(&next_path, &form.base_dir);
+            if sub.entries.is_empty() {
+                form.completion.close();
+            } else {
+                form.completion.open_with(next_path, sub.entries);
+            }
+        } else {
+            form.completion.close();
+        }
+    }
+
+    pub(super) fn dual_form_key(&mut self, mut form: DualForm, key: KeyEvent) {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let alt = key.modifiers.contains(KeyModifiers::ALT);
+        if form.active_field == 0 {
+            match key.code {
+                KeyCode::Tab | KeyCode::BackTab => {
+                    form.active_field = 1;
+                }
+                KeyCode::Up | KeyCode::Down if !ctrl && !alt => {
+                    form.active_field = 1;
+                }
+                KeyCode::Char('n' | 'p') if ctrl && !alt => {
+                    form.active_field = 1;
+                }
+                KeyCode::Enter => {
+                    let enter_after = !alt;
+                    self.submit_dual_form(form, enter_after);
+                    return;
+                }
+                _ => {
+                    let before = form.first_input.value().to_owned();
+                    if form.first_input.handle_key(key) && form.first_input.value() != before {
+                        form.name_manually_edited = !form.first_input.value().trim().is_empty();
                     }
                 }
             }
+            self.views.push(View::DualForm(form));
+            return;
+        }
+
+        if form.completion.open {
+            if form.completion.entries.is_empty() {
+                form.completion.close();
+            } else {
+                let len = form.completion.entries.len();
+                let is_next = (!ctrl && !alt && matches!(key.code, KeyCode::Tab | KeyCode::Down))
+                    || (ctrl && !alt && key.code == KeyCode::Char('n'));
+                let is_prev = (!ctrl && !alt && matches!(key.code, KeyCode::BackTab | KeyCode::Up))
+                    || (ctrl && !alt && key.code == KeyCode::Char('p'));
+                if is_next {
+                    if !form.completion.previewing {
+                        form.completion.selected = 0;
+                        form.completion.previewing = true;
+                    } else {
+                        form.completion.selected =
+                            super::wrap_step(form.completion.selected, len, 1);
+                    }
+                    if let Some(entry) = form.completion.entries.get(form.completion.selected) {
+                        form.second_input.set_value(&entry.full_input);
+                        form.sync_default_name_from_dir();
+                    }
+                    self.views.push(View::DualForm(form));
+                    return;
+                }
+                if is_prev {
+                    if !form.completion.previewing {
+                        form.completion.selected = len.saturating_sub(1);
+                        form.completion.previewing = true;
+                    } else {
+                        form.completion.selected =
+                            super::wrap_step(form.completion.selected, len, -1);
+                    }
+                    if let Some(entry) = form.completion.entries.get(form.completion.selected) {
+                        form.second_input.set_value(&entry.full_input);
+                        form.sync_default_name_from_dir();
+                    }
+                    self.views.push(View::DualForm(form));
+                    return;
+                }
+                if !ctrl && !alt && matches!(key.code, KeyCode::Char('/') | KeyCode::Right) {
+                    self.drill_into_dual_form_completion(&mut form);
+                    self.views.push(View::DualForm(form));
+                    return;
+                }
+                if key.code == KeyCode::Enter {
+                    if let Some(entry) = form.completion.entries.get(form.completion.selected) {
+                        form.second_input.set_value(&entry.full_input);
+                        form.sync_default_name_from_dir();
+                    }
+                    form.completion.close();
+                    self.views.push(View::DualForm(form));
+                    return;
+                }
+                form.completion.close();
+            }
+        }
+
+        match key.code {
+            KeyCode::Tab if !ctrl && !alt => {
+                let current = form.second_input.value().to_owned();
+                let result = path_complete::complete_directory(&current, &form.base_dir);
+                if result.entries.is_empty() {
+                    let msg = self
+                        .theme
+                        .tr("No matching directories", "无匹配目录")
+                        .to_owned();
+                    self.push_toast(ToastKind::Info, msg);
+                } else if result.entries.len() == 1 {
+                    form.second_input.set_value(&result.entries[0].full_input);
+                    form.sync_default_name_from_dir();
+                    self.status.clear();
+                } else {
+                    let updated_input = if result.common_prefix.len() > current.len()
+                        || (current == "~" && result.common_prefix.starts_with("~/"))
+                    {
+                        form.second_input.set_value(&result.common_prefix);
+                        form.sync_default_name_from_dir();
+                        result.common_prefix
+                    } else {
+                        current
+                    };
+                    form.completion.open_with(updated_input, result.entries);
+                    self.status.clear();
+                }
+            }
+            KeyCode::BackTab if !ctrl => {
+                form.active_field = 0;
+                if !form.name_manually_edited {
+                    let v = form.first_input.value().to_owned();
+                    form.first_input.set_value_selected(v);
+                }
+            }
+            KeyCode::Up | KeyCode::Down if !ctrl && !alt => {
+                form.active_field = 0;
+                if !form.name_manually_edited {
+                    let v = form.first_input.value().to_owned();
+                    form.first_input.set_value_selected(v);
+                }
+            }
+            KeyCode::Char('p' | 'n') if ctrl && !alt => {
+                form.active_field = 0;
+                if !form.name_manually_edited {
+                    let v = form.first_input.value().to_owned();
+                    form.first_input.set_value_selected(v);
+                }
+            }
+            KeyCode::Enter => {
+                let enter_after = !alt;
+                self.submit_dual_form(form, enter_after);
+                return;
+            }
             _ => {
-                form.active_input_mut().handle_key(key);
-                self.views.push(View::DualForm(form));
+                let before = form.second_input.value().to_owned();
+                if form.second_input.handle_key_path(key) && form.second_input.value() != before {
+                    form.sync_default_name_from_dir();
+                }
+            }
+        }
+        self.views.push(View::DualForm(form));
+    }
+
+    fn submit_dual_form(&mut self, mut form: DualForm, enter_after: bool) {
+        let resolved = form.resolved_dir();
+        if !resolved.is_dir() {
+            let msg = if self.theme.language.is_zh() {
+                format!("工作目录不存在：{}", resolved.display())
+            } else {
+                format!("Working directory does not exist: {}", resolved.display())
+            };
+            self.push_toast(ToastKind::Error, msg);
+            form.active_field = 1;
+            self.views.push(View::DualForm(form));
+            return;
+        }
+        let is_session = matches!(form.action, DualFormAction::NewSession);
+        let raw_name = form.first_input.value().trim().to_owned();
+        let final_name = if raw_name.is_empty() {
+            path_complete::folder_name_from_path(&resolved, is_session)
+        } else {
+            raw_name
+        };
+        match &form.action {
+            DualFormAction::NewSession => {
+                if let Err(error) = crate::tmux::validate_session_name(&final_name) {
+                    self.push_toast(ToastKind::Error, error.to_string());
+                    form.active_field = 0;
+                    self.views.push(View::DualForm(form));
+                    return;
+                }
+                if !self.create_session_at(&final_name, &resolved, enter_after) {
+                    self.views.push(View::DualForm(form));
+                }
+            }
+            DualFormAction::NewWindow(session_id) => {
+                let session_id = session_id.clone();
+                match self
+                    .tmux
+                    .new_window(&session_id, Some(&final_name), Some(&resolved))
+                {
+                    Ok(window) => {
+                        self.views = super::ViewStack::default();
+                        self.matrix_action = ui::MatrixAction::Open;
+                        self.composer.set_value("");
+                        self.refresh_home_data();
+                        self.matrix.select_window(&session_id, &window.id);
+                        self.refresh_home_preview();
+                        let msg = if self.theme.language.is_zh() {
+                            format!(
+                                "✦ 已创建窗口 {}:{} ({})",
+                                window.session_name, window.index, window.name
+                            )
+                        } else {
+                            format!(
+                                "✦ Created window {}:{} ({})",
+                                window.session_name, window.index, window.name
+                            )
+                        };
+                        if enter_after {
+                            self.status = msg;
+                            self.enter(Target::Window(session_id, window.id));
+                        } else {
+                            self.push_toast(ToastKind::Success, msg);
+                        }
+                    }
+                    Err(error) => {
+                        self.push_toast(ToastKind::Error, error.to_string());
+                        self.views.push(View::DualForm(form));
+                    }
+                }
             }
         }
     }

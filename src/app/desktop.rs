@@ -269,6 +269,7 @@ pub(super) enum ClickableItem {
     SplitSlot(usize),
     SplitWindow(usize),
     ExposeTile(usize),
+    DualFormCompletion(usize),
 }
 
 /// Action executed when a floating Context Menu or Top Menubar Dropdown item is chosen.
@@ -1153,8 +1154,9 @@ impl App<'_> {
     }
 
     pub(super) fn expose_key(&mut self, mut state: ExposeState, key: KeyEvent) {
-        let no_ctrl_alt = !key.modifiers.contains(KeyModifiers::CONTROL)
-            && !key.modifiers.contains(KeyModifiers::ALT);
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let alt = key.modifiers.contains(KeyModifiers::ALT);
+        let no_ctrl_alt = !ctrl && !alt;
         let total = state.tiles.len();
         let cols = state.grid_columns() as isize;
         match key.code {
@@ -1162,7 +1164,15 @@ impl App<'_> {
                 state.selected = wrap_step(state.selected, total, -1);
                 state.sync_page_to_selected();
             }
+            KeyCode::Char('h') if no_ctrl_alt => {
+                state.selected = wrap_step(state.selected, total, -1);
+                state.sync_page_to_selected();
+            }
             KeyCode::Right => {
+                state.selected = wrap_step(state.selected, total, 1);
+                state.sync_page_to_selected();
+            }
+            KeyCode::Char('l') if no_ctrl_alt => {
                 state.selected = wrap_step(state.selected, total, 1);
                 state.sync_page_to_selected();
             }
@@ -1170,7 +1180,23 @@ impl App<'_> {
                 state.selected = wrap_step(state.selected, total, -cols);
                 state.sync_page_to_selected();
             }
+            KeyCode::Char('k') if no_ctrl_alt => {
+                state.selected = wrap_step(state.selected, total, -cols);
+                state.sync_page_to_selected();
+            }
+            KeyCode::Char('p') if ctrl && !alt => {
+                state.selected = wrap_step(state.selected, total, -cols);
+                state.sync_page_to_selected();
+            }
             KeyCode::Down => {
+                state.selected = wrap_step(state.selected, total, cols);
+                state.sync_page_to_selected();
+            }
+            KeyCode::Char('j') if no_ctrl_alt => {
+                state.selected = wrap_step(state.selected, total, cols);
+                state.sync_page_to_selected();
+            }
+            KeyCode::Char('n') if ctrl && !alt => {
                 state.selected = wrap_step(state.selected, total, cols);
                 state.sync_page_to_selected();
             }
@@ -1329,7 +1355,7 @@ impl App<'_> {
         let initial = target.current_name().to_owned();
         self.desktop.inline_rename = Some(InlineRenameState {
             target,
-            input: TextInput::new(initial),
+            input: TextInput::new_selected(initial),
             anchor,
         });
     }
@@ -1822,6 +1848,9 @@ impl App<'_> {
         let Some(mut menu) = self.desktop.context_menu.take() else {
             return false;
         };
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let alt = key.modifiers.contains(KeyModifiers::ALT);
+        let no_ctrl_alt = !ctrl && !alt;
         let len = menu.items.len();
         match key.code {
             KeyCode::Esc => true,
@@ -1830,7 +1859,27 @@ impl App<'_> {
                 self.desktop.context_menu = Some(menu);
                 true
             }
+            KeyCode::Char('p') if ctrl && !alt => {
+                menu.selected = wrap_step(menu.selected, len, -1);
+                self.desktop.context_menu = Some(menu);
+                true
+            }
+            KeyCode::Char('k') if no_ctrl_alt => {
+                menu.selected = wrap_step(menu.selected, len, -1);
+                self.desktop.context_menu = Some(menu);
+                true
+            }
             KeyCode::Down => {
+                menu.selected = wrap_step(menu.selected, len, 1);
+                self.desktop.context_menu = Some(menu);
+                true
+            }
+            KeyCode::Char('n') if ctrl && !alt => {
+                menu.selected = wrap_step(menu.selected, len, 1);
+                self.desktop.context_menu = Some(menu);
+                true
+            }
+            KeyCode::Char('j') if no_ctrl_alt => {
                 menu.selected = wrap_step(menu.selected, len, 1);
                 self.desktop.context_menu = Some(menu);
                 true
@@ -3034,6 +3083,46 @@ impl App<'_> {
                 self.views.push(View::ThemePicker { initial, selected });
                 changed
             }
+            Some(View::DualForm(mut form)) => {
+                if form.field_hits[0].is_some_and(|r| r.contains(pt)) {
+                    form.completion.close();
+                    form.active_field = 0;
+                    if !form.name_manually_edited {
+                        let v = form.first_input.value().to_owned();
+                        form.first_input.set_value_selected(v);
+                    }
+                    self.views.push(View::DualForm(form));
+                    return true;
+                }
+                if form.field_hits[1].is_some_and(|r| r.contains(pt)) {
+                    form.active_field = 1;
+                    self.views.push(View::DualForm(form));
+                    return true;
+                }
+                if form.completion.open
+                    && let Some(rect) = form.completion_list_rect
+                    && rect.contains(pt)
+                {
+                    let clicked = form.completion_offset + usize::from(row - rect.y);
+                    if let Some(entry) = form.completion.entries.get(clicked).cloned() {
+                        let dbl = self
+                            .desktop
+                            .record_click(ClickableItem::DualFormCompletion(clicked));
+                        form.active_field = 1;
+                        form.completion.selected = clicked;
+                        form.completion.previewing = true;
+                        form.second_input.set_value(&entry.full_input);
+                        form.sync_default_name_from_dir();
+                        if dbl {
+                            self.drill_into_dual_form_completion(&mut form);
+                        }
+                        self.views.push(View::DualForm(form));
+                        return true;
+                    }
+                }
+                self.views.push(View::DualForm(form));
+                false
+            }
             Some(other) => {
                 self.views.push(other);
                 false
@@ -3106,11 +3195,7 @@ impl App<'_> {
                 self.sync_action_scope_with_matrix();
                 match &hit.target {
                     MatrixHitTarget::NewWindow(_) | MatrixHitTarget::NewSession => {
-                        if dbl {
-                            self.activate_matrix_selection();
-                        } else {
-                            self.refresh_home_preview();
-                        }
+                        self.activate_matrix_selection();
                     }
                     MatrixHitTarget::Session(_) => {
                         if dbl
@@ -4191,11 +4276,17 @@ mod tests {
         assert!(app.handle_event(Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE,))));
         assert!(!app.is_live_pip_active());
 
-        // `F2` inline rename pre-fills current window name and commits on Enter.
+        // `F2` inline rename pre-fills current window name selected-all:
+        // moving cursor right cancels selection and appends `2` -> `shell2`,
+        // while immediate typing replaces the whole text cleanly.
         assert!(app.handle_event(Event::Key(
             KeyEvent::new(KeyCode::F(2), KeyModifiers::NONE,)
         )));
         assert!(app.desktop.inline_rename.is_some());
+        assert!(app.handle_event(Event::Key(KeyEvent::new(
+            KeyCode::Right,
+            KeyModifiers::NONE,
+        ))));
         assert!(app.handle_event(Event::Key(KeyEvent::new(
             KeyCode::Char('2'),
             KeyModifiers::NONE,
@@ -4205,9 +4296,26 @@ mod tests {
             KeyModifiers::NONE,
         ))));
         assert!(app.desktop.inline_rename.is_none());
+
+        assert!(app.handle_event(Event::Key(
+            KeyEvent::new(KeyCode::F(2), KeyModifiers::NONE,)
+        )));
+        for ch in ['a', 'p', 'i'] {
+            assert!(app.handle_event(Event::Key(KeyEvent::new(
+                KeyCode::Char(ch),
+                KeyModifiers::NONE,
+            ))));
+        }
+        assert!(app.handle_event(Event::Key(KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        ))));
         assert_eq!(
             stub.renamed_windows.borrow().as_slice(),
-            &[(WindowId::new("@1").expect("wid"), "shell2".to_owned())]
+            &[
+                (WindowId::new("@1").expect("wid"), "shell2".to_owned()),
+                (WindowId::new("@1").expect("wid"), "api".to_owned()),
+            ]
         );
 
         // `F3` opens Mission Control `/expose` with 250ms poll interval.

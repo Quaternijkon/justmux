@@ -794,6 +794,11 @@ fn controller_target_picker_and_dual_form_render_cleanly_bilingual() {
                         second_label: "工作目录（可选）",
                         second_input: &cwd_in,
                         active_field: 1,
+                        dir_exists: true,
+                        auto_name: false,
+                        completions: &[],
+                        completion_selected: 0,
+                        completion_open: false,
                     },
                     ..WorkspaceSubviewSpec::default()
                 },

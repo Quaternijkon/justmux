@@ -26,12 +26,27 @@ use crate::commands::{CommandKind, MERGED_COMMANDS, registry};
 pub struct TextInput {
     value: String,
     cursor: usize,
+    selected_all: bool,
 }
 impl TextInput {
     pub fn new(v: impl Into<String>) -> Self {
         let value = v.into();
         let cursor = value.graphemes(true).count();
-        Self { value, cursor }
+        Self {
+            value,
+            cursor,
+            selected_all: false,
+        }
+    }
+    pub fn new_selected(v: impl Into<String>) -> Self {
+        let value = v.into();
+        let cursor = value.graphemes(true).count();
+        let selected_all = !value.is_empty();
+        Self {
+            value,
+            cursor,
+            selected_all,
+        }
     }
     pub fn value(&self) -> &str {
         &self.value
@@ -42,12 +57,29 @@ impl TextInput {
     pub fn set_value(&mut self, v: impl Into<String>) {
         self.value = v.into();
         self.cursor = self.value.graphemes(true).count();
+        self.selected_all = false;
+    }
+    pub fn set_value_selected(&mut self, v: impl Into<String>) {
+        self.value = v.into();
+        self.cursor = self.value.graphemes(true).count();
+        self.selected_all = !self.value.is_empty();
     }
     pub fn cursor(&self) -> usize {
         self.cursor
     }
+    pub fn is_selected_all(&self) -> bool {
+        self.selected_all
+    }
+    pub fn clear_selection(&mut self) {
+        self.selected_all = false;
+    }
     /// Insert a single-line paste and leave the cursor on a grapheme boundary.
     pub fn insert_str(&mut self, text: &str) {
+        if self.selected_all {
+            self.value.clear();
+            self.cursor = 0;
+            self.selected_all = false;
+        }
         let clean: String = text.chars().filter(|c| !c.is_control()).collect();
         let byte = self.byte_offset(self.cursor);
         self.value.insert_str(byte, &clean);
@@ -91,6 +123,31 @@ impl TextInput {
         }
         i
     }
+    fn is_path_sep(g: &str) -> bool {
+        g == "/" || g.chars().all(char::is_whitespace)
+    }
+    fn previous_path_word(&self) -> usize {
+        let gs: Vec<&str> = self.value.graphemes(true).collect();
+        let mut i = self.cursor;
+        while i > 0 && Self::is_path_sep(gs[i - 1]) {
+            i -= 1;
+        }
+        while i > 0 && !Self::is_path_sep(gs[i - 1]) {
+            i -= 1;
+        }
+        i
+    }
+    fn next_path_word(&self) -> usize {
+        let gs: Vec<&str> = self.value.graphemes(true).collect();
+        let mut i = self.cursor;
+        while i < gs.len() && !Self::is_path_sep(gs[i]) {
+            i += 1;
+        }
+        while i < gs.len() && Self::is_path_sep(gs[i]) {
+            i += 1;
+        }
+        i
+    }
     pub fn handle_key(&mut self, key: KeyEvent) -> bool {
         if key.kind == KeyEventKind::Release {
             return false;
@@ -98,6 +155,63 @@ impl TextInput {
         let count = self.value.graphemes(true).count();
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         let alt = key.modifiers.contains(KeyModifiers::ALT);
+        if self.selected_all {
+            match key.code {
+                KeyCode::Left | KeyCode::Home if !ctrl && !alt => {
+                    self.selected_all = false;
+                    self.cursor = 0;
+                    return true;
+                }
+                KeyCode::Left | KeyCode::Char('b') if ctrl || alt => {
+                    self.selected_all = false;
+                    self.cursor = 0;
+                    return true;
+                }
+                KeyCode::Char('a') if ctrl && !alt => {
+                    self.selected_all = false;
+                    self.cursor = 0;
+                    return true;
+                }
+                KeyCode::Right | KeyCode::End if !ctrl && !alt => {
+                    self.selected_all = false;
+                    self.cursor = count;
+                    return true;
+                }
+                KeyCode::Right | KeyCode::Char('f') if ctrl || alt => {
+                    self.selected_all = false;
+                    self.cursor = count;
+                    return true;
+                }
+                KeyCode::Char('e') if ctrl && !alt => {
+                    self.selected_all = false;
+                    self.cursor = count;
+                    return true;
+                }
+                KeyCode::Backspace | KeyCode::Delete => {
+                    self.value.clear();
+                    self.cursor = 0;
+                    self.selected_all = false;
+                    return true;
+                }
+                KeyCode::Char('h' | 'd' | 'u' | 'k' | 'w') if ctrl && !alt => {
+                    self.value.clear();
+                    self.cursor = 0;
+                    self.selected_all = false;
+                    return true;
+                }
+                KeyCode::Char('d') if alt && !ctrl => {
+                    self.value.clear();
+                    self.cursor = 0;
+                    self.selected_all = false;
+                    return true;
+                }
+                KeyCode::Char(c) if !ctrl && !alt && !c.is_control() => {
+                    self.insert_str(&c.to_string());
+                    return true;
+                }
+                _ => return false,
+            }
+        }
         if ctrl || alt {
             match key.code {
                 KeyCode::Char('a') if ctrl => self.cursor = 0,
@@ -106,6 +220,14 @@ impl TextInput {
                 KeyCode::Char('k') if ctrl => self.delete_range(self.cursor, count),
                 KeyCode::Char('w') if ctrl => self.delete_range(self.previous_word(), self.cursor),
                 KeyCode::Backspace if alt => self.delete_range(self.previous_word(), self.cursor),
+                KeyCode::Char('h') if ctrl && !alt && self.cursor > 0 => {
+                    self.delete_range(self.cursor - 1, self.cursor)
+                }
+                KeyCode::Char('d') if ctrl && !alt && self.cursor < count => {
+                    self.delete_range(self.cursor, self.cursor + 1)
+                }
+                KeyCode::Char('b') if ctrl && !alt && self.cursor > 0 => self.cursor -= 1,
+                KeyCode::Char('f') if ctrl && !alt && self.cursor < count => self.cursor += 1,
                 KeyCode::Char('b') if alt => self.cursor = self.previous_word(),
                 KeyCode::Left if ctrl || alt => self.cursor = self.previous_word(),
                 KeyCode::Char('f') if alt => self.cursor = self.next_word(),
@@ -130,6 +252,51 @@ impl TextInput {
             _ => return false,
         }
         true
+    }
+    /// Path-aware key handler where word motions/deletions stop at `/` segment boundaries.
+    pub fn handle_key_path(&mut self, key: KeyEvent) -> bool {
+        if key.kind == KeyEventKind::Release {
+            return false;
+        }
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let alt = key.modifiers.contains(KeyModifiers::ALT);
+        if self.selected_all {
+            return self.handle_key(key);
+        }
+        if ctrl || alt {
+            match key.code {
+                KeyCode::Char('w') if ctrl => {
+                    self.delete_range(self.previous_path_word(), self.cursor);
+                    return true;
+                }
+                KeyCode::Backspace if alt => {
+                    self.delete_range(self.previous_path_word(), self.cursor);
+                    return true;
+                }
+                KeyCode::Char('b') if alt => {
+                    self.cursor = self.previous_path_word();
+                    return true;
+                }
+                KeyCode::Left if ctrl || alt => {
+                    self.cursor = self.previous_path_word();
+                    return true;
+                }
+                KeyCode::Char('f') if alt => {
+                    self.cursor = self.next_path_word();
+                    return true;
+                }
+                KeyCode::Right if ctrl || alt => {
+                    self.cursor = self.next_path_word();
+                    return true;
+                }
+                KeyCode::Char('d') if alt => {
+                    self.delete_range(self.cursor, self.next_path_word());
+                    return true;
+                }
+                _ => {}
+            }
+        }
+        self.handle_key(key)
     }
     pub fn rendered(&self, focused: bool, theme: Theme) -> Line<'static> {
         self.rendered_width(focused, theme, u16::MAX)
@@ -163,14 +330,14 @@ impl TextInput {
             if used + cells > width {
                 break;
             }
-            spans.push(if focused && i == self.cursor {
+            spans.push(if focused && (self.selected_all || i == self.cursor) {
                 Span::styled((*g).to_owned(), theme.selected_style())
             } else {
                 Span::raw((*g).to_owned())
             });
             used += cells;
         }
-        if focused && self.cursor == gs.len() && used < width {
+        if focused && !self.selected_all && self.cursor == gs.len() && used < width {
             spans.push(Span::styled(" ", theme.selected_style()));
         }
         Line::from(spans)
@@ -1531,6 +1698,13 @@ fn render_home_drawers(
     }
 }
 
+/// Directory completion entry rendered inside [`SubviewContent::DualForm`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct PathCompletionItem<'a> {
+    pub display: &'a str,
+    pub is_symlink: bool,
+}
+
 /// Result geometry and interaction metadata returned by [`render_workspace_subview`].
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct WorkspaceSubviewLayout {
@@ -1538,6 +1712,7 @@ pub struct WorkspaceSubviewLayout {
     pub preview_area: Option<Rect>,
     pub hydra_rendered: bool,
     pub confirm_scroll: u16,
+    pub dual_form_field_hits: [Option<Rect>; 2],
     pub split_slot_hits: Vec<(Rect, usize)>,
     pub split_toolbar_hits: Vec<(Rect, SplitToolbarButton)>,
     pub preview_action_hits: Vec<(Rect, PreviewAction)>,
@@ -1599,6 +1774,11 @@ pub enum SubviewContent<'a> {
         second_label: &'a str,
         second_input: &'a TextInput,
         active_field: usize,
+        dir_exists: bool,
+        auto_name: bool,
+        completions: &'a [PathCompletionItem<'a>],
+        completion_selected: usize,
+        completion_open: bool,
     },
     Confirm {
         title: &'a str,
@@ -1606,6 +1786,7 @@ pub enum SubviewContent<'a> {
         message: &'a str,
         input: &'a TextInput,
         scroll: u16,
+        require_full_yes: bool,
     },
     Actions {
         title: &'a str,
@@ -1757,18 +1938,42 @@ impl SubviewContent<'_> {
                     "Type value · Enter Submit · Esc Back"
                 }
             }
-            Self::DualForm { .. } => {
-                if zh {
-                    "Tab 切换名称/目录 · Enter 一步创建 · Esc 返回"
+            Self::DualForm {
+                active_field,
+                completion_open,
+                ..
+            } => {
+                if *completion_open {
+                    if zh {
+                        "Tab/↑↓ 选候选 · / 钻入 · Enter 确认 · Esc 收起"
+                    } else {
+                        "Tab/↑↓ Pick · / Drill in · Enter Accept · Esc Close"
+                    }
+                } else if *active_field == 1 {
+                    if zh {
+                        "Tab 补全路径 · ↑↓ 切栏 · Enter 创建并进入 · Alt+Enter 仅创建 · Esc 返回"
+                    } else {
+                        "Tab Complete path · ↑↓ Switch · Enter Create & Enter · Alt+Enter Stay · Esc Back"
+                    }
+                } else if zh {
+                    "Tab/↓ 目录 · Enter 创建并进入 · Alt+Enter 仅创建 · Esc 返回"
                 } else {
-                    "Tab Switch Name/Directory · Enter Submit · Esc Back"
+                    "Tab/↓ Directory · Enter Create & Enter · Alt+Enter Stay · Esc Back"
                 }
             }
-            Self::Confirm { .. } => {
-                if zh {
-                    "↑↓ 滚动详情 · 输入 yes 后按 Enter 关闭 · Esc 返回"
+            Self::Confirm {
+                require_full_yes, ..
+            } => {
+                if *require_full_yes {
+                    if zh {
+                        "↑↓ 滚动详情 · 输入 yes 后按 Enter 关闭 · Esc 返回"
+                    } else {
+                        "↑↓ Review · Type yes + Enter to kill · Esc Back"
+                    }
+                } else if zh {
+                    "↑↓ 滚动详情 · 输入 y 或 yes 后按 Enter 关闭 · Esc 返回"
                 } else {
-                    "↑↓ Review · Type yes + Enter to kill · Esc Back"
+                    "↑↓ Review · Type y or yes + Enter to kill · Esc Back"
                 }
             }
             Self::Actions { .. } => {
@@ -1938,6 +2143,10 @@ fn render_compact_subview_fallback(
             second_label,
             second_input,
             active_field,
+            completions,
+            completion_selected,
+            completion_open,
+            ..
         } => render_compact_dual_form(
             frame,
             area,
@@ -1947,6 +2156,9 @@ fn render_compact_subview_fallback(
             second_label,
             second_input,
             *active_field,
+            completions,
+            *completion_selected,
+            *completion_open,
             theme,
         ),
         SubviewContent::Confirm {
@@ -1955,6 +2167,7 @@ fn render_compact_subview_fallback(
             message,
             input,
             scroll,
+            ..
         } => {
             layout.confirm_scroll = render_confirm_card(
                 frame,
@@ -2164,6 +2377,11 @@ fn render_subview_card_body(
             second_label,
             second_input,
             active_field,
+            dir_exists,
+            auto_name,
+            completions,
+            completion_selected,
+            completion_open,
         } => render_subview_dual_form(
             frame,
             card_inner,
@@ -2173,6 +2391,11 @@ fn render_subview_card_body(
             second_label,
             second_input,
             *active_field,
+            *dir_exists,
+            *auto_name,
+            completions,
+            *completion_selected,
+            *completion_open,
             border_color,
             spec.emblem_step,
             spec.emblem_mode,
@@ -2183,6 +2406,7 @@ fn render_subview_card_body(
             target_summary,
             message,
             scroll,
+            require_full_yes,
             ..
         } => render_subview_confirm(
             frame,
@@ -2190,6 +2414,7 @@ fn render_subview_card_body(
             target_summary,
             message,
             *scroll,
+            *require_full_yes,
             spec.emblem_step,
             spec.emblem_mode,
             theme,
@@ -6980,16 +7205,12 @@ fn render_subview_form(
             lines.push(Line::from(Span::styled(wrapped, theme.style(theme.text))));
         }
         if usize::from(area.height) > lines.len() {
-            lines.push(Line::from(vec![
+            let mut input_line = input.rendered_width(true, theme, area.width.saturating_sub(2));
+            input_line.spans.insert(
+                0,
                 Span::styled(format!("{} ", theme.marker()), theme.style(border_color)),
-                Span::styled(
-                    truncate_to_width(
-                        &single_line(input.value()),
-                        usize::from(area.width).saturating_sub(2),
-                    ),
-                    theme.style(theme.accent).add_modifier(Modifier::BOLD),
-                ),
-            ]));
+            );
+            lines.push(input_line);
         }
         frame.render_widget(Paragraph::new(lines), area);
     };
@@ -7047,6 +7268,7 @@ fn render_subview_confirm(
     target_summary: &str,
     message: &str,
     scroll: u16,
+    require_full_yes: bool,
     emblem_step: usize,
     emblem_mode: EmblemMode,
     theme: Theme,
@@ -7127,10 +7349,16 @@ fn render_subview_confirm(
                     theme.style(theme.error).add_modifier(Modifier::BOLD),
                 )),
                 styled_key_hint_line(
-                    if zh {
-                        "请在下方确认栏输入 yes 后按 Enter 执行"
+                    if require_full_yes {
+                        if zh {
+                            "请在下方确认栏输入 yes 后按 Enter 执行"
+                        } else {
+                            "Type yes in the confirmation prompt below and press Enter"
+                        }
+                    } else if zh {
+                        "请在下方确认栏输入 y 或 yes 后按 Enter 执行"
                     } else {
-                        "Type yes in the confirmation prompt below and press Enter"
+                        "Type y or yes in the confirmation prompt below and press Enter"
                     },
                     theme.style(theme.text),
                     theme,
@@ -7584,6 +7812,8 @@ fn render_subview_bottom_composer(
             second_label,
             second_input,
             active_field,
+            completion_open,
+            ..
         } => {
             let (field_label, active_input) = if *active_field == 0 {
                 (*first_label, *first_input)
@@ -7596,12 +7826,28 @@ fn render_subview_bottom_composer(
                 theme.adapt(title),
                 theme.adapt(field_label)
             );
-            let form_right = (composer.width >= 56).then_some(if theme.ascii {
-                " Tab Next | Enter Submit | Esc Back "
+            let form_right = (composer.width >= 56).then_some(if *completion_open {
+                if theme.ascii {
+                    " Tab/Up/Down Pick | / Drill | Enter Accept | Esc Close "
+                } else if zh {
+                    " Tab/↑↓ 选择 · / 钻入 · Enter 确认 · Esc 收起 "
+                } else {
+                    " Tab/↑↓ Pick · / Drill · Enter Accept · Esc Close "
+                }
+            } else if *active_field == 1 {
+                if theme.ascii {
+                    " Tab Complete | Enter Create | Alt+Enter Stay | Esc Back "
+                } else if zh {
+                    " Tab 补全 · Enter 创建并进入 · Alt+Enter 仅创建 · Esc 返回 "
+                } else {
+                    " Tab Complete · Enter Create · Alt+Enter Stay · Esc Back "
+                }
+            } else if theme.ascii {
+                " Tab Dir | Enter Create | Alt+Enter Stay | Esc Back "
             } else if zh {
-                " Tab 切换栏位 · Enter 提交 · Esc 返回 "
+                " Tab 切目录 · Enter 创建并进入 · Alt+Enter 仅创建 · Esc 返回 "
             } else {
-                " Tab Next · Enter Submit · Esc Back "
+                " Tab Dir · Enter Create · Alt+Enter Stay · Esc Back "
             });
             let input_area = render_bordered_composer_box(
                 frame,
@@ -7621,14 +7867,27 @@ fn render_subview_bottom_composer(
                 theme,
             );
         }
-        SubviewContent::Confirm { title, input, .. } => {
+        SubviewContent::Confirm {
+            title,
+            input,
+            require_full_yes,
+            ..
+        } => {
             let left_title = format!("! {}", theme.adapt(title));
-            let confirm_right = (composer.width >= 54).then_some(if theme.ascii {
-                " Type yes + Enter | Esc Back "
+            let confirm_right = (composer.width >= 54).then_some(if *require_full_yes {
+                if theme.ascii {
+                    " Type yes + Enter | Esc Back "
+                } else if zh {
+                    " 输入 yes + Enter · Esc 返回 "
+                } else {
+                    " Type yes + Enter · Esc Back "
+                }
+            } else if theme.ascii {
+                " Type y/yes + Enter | Esc Back "
             } else if zh {
-                " 输入 yes + Enter · Esc 返回 "
+                " 输入 y/yes + Enter · Esc 返回 "
             } else {
-                " Type yes + Enter · Esc Back "
+                " Type y/yes + Enter · Esc Back "
             });
             let input_area = render_bordered_composer_box(
                 frame,
@@ -7645,10 +7904,16 @@ fn render_subview_bottom_composer(
                 input_area.width.saturating_sub(marker.width() as u16),
             );
             if input.value().is_empty() && input_area.width >= 30 {
-                let ghost = if zh {
-                    "输入 yes 以确认"
+                let ghost = if *require_full_yes {
+                    if zh {
+                        "输入 yes 以确认"
+                    } else {
+                        "type yes to confirm"
+                    }
+                } else if zh {
+                    "输入 y 或 yes 以确认"
                 } else {
-                    "type yes to confirm"
+                    "type y or yes to confirm"
                 };
                 if marker.width() + line.width() + ghost.width() <= usize::from(input_area.width) {
                     line.spans
@@ -11289,6 +11554,62 @@ pub(super) mod tests {
     }
 
     #[test]
+    fn selected_all_replace_on_type_emacs_keys_and_path_word_rubout() {
+        // 1. new_selected replaces on first typed char, or unselects on Left/Right.
+        let mut sel = TextInput::new_selected("justmux");
+        assert!(sel.is_selected_all());
+        let line = sel.rendered_width(true, Theme::default(), 20);
+        assert_eq!(line.spans.len(), 7);
+        assert!(
+            line.spans
+                .iter()
+                .all(|s| s.style == Theme::default().selected_style())
+        );
+
+        sel.handle_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE));
+        assert!(!sel.is_selected_all());
+        assert_eq!(sel.value(), "a");
+
+        let mut keep = TextInput::new_selected("logs");
+        keep.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
+        assert!(!keep.is_selected_all());
+        keep.handle_key(KeyEvent::new(KeyCode::Char('2'), KeyModifiers::NONE));
+        assert_eq!(keep.value(), "logs2");
+
+        let mut head = TextInput::new_selected("logs");
+        head.handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
+        assert!(!head.is_selected_all());
+        head.handle_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
+        assert_eq!(head.value(), "xlogs");
+
+        let mut cleared = TextInput::new_selected("old");
+        cleared.handle_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE));
+        assert_eq!(cleared.value(), "");
+        assert!(!cleared.is_selected_all());
+
+        // 2. Ctrl+B/F/H/D work like standard readline.
+        let mut ed = TextInput::new("abcd");
+        ed.handle_key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL));
+        ed.handle_key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL));
+        ed.handle_key(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::CONTROL));
+        assert_eq!(ed.value(), "acd");
+        ed.handle_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL));
+        assert_eq!(ed.value(), "ad");
+        ed.handle_key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL));
+        ed.insert_str("Z");
+        assert_eq!(ed.value(), "adZ");
+
+        // 3. handle_key_path rubs out one directory segment per Ctrl+W.
+        let mut path = TextInput::new("~/project/justmux/");
+        path.handle_key_path(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL));
+        assert_eq!(path.value(), "~/project/");
+        path.handle_key_path(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL));
+        assert_eq!(path.value(), "~/");
+        path.handle_key_path(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL));
+        assert_eq!(path.value(), "");
+    }
+
+    #[test]
     fn insert() {
         let mut i = TextInput::default();
         i.handle_key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE));
@@ -13504,6 +13825,7 @@ pub(super) mod tests {
                         message: "Permanently terminate session?",
                         input: &confirm_input,
                         scroll: 0,
+                        require_full_yes: true,
                     },
                     menubar: DesktopMenubarState::default(),
                 },
