@@ -67,6 +67,8 @@ jobs:
         run: node --test tests/npm-packages.test.mjs
       - name: Test local release workflow
         run: node --test tests/release-workflow.test.mjs
+      - name: Test standalone installer script
+        run: node --test tests/install-script.test.mjs
 
   native:
     name: Build and test ${{ matrix.platform }}

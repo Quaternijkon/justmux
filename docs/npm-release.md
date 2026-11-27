@@ -1,9 +1,23 @@
 # npm installation and release
 
 The npm distribution contains the Rust executable; it does not compile Rust on
-the user's machine or download programs from an installation script. The main
-`justmux` package exposes both `jm` and `justmux`. npm selects an exact-version
-optional package for the operating system and CPU.
+the user's machine or download binaries from an installation script. The main
+`justmux` package exposes both `jm` and `justmux`, and includes a local-only
+`postinstall` helper (`lib/postinstall.cjs`) with zero network calls or shell
+execution. On global npm installs, it repairs missing `<prefix>/bin` links (for
+`bin-links=false`) and, if the global npm prefix is missing from `PATH`, creates
+symlinks in a writable allowlisted `PATH` directory (`/usr/local/bin`,
+`/opt/homebrew/bin`, `~/.local/bin`, or `~/bin`) without ever overwriting or
+shadowing unrelated commands. Set `JUSTMUX_NO_POSTINSTALL_LINK=1` to opt out;
+`--ignore-scripts` continues to work whenever `<prefix>/bin` is already on
+`PATH`. npm selects an exact-version optional package for the operating system
+and CPU.
+
+For environments without Node.js 22.15+ (or where users prefer a direct native
+binary), `install.sh` downloads the exact platform tarball from npm (with
+npmmirror fallback), verifies its SHA-256 digest against the registry metadata
+and package manifest, installs `jm` + `justmux` atomically, and ensures `PATH`
+is configured.
 
 Users install or update with:
 

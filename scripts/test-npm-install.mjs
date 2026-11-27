@@ -81,15 +81,16 @@ async function pack(directory) {
   return manifest;
 }
 
-async function install(prefix, packageName, extra = []) {
-  return command(npm, [
+async function install(prefix, packageName, extra = [], { scripts = false, env = environment } = {}) {
+  const args = [
     'install', '--global', '--prefix', prefix, `${packageName}@latest`,
     '--registry', registry, '--userconfig', path.join(temporary, 'empty.npmrc'),
     '--globalconfig', path.join(temporary, 'empty-global.npmrc'),
-    '--cache', path.join(temporary, 'cache'), '--ignore-scripts', '--no-audit',
-    '--no-fund', '--fetch-retries=0', '--fetch-timeout=15000', '--prefer-online',
-    ...extra,
-  ]);
+    '--cache', path.join(temporary, 'cache'),
+  ];
+  if (!scripts) args.push('--ignore-scripts');
+  args.push('--no-audit', '--no-fund', '--fetch-retries=0', '--fetch-timeout=15000', '--prefer-online', ...extra);
+  return command(npm, args, { env });
 }
 
 async function invoke(prefix, name, args, options = {}) {
@@ -166,10 +167,12 @@ try {
   await pack(nativeDirectory);
   const manifest = await pack(mainDirectory);
   assert.notEqual(manifest.private, true, 'prepared release must be publishable');
-  for (const lifecycle of ['preinstall', 'install', 'postinstall']) {
+  for (const lifecycle of ['preinstall', 'install']) {
     assert.equal(manifest.scripts?.[lifecycle], undefined,
       `installation must not require a ${lifecycle} download/build script`);
   }
+  assert.equal(manifest.scripts?.postinstall, 'node lib/postinstall.cjs',
+    'prepared release includes the local PATH/bin-link postinstall helper');
   const prefix = path.join(temporary, 'actual-prefix');
   await install(prefix, manifest.name);
   const expected = await command(binary, ['--version']);
@@ -181,6 +184,64 @@ try {
     assert.match(help.stdout, /--socket-name/);
   }
   console.log('PASS actual npm install: packed Rust binary, jm + justmux through PATH, --version and --help');
+
+  const toolBin = path.join(temporary, 'tool-bin');
+  await fs.mkdir(toolBin, { recursive: true });
+  await fs.symlink(process.execPath, path.join(toolBin, 'node'));
+  const resolvedNpm = (await command('which', [npm])).stdout.trim();
+
+  // Hidden prefix not in PATH: postinstall links jm & justmux into $HOME/.local/bin.
+  const tempHome = path.join(temporary, 'hidden-home');
+  const localBin = path.join(tempHome, '.local', 'bin');
+  const hiddenPrefix = path.join(temporary, 'hidden-prefix');
+  await fs.mkdir(localBin, { recursive: true });
+  await fs.mkdir(hiddenPrefix, { recursive: true });
+  const hiddenEnv = {
+    ...environment,
+    HOME: tempHome,
+    PATH: `${localBin}${path.delimiter}${toolBin}${path.delimiter}/usr/bin${path.delimiter}/bin`,
+  };
+  await command(resolvedNpm, [
+    'install', '--global', '--prefix', hiddenPrefix, `${manifest.name}@latest`,
+    '--registry', registry, '--userconfig', path.join(temporary, 'empty.npmrc'),
+    '--globalconfig', path.join(temporary, 'empty-global.npmrc'),
+    '--cache', path.join(temporary, 'cache'), '--no-audit', '--no-fund',
+    '--fetch-retries=0', '--fetch-timeout=15000', '--prefer-online',
+  ], { env: hiddenEnv });
+  for (const name of ['jm', 'justmux']) {
+    const linkPath = path.join(localBin, name);
+    assert.equal((await fs.lstat(linkPath)).isSymbolicLink(), true, `${name} symlink must be created in $HOME/.local/bin`);
+    const out = await command(name, ['--version'], { env: hiddenEnv });
+    assert.equal(out.stdout.trim(), expected.stdout.trim(), `hidden-prefix ${name} executes directly from PATH`);
+  }
+  console.log('PASS hidden-prefix PATH recovery: postinstall links jm + justmux into $HOME/.local/bin');
+
+  // --bin-links=false recovery: postinstall restores <prefix>/bin symlinks.
+  const noBinLinksPrefix = path.join(temporary, 'no-bin-links-prefix');
+  const noBinLinksBin = path.join(noBinLinksPrefix, 'bin');
+  const noBinLinksHome = path.join(temporary, 'no-bin-links-home');
+  await fs.mkdir(noBinLinksBin, { recursive: true });
+  await fs.mkdir(noBinLinksHome, { recursive: true });
+  const noBinLinksEnv = {
+    ...environment,
+    HOME: noBinLinksHome,
+    PATH: `${noBinLinksBin}${path.delimiter}${toolBin}${path.delimiter}/usr/bin${path.delimiter}/bin`,
+  };
+  await command(resolvedNpm, [
+    'install', '--global', '--prefix', noBinLinksPrefix, `${manifest.name}@latest`,
+    '--bin-links=false', '--registry', registry, '--userconfig', path.join(temporary, 'empty.npmrc'),
+    '--globalconfig', path.join(temporary, 'empty-global.npmrc'),
+    '--cache', path.join(temporary, 'cache'), '--no-audit', '--no-fund',
+    '--fetch-retries=0', '--fetch-timeout=15000', '--prefer-online',
+  ], { env: noBinLinksEnv });
+  for (const name of ['jm', 'justmux']) {
+    const linkPath = path.join(noBinLinksBin, name);
+    assert.equal((await fs.lstat(linkPath)).isSymbolicLink(), true, `${name} symlink must be restored in <prefix>/bin`);
+    const out = await command(name, ['--version'], { env: noBinLinksEnv });
+    assert.equal(out.stdout.trim(), expected.stdout.trim(), `bin-links=false ${name} executes from <prefix>/bin`);
+  }
+  await assert.rejects(fs.lstat(path.join(noBinLinksHome, '.local', 'bin')), { code: 'ENOENT' });
+  console.log('PASS --bin-links=false recovery: postinstall restores <prefix>/bin symlinks');
 
   if (runPty) {
     const prompt = await command('python3', [path.join(root, 'scripts/test-npm-update-pty.py'),

@@ -14,6 +14,8 @@
 **English** · [简体中文](README.zh-CN.md)
 
 ```sh
+curl -fsSL https://raw.githubusercontent.com/Quaternijkon/justmux/main/install.sh | sh
+# Or via npm (Node.js 22.15+):
 npm install -g justmux@latest
 jm
 ```
@@ -113,14 +115,23 @@ Press **`Ctrl+T`** anytime to cycle palettes—from **Antigravity Aurora** and *
 
 ## Get started in 15 seconds
 
-### Install via npm (prebuilt binary, no Rust needed)
+### One-line standalone installer (no Node.js or Rust needed)
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/Quaternijkon/justmux/main/install.sh | sh
+jm        # or: justmux
+```
+
+> Downloads the prebuilt platform binary (**macOS Apple Silicon** or **Linux x64** static musl), verifies its SHA-256 checksum, and installs `jm` and `justmux` directly into a writable directory on your `PATH` (falling back to `~/.local/bin` and configuring your shell profile if needed).
+
+### Or install via npm (Node.js 22.15+)
 
 ```sh
 npm install -g justmux@latest
 jm        # or: justmux
 ```
 
-> Both `jm` and `justmux` launch the exact same native Rust executable (the thin Node launcher `execve`s straight into the binary and exits). Update anytime with **`jm update`**. Supports **macOS Apple Silicon** and **Linux x64** (static musl).
+> Both `jm` and `justmux` launch the exact same native Rust executable (the thin Node launcher `execve`s straight into the binary and exits). During installation, a local-only `postinstall` helper ensures `jm` and `justmux` are linked into `<prefix>/bin` and reachable on your `PATH` (if your npm global prefix isn't in `PATH`, it symlinks them into a writable standard `PATH` directory such as `/usr/local/bin` or `~/.local/bin` without overwriting existing commands). If you pass `--ignore-scripts`, or use `pnpm` / `bun`, and encounter `command not found`, add `$(npm prefix -g)/bin` to your `PATH` or use the standalone installer above. Update anytime with **`jm update`**. Supports **macOS Apple Silicon** and **Linux x64** (static musl).
 
 ### Or install from source with Cargo (Rust 1.88+)
 

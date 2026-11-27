@@ -29,7 +29,7 @@ test('both installed command names use the same launcher and exact dependencies'
   for (const { platform, arch } of SUPPORTED_PLATFORMS) {
     assert.equal(pkg.optionalDependencies[platformPackageName(pkg.name, platform, arch)], pkg.version);
   }
-  assert.equal(pkg.scripts.postinstall, undefined);
+  assert.equal(pkg.scripts.postinstall, 'node lib/postinstall.cjs');
 });
 
 test('native resolution validates the installed version and executable', (t) => {

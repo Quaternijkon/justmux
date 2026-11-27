@@ -71,7 +71,8 @@ function run(args, options = {}) {
   if (typeof runtime.execve !== 'function') {
     throw new Error(
       'Node.js 22.15.0 or newer with process.execve support is required. '
-      + 'Upgrade Node.js, or install the native release binary directly.',
+      + 'Upgrade Node.js, or install the standalone native binary: '
+      + 'curl -fsSL https://raw.githubusercontent.com/Quaternijkon/justmux/main/install.sh | sh',
     );
   }
   const executable = resolveExecutable(manifest, { platform: runtime.platform, arch: runtime.arch });

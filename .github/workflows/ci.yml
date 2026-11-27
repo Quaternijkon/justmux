@@ -31,6 +31,7 @@ jobs:
       - run: npm --prefix npm/justmux test
       - run: node --test tests/npm-packages.test.mjs
       - run: node --test tests/release-workflow.test.mjs
+      - run: node --test tests/install-script.test.mjs
       - name: Verify npm install and update locally
         if: runner.os == 'macOS'
         run: node scripts/test-npm-install.mjs --pty

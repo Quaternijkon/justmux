@@ -14,6 +14,8 @@
 [English](README.md) · **简体中文**
 
 ```sh
+curl -fsSL https://raw.githubusercontent.com/Quaternijkon/justmux/main/install.sh | sh
+# 或通过 npm 安装（需 Node.js 22.15+）：
 npm install -g justmux@latest
 jm
 ```
@@ -121,14 +123,23 @@ JustMux 在终端内带来原生桌面 IDE 般的交互体验——配备 **顶�
 
 ## 15 秒快速上手
 
-### npm 一键安装（自带预编译原生二进制，无需配置 Rust 环境）
+### 一键原生安装（无需 Node.js，也无需 Rust 环境）
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/Quaternijkon/justmux/main/install.sh | sh
+jm        # 也可以用：justmux
+```
+
+> 自动下载对应平台预编译二进制（**macOS Apple Silicon** 或 **Linux x64** 静态 musl），校验 SHA-256 后将 `jm` 与 `justmux` 直接安装到 `PATH` 中的可写目录（若当前无目录可用则落盘到 `~/.local/bin` 并自动写入 shell `PATH` 配置）。
+
+### 或通过 npm 一键安装（需 Node.js 22.15+）
 
 ```sh
 npm install -g justmux@latest
 jm        # 也可以用：justmux
 ```
 
-> `jm` 和 `justmux` 指向同一个 Rust 原生应用（Node 仅在启动时通过 `execve` 无缝替换为二进制并退出，不占内存）。日后想升级只需运行 **`jm update`**。现已预编译支持 **macOS Apple Silicon (ARM64)** 与 **Linux x64**（静态链接 musl）。
+> `jm` 和 `justmux` 指向同一个 Rust 原生应用（Node 仅在启动时通过 `execve` 无缝替换为二进制并退出，不占内存）。安装时会运行纯本地 `postinstall` 助手，确保 `jm` / `justmux` 已链接到 `<prefix>/bin` 且在 `PATH` 中直接可用（当 npm 全局前缀不在 `PATH` 中或开启了 `bin-links=false` 时，会自动在 `/usr/local/bin`、`~/.local/bin` 等已有的 `PATH` 目录建立软链，且绝不覆盖同名外部程序）。若在启用 `--ignore-scripts`、或使用 `pnpm` / `bun` 时遇到 `command not found`，请将 `$(npm prefix -g)/bin` 加入 `PATH` 或直接改用上方一键原生安装脚本。日后想升级只需运行 **`jm update`**。
 
 ### 或者通过 Cargo 源码编译安装（Rust 1.88+）
 

@@ -263,6 +263,7 @@ fn standalone_update_text(args: &[String]) -> Result<String> {
             "`jm update` / `justmux update` checks npm and updates global npm installations\n",
             "(`npm install -g justmux@latest`). This binary was invoked directly instead of\n",
             "through the npm wrapper:\n",
+            "  - Standalone:   curl -fsSL https://raw.githubusercontent.com/Quaternijkon/justmux/main/install.sh | sh\n",
             "  - npm global:   npm install -g justmux@latest\n",
             "  - Cargo source: cargo install --path . --locked\n",
         ),
@@ -579,6 +580,7 @@ mod tests {
     fn standalone_update_text_handles_default_check_help_and_unknown_args() {
         let default = standalone_update_text(&[]).expect("default text");
         assert!(default.contains("standalone native binary"));
+        assert!(default.contains("install.sh"));
         assert!(default.contains("npm install -g justmux@latest"));
         assert!(default.contains("cargo install --path . --locked"));
 

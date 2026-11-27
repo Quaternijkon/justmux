@@ -160,7 +160,8 @@ test('prepared main is publishable while its source remains protected and every 
   const prepared = await prepare({ out: directory, main: true });
   const manifest = JSON.parse(await readFile(join(prepared, 'package.json'), 'utf8'));
   assert.equal(manifest.private, undefined);
-  assert.equal(manifest.scripts, undefined);
+  assert.deepEqual(manifest.scripts, { postinstall: 'node lib/postinstall.cjs' });
+  assert.equal(manifest.scripts.test, undefined);
   assert.equal(manifest.bin.jm, manifest.bin.justmux);
   assert.equal(Object.keys(manifest.optionalDependencies).length, 2);
   assert.ok(Object.values(manifest.optionalDependencies).every((v) => v === source.version));

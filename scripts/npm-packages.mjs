@@ -16,6 +16,7 @@ const digest = (bytes, algorithm = 'sha256', encoding = 'hex') => createHash(alg
 const json = async (path) => JSON.parse(await readFile(path, 'utf8'));
 const save = (path, value) => writeFile(path, `${JSON.stringify(value, null, 2)}\n`);
 const VERSION_PATTERN = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?$/;
+const MAIN_PUBLISHED_SCRIPTS = Object.freeze({ postinstall: 'node lib/postinstall.cjs' });
 
 function versionParts(version) {
   const match = VERSION_PATTERN.exec(version);
@@ -119,6 +120,7 @@ export async function prepare({ out, platform, binary, main = false }) {
     const { private: ignoredPrivate, scripts: ignoredScripts, ...manifest } = source;
     void ignoredPrivate;
     void ignoredScripts;
+    manifest.scripts = { ...MAIN_PUBLISHED_SCRIPTS };
     manifest.optionalDependencies = Object.fromEntries(SUPPORTED_PLATFORMS.map((p) => [
       platformPackageName(source.name, p.platform, p.arch), source.version,
     ]));
@@ -184,12 +186,14 @@ export async function validate(directory) {
   const path = join(directory, 'justmux');
   const manifest = await json(join(path, 'package.json'));
   const expected = Object.fromEntries(manifests.map((p) => [p.manifest.name, source.version]));
-  if (manifest.name !== source.name || manifest.version !== source.version || manifest.private || manifest.scripts
+  if (manifest.name !== source.name || manifest.version !== source.version || manifest.private
+    || JSON.stringify(manifest.scripts) !== JSON.stringify(MAIN_PUBLISHED_SCRIPTS)
     || manifest.bin?.jm !== 'bin/justmux.cjs' || manifest.bin?.justmux !== 'bin/justmux.cjs'
     || JSON.stringify(manifest.optionalDependencies) !== JSON.stringify(expected)) {
     throw new Error('The main npm package must reference every exact-version native package and expose both commands.');
   }
   await access(join(path, 'bin/justmux.cjs'), constants.X_OK);
+  await access(join(path, 'lib/postinstall.cjs'), constants.R_OK);
   manifests.push({ path, manifest, platform: null });
   return manifests;
 }
@@ -236,7 +240,8 @@ export async function verifyPacked(directory) {
     const metadata = JSON.parse(command('tar', ['-xOf', path, 'package/package.json']));
     if (JSON.stringify(metadata) !== JSON.stringify(expected)) throw new Error(`Packed metadata changed: ${record.name}`);
     const contents = packages[i].platform
-      ? ['bin/jm'] : ['bin/justmux.cjs', 'lib/launcher.cjs', 'lib/update.cjs', 'lib/update-prompt.cjs'];
+      ? ['bin/jm']
+      : ['bin/justmux.cjs', 'lib/launcher.cjs', 'lib/postinstall.cjs', 'lib/update.cjs', 'lib/update-prompt.cjs'];
     for (const file of contents) {
       const packedBytes = command('tar', ['-xOf', path, `package/${file}`], { encoding: null });
       const preparedBytes = await readFile(join(packages[i].path, file));

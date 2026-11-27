@@ -28,10 +28,24 @@ not block use. Set `JUSTMUX_NO_UPDATE_CHECK=1` to disable them. Help, version,
 direct commands, CI, and piped runs skip checks.
 
 The npm package selects a precompiled native binary for macOS ARM64 or Linux
-x64. No Rust compiler, installation script, or download on first launch is
-required. Keep npm optional dependencies enabled so the matching binary can be
-installed. Node.js 22.15.0 or newer is required (Node.js 24 LTS is recommended) to replace the launcher process
-with the native executable; JustMux does not leave a Node process supervising tmux.
+x64. No Rust compiler or download on first launch is required. A local-only
+`postinstall` step verifies that `jm` and `justmux` are linked into `<prefix>/bin`
+and reachable on your `PATH`; when the global npm `bin` directory is not on
+`PATH`, it creates symlinks in a writable standard `PATH` directory (such as
+`/usr/local/bin` or `~/.local/bin`) without overwriting unrelated commands.
+Set `JUSTMUX_NO_POSTINSTALL_LINK=1` to skip this check, or install with
+`--ignore-scripts` when `<prefix>/bin` is already on `PATH`.
+
+Keep npm optional dependencies enabled so the matching binary can be installed.
+Node.js 22.15.0 or newer is required (Node.js 24 LTS is recommended) to replace
+the launcher process with the native executable; JustMux does not leave a Node
+process supervising tmux.
+
+Alternatively, install the standalone native binary without Node.js:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/Quaternijkon/justmux/main/install.sh | sh
+```
 
 Install tmux through your system's package manager. tmux is a runtime dependency;
 it is not bundled by this npm package. Popup integration requires tmux 3.2+.
